@@ -1,3 +1,8 @@
+mod crypto;
+mod fs;
+mod storage;
+mod utils;
+
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
