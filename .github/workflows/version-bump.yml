@@ -1,0 +1,171 @@
+name: Version Bump and Release
+
+on:
+  push:
+    branches:
+      - main
+      - master
+    paths:
+      - 'Cargo.toml'
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  check-version-bump:
+    name: Check Version Change and Create Release PR
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Fetch all history for changelog generation
+          
+      - name: Get current version from Cargo.toml
+        id: current_version
+        run: |
+          VERSION=$(grep '^version = ' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Current version in Cargo.toml: $VERSION"
+          
+      - name: Get latest tag
+        id: latest_tag
+        run: |
+          # Get the latest tag, or use a default if no tags exist
+          LATEST_TAG=$(git tag -l "v*" --sort=-v:refname | head -n 1)
+          if [ -z "$LATEST_TAG" ]; then
+            LATEST_TAG="v0.0.0"
+            echo "No previous tags found, using $LATEST_TAG as base"
+          else
+            echo "Latest tag: $LATEST_TAG"
+          fi
+          echo "tag=$LATEST_TAG" >> $GITHUB_OUTPUT
+          
+          # Get the version from the tag (remove 'v' prefix)
+          TAG_VERSION=${LATEST_TAG#v}
+          echo "tag_version=$TAG_VERSION" >> $GITHUB_OUTPUT
+          
+      - name: Check if version changed
+        id: version_check
+        run: |
+          CURRENT="${{ steps.current_version.outputs.version }}"
+          TAG_VERSION="${{ steps.latest_tag.outputs.tag_version }}"
+          
+          if [ "$CURRENT" = "$TAG_VERSION" ]; then
+            echo "Version has not changed (still $CURRENT)"
+            echo "changed=false" >> $GITHUB_OUTPUT
+          else
+            echo "Version changed from $TAG_VERSION to $CURRENT"
+            echo "changed=true" >> $GITHUB_OUTPUT
+          fi
+          
+      - name: Generate changelog
+        id: changelog
+        if: steps.version_check.outputs.changed == 'true'
+        run: |
+          LATEST_TAG="${{ steps.latest_tag.outputs.tag }}"
+          NEW_VERSION="v${{ steps.current_version.outputs.version }}"
+          
+          echo "Generating changelog from $LATEST_TAG to HEAD"
+          
+          # Generate changelog from commits
+          if [ "$LATEST_TAG" = "v0.0.0" ]; then
+            # If no previous tag, get all commits
+            CHANGELOG=$(git log --pretty=format:"- %s (%h)" --no-merges)
+          else
+            # Get commits since last tag
+            CHANGELOG=$(git log ${LATEST_TAG}..HEAD --pretty=format:"- %s (%h)" --no-merges)
+          fi
+          
+          # Create changelog file
+          cat > CHANGELOG_NEW.md << EOF
+          # Changelog for $NEW_VERSION
+          
+          $(date +%Y-%m-%d)
+          
+          ## Changes
+          
+          $CHANGELOG
+          EOF
+          
+          # Save changelog for PR body
+          echo "changelog_file=CHANGELOG_NEW.md" >> $GITHUB_OUTPUT
+          
+      - name: Check if release PR already exists
+        id: check_pr
+        if: steps.version_check.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          NEW_VERSION="v${{ steps.current_version.outputs.version }}"
+          BRANCH_NAME="release/$NEW_VERSION"
+          
+          # Check if a PR from this branch already exists
+          PR_EXISTS=$(gh pr list --head "$BRANCH_NAME" --json number --jq 'length')
+          
+          if [ "$PR_EXISTS" -gt 0 ]; then
+            echo "Release PR already exists for $NEW_VERSION"
+            echo "exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "No existing PR found for $NEW_VERSION"
+            echo "exists=false" >> $GITHUB_OUTPUT
+          fi
+          echo "branch=$BRANCH_NAME" >> $GITHUB_OUTPUT
+          
+      - name: Create release branch and PR
+        if: steps.version_check.outputs.changed == 'true' && steps.check_pr.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          NEW_VERSION="v${{ steps.current_version.outputs.version }}"
+          BRANCH_NAME="${{ steps.check_pr.outputs.branch }}"
+          
+          # Configure git
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          
+          # Create and push release branch
+          git checkout -b "$BRANCH_NAME"
+          
+          # Add changelog if it exists
+          if [ -f "CHANGELOG_NEW.md" ]; then
+            if [ -f "CHANGELOG.md" ]; then
+              # Prepend to existing changelog
+              cat CHANGELOG_NEW.md CHANGELOG.md > CHANGELOG_TEMP.md
+              mv CHANGELOG_TEMP.md CHANGELOG.md
+            else
+              # Create new changelog
+              mv CHANGELOG_NEW.md CHANGELOG.md
+            fi
+            
+            git add CHANGELOG.md
+            git commit -m "Update CHANGELOG.md for $NEW_VERSION"
+          fi
+          
+          git push origin "$BRANCH_NAME"
+          
+          # Read changelog for PR description
+          if [ -f "CHANGELOG.md" ]; then
+            CHANGELOG_CONTENT=$(head -n 50 CHANGELOG.md)
+          else
+            CHANGELOG_CONTENT="Release $NEW_VERSION"
+          fi
+          
+          # Create pull request
+          gh pr create \
+            --title "Release $NEW_VERSION" \
+            --body "This PR prepares the release for $NEW_VERSION.
+
+          ## Changelog
+
+          $CHANGELOG_CONTENT
+
+          ---
+          
+          **After merging this PR, a release tag will be automatically created.**" \
+            --base main \
+            --head "$BRANCH_NAME" \
+            --label "release"
+          
+          echo "✓ Created release PR for $NEW_VERSION"
+
