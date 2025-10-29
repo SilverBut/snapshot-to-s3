@@ -33,20 +33,20 @@ impl BackupMetadata {
         mode: BackupMode,
         parent_volume_id: Option<String>,
         parent_snapshot_id: Option<String>,
-    ) -> Self {
+    ) -> Result<Self> {
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .context("System time is before UNIX_EPOCH")?
             .as_secs();
         
-        Self {
+        Ok(Self {
             volume_id,
             snapshot_id,
             mode,
             parent_volume_id,
             parent_snapshot_id,
             timestamp,
-        }
+        })
     }
 }
 
@@ -106,7 +106,7 @@ pub async fn execute_backup(
         mode.clone(),
         parent_snapshot.as_ref().map(|s| s.volume_id().to_string()),
         parent_snapshot.as_ref().map(|s| s.id().to_string()),
-    );
+    )?;
     let metadata_json = serde_json::to_vec(&metadata)?;
     
     // Encrypt metadata
@@ -164,9 +164,12 @@ pub async fn execute_backup(
         Box::new(encrypting_stream)
     };
     
-    // We need to know the size beforehand for tar, but streams don't always provide this
-    // For simplicity, we'll read the entire stream into memory first
-    // In a production implementation, you might want to stream in chunks
+    // NOTE: The tar format requires knowing the file size upfront for the header.
+    // For true streaming without buffering, we would need to:
+    // 1. Use the multipart upload strategy from design.md where headers are uploaded after data
+    // 2. Or use a chunked encoding approach
+    // For now, we read into memory which limits us to available RAM.
+    // TODO: Implement proper streaming as described in design.md section "Stream Tar for Multipart Upload"
     let mut encrypted_stream_data = Vec::new();
     tokio::io::AsyncReadExt::read_to_end(&mut final_stream, &mut encrypted_stream_data).await?;
     
@@ -176,9 +179,11 @@ pub async fn execute_backup(
     
     println!("Uploading log...");
     // Create a simple log
-    let log = format!("Backup completed at {}\nMode: {:?}\n", 
-        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(),
-        mode);
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .context("System time is before UNIX_EPOCH")?
+        .as_secs();
+    let log = format!("Backup completed at {}\nMode: {:?}\n", timestamp, mode);
     let encrypted_log = {
         let mut cursor = std::io::Cursor::new(log.as_bytes());
         crypto::aes::encrypt_stream(&encryption_key, &mut cursor).await?
@@ -246,7 +251,7 @@ async fn determine_backup_mode(
             let remote_snap_id = parts[1];
             
             // Check if this snapshot exists locally
-            if local_snapshot_ids.iter().any(|id| id.contains(remote_snap_id)) {
+            if local_snapshot_ids.iter().any(|id| id == remote_snap_id) {
                 // Get metadata to verify chain
                 if let Ok(metadata) = client.get_metadata(file_key).await {
                     let mode = metadata.user_metadata.get("mode");
