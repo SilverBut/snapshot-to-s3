@@ -11,8 +11,9 @@
       "extensions": [
         "rust-lang.rust-analyzer",
         "tamasfe.even-better-toml",
-        "serayuzgur.crates",
-        "vadimcn.vscode-lldb"
+        "fill-labs.dependi",
+        "vadimcn.vscode-lldb",
+        "streetsidesoftware.code-spell-checker"
       ],
       "settings": {
         "rust-analyzer.checkOnSave.command": "clippy",
@@ -24,9 +25,9 @@
     }
   },
   
-  "features": {
-    "ghcr.io/devcontainers/features/github-cli:1": {}
-  },
+  // "features": {
+  //   "ghcr.io/devcontainers/features/github-cli:1": {}
+  // },
   
   "postCreateCommand": "rustc --version && cargo --version",
   
