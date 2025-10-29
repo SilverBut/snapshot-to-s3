@@ -24,7 +24,7 @@ jobs:
       - name: Get current version from Cargo.toml
         id: current_version
         run: |
-          VERSION=$(grep '^version = ' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
+          VERSION=$(grep '^version = ' Cargo.toml | head -1 | sed -E 's/version = ["\x27]([^"\x27]+)["\x27]/\1/')
           echo "version=$VERSION" >> $GITHUB_OUTPUT
           echo "Current version in Cargo.toml: $VERSION"
           
@@ -70,8 +70,11 @@ jobs:
           
           # Generate changelog from commits
           if [ "$LATEST_TAG" = "v0.0.0" ]; then
-            # If no previous tag, get all commits
-            CHANGELOG=$(git log --pretty=format:"- %s (%h)" --no-merges)
+            # If no previous tag, get last 100 commits to avoid overwhelming changelog
+            CHANGELOG=$(git log --pretty=format:"- %s (%h)" --no-merges -n 100)
+            if [ $(git rev-list --count HEAD) -gt 100 ]; then
+              CHANGELOG="$CHANGELOG"$'\n'"- ... and $(( $(git rev-list --count HEAD) - 100 )) more commits"
+            fi
           else
             # Get commits since last tag
             CHANGELOG=$(git log ${LATEST_TAG}..HEAD --pretty=format:"- %s (%h)" --no-merges)
@@ -144,9 +147,10 @@ jobs:
           
           git push origin "$BRANCH_NAME"
           
-          # Read changelog for PR description
+          # Read changelog for PR description (show full changelog, GitHub will handle display)
           if [ -f "CHANGELOG.md" ]; then
-            CHANGELOG_CONTENT=$(head -n 50 CHANGELOG.md)
+            # Get the section for this version only (up to next version or 200 lines)
+            CHANGELOG_CONTENT=$(head -n 200 CHANGELOG.md)
           else
             CHANGELOG_CONTENT="Release $NEW_VERSION"
           fi
