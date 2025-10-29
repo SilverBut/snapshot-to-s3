@@ -222,12 +222,23 @@ The GitHub Actions workflow will automatically:
 ### Release Assets
 
 Each release includes:
-- `snapshot-to-s3-linux-x86_64.tar.gz` - Statically linked binary for Linux x86_64
+- `snapshot-to-s3-linux-x86_64.tar.gz` - Statically linked binary for Linux x86_64 (stripped)
 - `snapshot-to-s3-linux-x86_64.tar.gz.sha256` - SHA256 checksum for verification
+- `snapshot-to-s3-linux-x86_64-debug.tar.gz` - Debug symbols file for debugging
+- `snapshot-to-s3-linux-x86_64-debug.tar.gz.sha256` - SHA256 checksum for debug symbols
 
 To verify a downloaded release:
 ```bash
 sha256sum -c snapshot-to-s3-linux-x86_64.tar.gz.sha256
+```
+
+To use debug symbols for debugging:
+```bash
+# Extract both files to the same directory
+tar -xzf snapshot-to-s3-linux-x86_64.tar.gz
+tar -xzf snapshot-to-s3-linux-x86_64-debug.tar.gz
+# Debug symbols will be automatically found by gdb/lldb
+gdb ./snapshot-to-s3
 ```
 
 ## Questions?
