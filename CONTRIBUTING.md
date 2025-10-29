@@ -223,13 +223,17 @@ The GitHub Actions workflow will automatically:
 
 Each release includes:
 - `snapshot-to-s3-linux-x86_64.tar.gz` - Statically linked binary for Linux x86_64 (stripped)
-- `snapshot-to-s3-linux-x86_64.tar.gz.sha256` - SHA256 checksum for verification
 - `snapshot-to-s3-linux-x86_64-debug.tar.gz` - Debug symbols file for debugging
-- `snapshot-to-s3-linux-x86_64-debug.tar.gz.sha256` - SHA256 checksum for debug symbols
+- `SHA256SUMS` - SHA256 checksums for all release files
 
 To verify a downloaded release:
 ```bash
-sha256sum -c snapshot-to-s3-linux-x86_64.tar.gz.sha256
+sha256sum -c SHA256SUMS
+```
+
+Or to verify a specific file:
+```bash
+sha256sum -c SHA256SUMS --ignore-missing
 ```
 
 To use debug symbols for debugging:
