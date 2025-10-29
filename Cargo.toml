@@ -1,0 +1,21 @@
+[package]
+name = "snapshot-to-s3"
+version = "0.1.0"
+edition = "2021"
+authors = ["SilverBut"]
+license = "AGPL-3.0"
+description = "Encrypt snapshot and upload to S3-compatible object storage"
+repository = "https://github.com/SilverBut/snapshot-to-s3"
+readme = "README.md"
+keywords = ["snapshot", "s3", "encryption", "backup"]
+categories = ["command-line-utilities"]
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+
+[dev-dependencies]
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1

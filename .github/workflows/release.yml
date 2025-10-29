@@ -1,0 +1,103 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build Release Binary
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+          
+      - name: Install musl tools
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+        
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          
+      - name: Cache cargo index
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/git
+          key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
+          
+      - name: Cache cargo build
+        uses: actions/cache@v4
+        with:
+          path: target
+          key: ${{ runner.os }}-cargo-build-release-${{ hashFiles('**/Cargo.lock') }}
+      
+      - name: Build release binary
+        run: cargo build --release --target x86_64-unknown-linux-musl
+        
+      - name: Strip binary
+        run: strip target/x86_64-unknown-linux-musl/release/snapshot-to-s3
+        
+      - name: Create tarball
+        run: |
+          cd target/x86_64-unknown-linux-musl/release
+          tar -czf snapshot-to-s3-linux-x86_64.tar.gz snapshot-to-s3
+          sha256sum snapshot-to-s3-linux-x86_64.tar.gz > snapshot-to-s3-linux-x86_64.tar.gz.sha256
+          
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: snapshot-to-s3-linux-x86_64
+          path: |
+            target/x86_64-unknown-linux-musl/release/snapshot-to-s3-linux-x86_64.tar.gz
+            target/x86_64-unknown-linux-musl/release/snapshot-to-s3-linux-x86_64.tar.gz.sha256
+
+  release:
+    name: Create GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: snapshot-to-s3-linux-x86_64
+          path: ./artifacts
+          
+      - name: Determine release type
+        id: release_type
+        run: |
+          TAG_NAME=${GITHUB_REF#refs/tags/}
+          echo "tag_name=$TAG_NAME" >> $GITHUB_OUTPUT
+          
+          # Check if tag matches pre-release pattern
+          # Pre-release: v*-alpha.*, v*-beta.*, v*-rc.*, v*-pre.*
+          if [[ "$TAG_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-(alpha|beta|rc|pre) ]]; then
+            echo "prerelease=true" >> $GITHUB_OUTPUT
+            echo "Release type: Pre-release"
+          else
+            echo "prerelease=false" >> $GITHUB_OUTPUT
+            echo "Release type: Stable release"
+          fi
+          
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: Release ${{ steps.release_type.outputs.tag_name }}
+          prerelease: ${{ steps.release_type.outputs.prerelease }}
+          files: |
+            ./artifacts/snapshot-to-s3-linux-x86_64.tar.gz
+            ./artifacts/snapshot-to-s3-linux-x86_64.tar.gz.sha256
+          generate_release_notes: true
