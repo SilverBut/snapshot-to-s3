@@ -149,13 +149,48 @@ Pre-release tags include a suffix and are marked as pre-releases in GitHub:
 
 Where `N` is a sequential number starting from 1.
 
-### Creating a Release
+### Creating a Release (Automated Workflow)
 
-Only maintainers can create releases:
+This project uses an automated release workflow. Here's how it works:
+
+#### For Maintainers
+
+1. **Update the version** in `Cargo.toml`:
+   ```bash
+   # Edit Cargo.toml and change the version field
+   version = "0.2.0"  # or "1.0.0-alpha.1" for pre-releases
+   ```
+
+2. **Commit and push to main**:
+   ```bash
+   git add Cargo.toml
+   git commit -m "Bump version to 0.2.0"
+   git push origin main
+   ```
+
+3. **Automated process** (handled by GitHub Actions):
+   - Detects version change in `Cargo.toml`
+   - Finds the previous release tag
+   - Generates a changelog from commit messages since the last tag
+   - Creates a release branch (e.g., `release/v0.2.0`)
+   - Updates or creates `CHANGELOG.md` with generated changelog
+   - Opens a Pull Request labeled "release"
+
+4. **Review and merge the release PR**:
+   - Review the automatically generated changelog
+   - Merge the PR when ready
+
+5. **Automatic tag creation**:
+   - After the PR is merged, a tag (e.g., `v0.2.0`) is automatically created
+   - This triggers the Release workflow to build and publish artifacts
+
+#### Manual Release (Alternative)
+
+If you prefer manual control, you can still create releases manually:
 
 1. **Update version** in `Cargo.toml`
 
-2. **Update CHANGELOG.md** (if it exists) with release notes
+2. **Update CHANGELOG.md** manually with release notes
 
 3. **Commit the changes**:
    ```bash
@@ -175,11 +210,14 @@ Only maintainers can create releases:
    git push origin vX.Y.Z
    ```
 
-5. The GitHub Actions workflow will automatically:
-   - Build a static x86_64 Linux binary
-   - Create a GitHub Release
-   - Mark it as pre-release or stable based on the tag format
-   - Upload the binary and SHA256 checksum
+#### What Happens After Tag Creation
+
+The GitHub Actions workflow will automatically:
+- Build a static x86_64 Linux binary
+- Create a GitHub Release
+- Mark it as pre-release or stable based on the tag format
+- Upload the binary and SHA256 checksum
+- Use the CHANGELOG.md content in the release notes
 
 ### Release Assets
 
