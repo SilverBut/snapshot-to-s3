@@ -53,22 +53,6 @@ enum Commands {
         #[arg(short, long)]
         rate_limit: Option<u64>,
     },
-    /// List available volumes
-    ListVolumes {
-        /// Filesystem type (zfs or dummy)
-        #[arg(short, long, default_value = "zfs")]
-        filesystem: String,
-    },
-    /// List snapshots for a volume
-    ListSnapshots {
-        /// Filesystem type (zfs or dummy)
-        #[arg(short, long, default_value = "zfs")]
-        filesystem: String,
-
-        /// Volume ID
-        #[arg(short, long)]
-        volume: String,
-    },
 }
 
 #[tokio::main]
@@ -151,62 +135,6 @@ async fn main() -> Result<()> {
             workflow::execute_backup(fs.as_ref(), &source_info.full_snapshot_id(), config).await?;
 
             println!("Backup completed successfully!");
-        }
-        Commands::ListVolumes { filesystem } => {
-            println!("Listing volumes for filesystem: {}", filesystem);
-
-            let fs: Box<dyn fs::SnapshotableFilesystem> = match filesystem.as_str() {
-                "zfs" => Box::new(fs::zfs::ZfsFilesystem::new()),
-                "dummy" => {
-                    let mut dummy_fs = fs::dummy::DummyFilesystem::new();
-                    let vol = fs::dummy::DummyVolume::new("test-volume".to_string());
-                    dummy_fs.add_volume(vol);
-                    Box::new(dummy_fs)
-                }
-                _ => {
-                    eprintln!("Unknown filesystem type: {}", filesystem);
-                    std::process::exit(1);
-                }
-            };
-
-            let volumes = fs.list_volumes().await?;
-            println!("Found {} volumes:", volumes.len());
-            for volume in volumes {
-                println!("  - {} (properties: {})", volume.id(), volume.properties().len());
-            }
-        }
-        Commands::ListSnapshots { filesystem, volume } => {
-            println!("Listing snapshots for volume: {}", volume);
-
-            let fs: Box<dyn fs::SnapshotableFilesystem> = match filesystem.as_str() {
-                "zfs" => Box::new(fs::zfs::ZfsFilesystem::new()),
-                "dummy" => {
-                    let mut dummy_fs = fs::dummy::DummyFilesystem::new();
-                    let mut vol = fs::dummy::DummyVolume::new(volume.clone());
-                    vol.add_snapshot(fs::dummy::DummySnapshot::new(
-                        "test-snapshot".to_string(),
-                        volume.clone(),
-                        b"Test data".to_vec(),
-                    ));
-                    dummy_fs.add_volume(vol);
-                    Box::new(dummy_fs)
-                }
-                _ => {
-                    eprintln!("Unknown filesystem type: {}", filesystem);
-                    std::process::exit(1);
-                }
-            };
-
-            let vol = fs.get_volume(&volume).await?;
-            if let Some(vol) = vol {
-                let snapshots = vol.list_snapshots().await?;
-                println!("Found {} snapshots:", snapshots.len());
-                for snapshot in snapshots {
-                    println!("  - {} (volume: {})", snapshot.id(), snapshot.volume_id());
-                }
-            } else {
-                println!("Volume not found: {}", volume);
-            }
         }
     }
 
