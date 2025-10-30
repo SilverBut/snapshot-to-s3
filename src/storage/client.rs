@@ -14,6 +14,16 @@ pub struct S3Client {
     metadata_prefix: String,
 }
 
+/// S3 client configuration
+pub struct S3ClientConfig {
+    pub bucket: String,
+    pub metadata_prefix: Option<String>,
+    pub endpoint: Option<String>,
+    pub access_key_id: Option<String>,
+    pub secret_access_key: Option<String>,
+    pub region: Option<String>,
+}
+
 impl S3Client {
     pub async fn new(bucket: String, metadata_prefix: Option<String>) -> Result<Self> {
         let config = aws_config::load_from_env().await;
@@ -23,6 +33,50 @@ impl S3Client {
             client,
             bucket,
             metadata_prefix: metadata_prefix.unwrap_or_else(|| "x-amz-meta".to_string()),
+        })
+    }
+    
+    /// Create a new S3 client with custom configuration
+    pub async fn with_config(config: S3ClientConfig) -> Result<Self> {
+        use aws_config::BehaviorVersion;
+        use aws_sdk_s3::config::{Credentials, Region};
+        
+        let mut aws_config_builder = aws_config::defaults(BehaviorVersion::latest());
+        
+        // Set region if provided
+        if let Some(region) = &config.region {
+            aws_config_builder = aws_config_builder.region(Region::new(region.clone()));
+        }
+        
+        // Set credentials if provided
+        if let (Some(access_key), Some(secret_key)) = (&config.access_key_id, &config.secret_access_key) {
+            let credentials = Credentials::new(
+                access_key,
+                secret_key,
+                None,
+                None,
+                "custom",
+            );
+            aws_config_builder = aws_config_builder.credentials_provider(credentials);
+        }
+        
+        let aws_config = aws_config_builder.load().await;
+        
+        // Build S3 client config
+        let mut s3_config_builder = aws_sdk_s3::config::Builder::from(&aws_config);
+        
+        // Set custom endpoint if provided
+        if let Some(endpoint) = &config.endpoint {
+            s3_config_builder = s3_config_builder.endpoint_url(endpoint);
+        }
+        
+        let s3_config = s3_config_builder.build();
+        let client = Client::from_conf(s3_config);
+        
+        Ok(Self {
+            client,
+            bucket: config.bucket,
+            metadata_prefix: config.metadata_prefix.unwrap_or_else(|| "x-amz-meta".to_string()),
         })
     }
     
