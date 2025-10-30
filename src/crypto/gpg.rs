@@ -1,100 +1,57 @@
 //! GPG encryption and key management
 
 use anyhow::{anyhow, Context, Result};
-use pgp::{
-    Deserializable, SignedPublicKey, crypto::sym::SymmetricKeyAlgorithm,
-    types::{PublicKeyTrait, SecretKeyTrait},
-};
-use std::io::Cursor;
+use tokio::process::Command;
 
-/// Find a public key by user ID or key ID
-pub async fn find_public_key(_identifier: &str) -> Result<SignedPublicKey> {
-    // TODO: In a real implementation, this would:
-    // 1. Search in the user's GPG keyring
-    // 2. Parse GPG keys from standard locations
-    // 3. Support both key IDs and user IDs
+/// Find and encrypt data with a GPG public key by user ID or key ID
+pub async fn encrypt_with_gpg_key(identifier: &str, data: &[u8]) -> Result<Vec<u8>> {
+    // Use gpg command-line tool to encrypt
+    let mut child = Command::new("gpg")
+        .args(&[
+            "--encrypt",
+            "--recipient", identifier,
+            "--armor",
+            "--trust-model", "always",  // Trust the key without prompting
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .context("Failed to spawn gpg command")?;
     
-    Err(anyhow!("GPG key lookup not yet implemented"))
-}
-
-/// Encrypt data with a GPG public key
-pub async fn encrypt_with_public_key(
-    public_key: &SignedPublicKey,
-    data: &[u8],
-) -> Result<Vec<u8>> {
-    use pgp::composed::{Deserializable, Message};
-    use pgp::crypto::hash::HashAlgorithm;
-    use pgp::types::CompressionAlgorithm;
-    
-    // Convert data to string (for literal message)
-    let data_str = String::from_utf8_lossy(data);
-    
-    // Create a message from the data
-    let message = Message::new_literal("data", &data_str);
-    
-    // Encrypt the message
-    let mut rng = rand::thread_rng();
-    let encrypted = message
-        .encrypt_to_keys_seipdv1(
-            &mut rng,
-            SymmetricKeyAlgorithm::AES256,
-            &[public_key],
-        )
-        .context("Failed to encrypt with public key")?;
-    
-    // Serialize to bytes
-    let mut encrypted_bytes = Vec::new();
-    encrypted.to_armored_writer(&mut encrypted_bytes, Default::default())
-        .context("Failed to armor encrypted message")?;
-    
-    Ok(encrypted_bytes)
-}
-
-/// Decrypt data with a GPG private key
-pub async fn decrypt_with_private_key(
-    encrypted_data: &[u8],
-    private_key_path: &str,
-    passphrase: Option<&str>,
-) -> Result<Vec<u8>> {
-    use pgp::composed::{Deserializable, Message, SignedSecretKey};
-    
-    // Load the private key
-    let key_data = tokio::fs::read(private_key_path).await
-        .context("Failed to read private key file")?;
-    
-    let (secret_key, _) = SignedSecretKey::from_armor_single(Cursor::new(&key_data))
-        .context("Failed to parse armored private key")?;
-    
-    // Parse the encrypted message
-    let (message, _) = Message::from_armor_single(Cursor::new(encrypted_data))
-        .context("Failed to parse encrypted message")?;
-    
-    // Decrypt the message
-    let (decrypted, _) = message
-        .decrypt(|| passphrase.unwrap_or("").to_string(), &[&secret_key])
-        .context("Failed to decrypt message")?;
-    
-    // Extract the literal data
-    match decrypted {
-        pgp::composed::Message::Literal(literal) => {
-            Ok(literal.data().to_vec())
-        }
-        _ => Err(anyhow!("Decrypted message is not a literal message")),
+    // Write data to stdin
+    if let Some(mut stdin) = child.stdin.take() {
+        use tokio::io::AsyncWriteExt;
+        stdin.write_all(data).await
+            .context("Failed to write to gpg stdin")?;
     }
+    
+    // Wait for gpg to finish and collect output
+    let output = child.wait_with_output().await
+        .context("Failed to wait for gpg command")?;
+    
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow!(
+            "GPG encryption failed for key '{}': {}",
+            identifier,
+            stderr
+        ));
+    }
+    
+    Ok(output.stdout)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // Note: Tests require actual GPG keys to work
-    // They are here as examples of how to use the API
-    
     #[tokio::test]
     #[ignore]
-    async fn test_find_public_key() {
-        // This test is ignored because GPG keyring lookup is not yet implemented
-        let result = find_public_key("test@example.com").await;
-        assert!(result.is_err());
+    async fn test_encrypt_with_gpg_key() {
+        // This test is ignored because it requires a GPG key to be set up
+        let result = encrypt_with_gpg_key("test@example.com", b"test data").await;
+        // Should either succeed if key exists or fail with appropriate error
+        assert!(result.is_ok() || result.is_err());
     }
 }

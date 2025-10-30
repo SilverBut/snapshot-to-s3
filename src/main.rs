@@ -108,9 +108,6 @@ async fn main() -> Result<()> {
                 }
             };
 
-            // Find GPG key
-            let gpg_public_key = Some(crypto::gpg::find_public_key(&gpg_key).await?);
-
             // Create S3 client config
             let s3_config = storage::S3ClientConfig {
                 bucket: dest_info.bucket.clone(),
@@ -125,7 +122,6 @@ async fn main() -> Result<()> {
             let config = workflow::BackupConfig {
                 bucket: dest_info.bucket,
                 gpg_key_id: gpg_key,
-                gpg_public_key,
                 metadata_prefix,
                 rate_limit,
                 s3_config: Some(s3_config),
