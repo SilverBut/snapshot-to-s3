@@ -54,7 +54,6 @@ impl BackupMetadata {
 pub struct BackupConfig {
     pub bucket: String,
     pub gpg_key_id: String,
-    pub gpg_public_key: Option<pgp::SignedPublicKey>,
     pub metadata_prefix: String,
     pub rate_limit: Option<u64>, // bytes per second
     pub s3_config: Option<crate::storage::S3ClientConfig>,
@@ -96,13 +95,7 @@ pub async fn execute_backup(
     let encryption_key = crypto::generate_key();
     
     // Encrypt the key with GPG
-    let gpg_key = if let Some(key) = config.gpg_public_key {
-        key
-    } else {
-        return Err(anyhow!("GPG public key not provided"));
-    };
-    
-    let encrypted_key = crypto::gpg::encrypt_with_public_key(&gpg_key, &encryption_key).await?;
+    let encrypted_key = crypto::gpg::encrypt_with_gpg_key(&config.gpg_key_id, &encryption_key).await?;
     
     // Create metadata
     let metadata = BackupMetadata::new(
