@@ -8,24 +8,13 @@ use pgp::{
 use std::io::Cursor;
 
 /// Find a public key by user ID or key ID
-pub async fn find_public_key(identifier: &str) -> Result<SignedPublicKey> {
-    // For now, this is a placeholder. In a real implementation, this would:
+pub async fn find_public_key(_identifier: &str) -> Result<SignedPublicKey> {
+    // TODO: In a real implementation, this would:
     // 1. Search in the user's GPG keyring
     // 2. Parse GPG keys from standard locations
     // 3. Support both key IDs and user IDs
     
-    Err(anyhow!("GPG key lookup not yet implemented. Please provide the key file directly."))
-}
-
-/// Load a public key from a file
-pub async fn load_public_key_from_file(path: &str) -> Result<SignedPublicKey> {
-    let key_data = tokio::fs::read(path).await
-        .context("Failed to read public key file")?;
-    
-    let (key, _) = SignedPublicKey::from_armor_single(Cursor::new(&key_data))
-        .context("Failed to parse armored public key")?;
-    
-    Ok(key)
+    Err(anyhow!("GPG key lookup not yet implemented"))
 }
 
 /// Encrypt data with a GPG public key
@@ -98,22 +87,14 @@ pub async fn decrypt_with_private_key(
 mod tests {
     use super::*;
 
-    // Note: These tests require actual GPG keys to work
+    // Note: Tests require actual GPG keys to work
     // They are here as examples of how to use the API
     
     #[tokio::test]
     #[ignore]
-    async fn test_encrypt_decrypt_roundtrip() {
-        // This test is ignored because it requires real GPG keys
-        // To run it, provide actual key files and remove the #[ignore] attribute
-        let public_key_path = "test_public.asc";
-        let private_key_path = "test_private.asc";
-        let data = b"Test data for encryption";
-        
-        let public_key = load_public_key_from_file(public_key_path).await.unwrap();
-        let encrypted = encrypt_with_public_key(&public_key, data).await.unwrap();
-        let decrypted = decrypt_with_private_key(&encrypted, private_key_path, None).await.unwrap();
-        
-        assert_eq!(decrypted, data);
+    async fn test_find_public_key() {
+        // This test is ignored because GPG keyring lookup is not yet implemented
+        let result = find_public_key("test@example.com").await;
+        assert!(result.is_err());
     }
 }

@@ -35,10 +35,6 @@ enum Commands {
         #[arg(short, long)]
         gpg_key: String,
 
-        /// Path to GPG public key file (optional, if not using keyring)
-        #[arg(long)]
-        gpg_key_file: Option<String>,
-
         /// S3 metadata prefix (e.g., x-amz-meta)
         #[arg(long, default_value = "x-amz-meta")]
         metadata_prefix: String,
@@ -75,7 +71,6 @@ async fn main() -> Result<()> {
             snapshot,
             bucket,
             gpg_key,
-            gpg_key_file,
             metadata_prefix,
             rate_limit,
         } => {
@@ -106,12 +101,8 @@ async fn main() -> Result<()> {
                 }
             };
 
-            // Load GPG key
-            let gpg_public_key = if let Some(key_file) = gpg_key_file {
-                Some(crypto::gpg::load_public_key_from_file(&key_file).await?)
-            } else {
-                None
-            };
+            // Find GPG key
+            let gpg_public_key = Some(crypto::gpg::find_public_key(&gpg_key).await?);
 
             // Create backup config
             let config = workflow::BackupConfig {
