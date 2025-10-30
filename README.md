@@ -54,18 +54,6 @@ snapshot-to-s3 backup \
   --region us-west-002
 ```
 
-### List Volumes
-
-```bash
-snapshot-to-s3 list-volumes --filesystem zfs
-```
-
-### List Snapshots
-
-```bash
-snapshot-to-s3 list-snapshots --filesystem zfs --volume pool/dataset
-```
-
 ## Configuration
 
 ### AWS Credentials
