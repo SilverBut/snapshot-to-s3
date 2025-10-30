@@ -8,7 +8,7 @@ use aws_sdk_s3::Client;
 use std::collections::HashMap;
 
 pub use client::S3Client;
-pub use tar_upload::TarUploader;
+pub use tar_upload::{S3ClientTrait, TarUploader};
 
 /// Metadata for a backup file
 #[derive(Debug, Clone)]

@@ -1,7 +1,7 @@
 //! Streaming tar file upload with multipart upload support
 
-use super::S3Client;
 use anyhow::{Context, Result};
+use async_trait::async_trait;
 use bytes::Bytes;
 use std::collections::HashMap;
 use tokio::io::{AsyncRead, AsyncReadExt};
@@ -9,9 +9,25 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 const UPLOAD_PART_SIZE: usize = 100_000_000; // 100MB per part
 const TAR_BLOCK_SIZE: usize = 512;
 
+/// Trait for S3 client operations needed by TarUploader
+#[async_trait]
+pub trait S3ClientTrait: Send + Sync {
+    /// Create a multipart upload
+    async fn create_multipart_upload(&self, key: &str, metadata: Option<HashMap<String, String>>) -> Result<String>;
+    
+    /// Upload a part
+    async fn upload_part(&self, key: &str, upload_id: &str, part_number: i32, data: Vec<u8>) -> Result<String>;
+    
+    /// Complete a multipart upload
+    async fn complete_multipart_upload(&self, key: &str, upload_id: &str, parts: Vec<(i32, String)>) -> Result<()>;
+    
+    /// Abort a multipart upload
+    async fn abort_multipart_upload(&self, key: &str, upload_id: &str) -> Result<()>;
+}
+
 /// Tar uploader that streams tar file creation with multipart upload
-pub struct TarUploader {
-    client: S3Client,
+pub struct TarUploader<C: S3ClientTrait> {
+    client: C,
     key: String,
     upload_id: String,
     part_number: i32,
@@ -19,10 +35,10 @@ pub struct TarUploader {
     metadata: Option<HashMap<String, String>>,
 }
 
-impl TarUploader {
+impl<C: S3ClientTrait> TarUploader<C> {
     /// Create a new tar uploader
     pub async fn new(
-        client: S3Client,
+        client: C,
         key: String,
         metadata: Option<HashMap<String, String>>,
     ) -> Result<Self> {
@@ -118,7 +134,10 @@ impl TarUploader {
         
         // File name (max 100 bytes)
         let name_bytes = name.as_bytes();
-        let name_len = std::cmp::min(name_bytes.len(), 100);
+        if name_bytes.len() > 100 {
+            return Err(anyhow::anyhow!("File name too long: {} bytes (max 100)", name_bytes.len()));
+        }
+        let name_len = name_bytes.len();
         header[..name_len].copy_from_slice(&name_bytes[..name_len]);
         
         // File mode (8 bytes, octal)
@@ -199,11 +218,93 @@ impl TarUploader {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex};
 
-    #[test]
-    fn test_generate_tar_header() {
-        // Note: This test is simplified as it requires an actual S3 client
-        // which needs real AWS credentials. In a production environment,
-        // you would use mock objects or integration tests with LocalStack.
+    // Mock S3 client for testing
+    struct MockS3Client {
+        upload_id: String,
+        parts: Arc<Mutex<Vec<(i32, Vec<u8>)>>>,
+        completed: Arc<Mutex<bool>>,
+    }
+
+    impl MockS3Client {
+        fn new() -> Self {
+            Self {
+                upload_id: "test-upload-id".to_string(),
+                parts: Arc::new(Mutex::new(Vec::new())),
+                completed: Arc::new(Mutex::new(false)),
+            }
+        }
+
+        fn get_parts(&self) -> Vec<(i32, Vec<u8>)> {
+            self.parts.lock().unwrap().clone()
+        }
+
+        fn is_completed(&self) -> bool {
+            *self.completed.lock().unwrap()
+        }
+    }
+
+    #[async_trait]
+    impl S3ClientTrait for MockS3Client {
+        async fn create_multipart_upload(&self, _key: &str, _metadata: Option<HashMap<String, String>>) -> Result<String> {
+            Ok(self.upload_id.clone())
+        }
+
+        async fn upload_part(&self, _key: &str, _upload_id: &str, part_number: i32, data: Vec<u8>) -> Result<String> {
+            self.parts.lock().unwrap().push((part_number, data.clone()));
+            Ok(format!("etag-{}", part_number))
+        }
+
+        async fn complete_multipart_upload(&self, _key: &str, _upload_id: &str, _parts: Vec<(i32, String)>) -> Result<()> {
+            *self.completed.lock().unwrap() = true;
+            Ok(())
+        }
+
+        async fn abort_multipart_upload(&self, _key: &str, _upload_id: &str) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_tar_uploader_basic() {
+        let client = MockS3Client::new();
+        let completed = client.completed.clone();
+        let mut uploader = TarUploader::new(client, "test.tar".to_string(), None).await.unwrap();
+
+        // Add a small file
+        let data = b"Hello, World!";
+        let mut cursor = std::io::Cursor::new(data.to_vec());
+        uploader.add_file("test.txt", data.len() as u64, &mut cursor).await.unwrap();
+
+        // Finalize
+        uploader.finalize().await.unwrap();
+
+        // Verify the mock client received the data
+        assert!(*completed.lock().unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_tar_header_generation() {
+        let client = MockS3Client::new();
+        let uploader = TarUploader {
+            client,
+            key: "test.tar".to_string(),
+            upload_id: "test-id".to_string(),
+            part_number: 1,
+            parts: Vec::new(),
+            metadata: None,
+        };
+
+        // Test with valid name
+        let header = uploader.generate_tar_header("test.txt", 12345).unwrap();
+        assert_eq!(header.len(), TAR_BLOCK_SIZE);
+        assert_eq!(&header[..8], b"test.txt");
+
+        // Test with name that's too long
+        let long_name = "a".repeat(101);
+        let result = uploader.generate_tar_header(&long_name, 12345);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("File name too long"));
     }
 }

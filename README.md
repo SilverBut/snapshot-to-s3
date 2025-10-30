@@ -31,9 +31,10 @@ snapshot-to-s3 backup \
   --snapshot pool/dataset@snapshot-name \
   --bucket my-backup-bucket \
   --gpg-key "user@example.com" \
-  --gpg-key-file /path/to/public-key.asc \
   --rate-limit 10485760  # Optional: 10 MB/s
 ```
+
+**Note:** GPG key lookup from keyring is not yet implemented. The `--gpg-key` parameter is required but the actual key lookup functionality needs to be completed.
 
 ### List Volumes
 
@@ -58,15 +59,12 @@ The tool uses the AWS SDK for Rust, which automatically loads credentials from:
 
 ### GPG Key Setup
 
-You need a GPG public key to encrypt the backup encryption keys. You can either:
-1. Use a key from your GPG keyring (not yet implemented - use `--gpg-key-file`)
-2. Provide a key file with `--gpg-key-file`
+GPG key lookup from the system keyring is not yet implemented. The `find_public_key` function needs to be completed to search for keys by user ID or key ID in the user's GPG keyring.
 
 Generate a GPG key pair if you don't have one:
 
 ```bash
 gpg --full-generate-key
-gpg --export -a "user@example.com" > public-key.asc
 ```
 
 ## Storage Layout

@@ -1,7 +1,9 @@
 //! S3 client wrapper
 
 use super::FileMetadata;
+use super::tar_upload::S3ClientTrait;
 use anyhow::{Context, Result};
+use async_trait::async_trait;
 use aws_sdk_s3::Client;
 use std::collections::HashMap;
 
@@ -206,5 +208,25 @@ impl S3Client {
     
     pub fn client(&self) -> &Client {
         &self.client
+    }
+}
+
+// Implement the S3ClientTrait for S3Client
+#[async_trait]
+impl S3ClientTrait for S3Client {
+    async fn create_multipart_upload(&self, key: &str, metadata: Option<HashMap<String, String>>) -> Result<String> {
+        self.create_multipart_upload(key, metadata).await
+    }
+    
+    async fn upload_part(&self, key: &str, upload_id: &str, part_number: i32, data: Vec<u8>) -> Result<String> {
+        self.upload_part(key, upload_id, part_number, data).await
+    }
+    
+    async fn complete_multipart_upload(&self, key: &str, upload_id: &str, parts: Vec<(i32, String)>) -> Result<()> {
+        self.complete_multipart_upload(key, upload_id, parts).await
+    }
+    
+    async fn abort_multipart_upload(&self, key: &str, upload_id: &str) -> Result<()> {
+        self.abort_multipart_upload(key, upload_id).await
     }
 }
