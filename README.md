@@ -1,15 +1,14 @@
 # snapshot-to-s3
 
-Encrypt snapshot of your modern file system and upload to S3-compatible object storage.
+Encrypt snapshots from modern filesystems and upload to S3-compatible object storage.
 
 ## Features
 
 * Stream processing to prevent additional disk usage and risk of plaintext leak
-* ZFS on Linux currently supported (more can be easily added later)
-* Single backup file writes to a S3-compatible storage
-* Each uploaded backup is encrypted with AES-256-GCM with a new key
-* Use your favorite GPG key as KEK (key-encryption-key)
-* Auto detect incremental backup
+* ZFS on Linux currently supported
+* Encrypted backups with AES-256-GCM
+* GPG-encrypted backup keys
+* Automatic incremental backup detection
 
 ## Installation
 
@@ -25,16 +24,35 @@ The binary will be available at `target/release/snapshot-to-s3`.
 
 ### Backup a Snapshot
 
+Basic usage with AWS S3:
+
 ```bash
 snapshot-to-s3 backup \
-  --filesystem zfs \
-  --snapshot pool/dataset@snapshot-name \
-  --bucket my-backup-bucket \
-  --gpg-key "user@example.com" \
-  --rate-limit 10485760  # Optional: 10 MB/s
+  zfs:pool/dataset@snapshot-name \
+  s3://my-backup-bucket/backups/dataset-snapshot \
+  --gpg-key "user@example.com"
 ```
 
-**Note:** GPG key lookup from keyring is not yet implemented. The `--gpg-key` parameter is required but the actual key lookup functionality needs to be completed.
+With rate limiting:
+
+```bash
+snapshot-to-s3 backup \
+  zfs:pool/dataset@snapshot-name \
+  s3://my-backup-bucket/backups/dataset-snapshot \
+  --gpg-key "user@example.com" \
+  --rate-limit 10485760  # 10 MB/s
+```
+
+For S3-compatible services (e.g., MinIO, Backblaze B2):
+
+```bash
+snapshot-to-s3 backup \
+  zfs:pool/dataset@snapshot-name \
+  s3://my-bucket/backups/dataset-snapshot \
+  --gpg-key "user@example.com" \
+  --endpoint https://s3.us-west-002.backblazeb2.com \
+  --region us-west-002
+```
 
 ### List Volumes
 
@@ -52,61 +70,103 @@ snapshot-to-s3 list-snapshots --filesystem zfs --volume pool/dataset
 
 ### AWS Credentials
 
-The tool uses the AWS SDK for Rust, which automatically loads credentials from:
-- Environment variables (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`)
-- AWS credentials file (`~/.aws/credentials`)
+The tool uses standard AWS credential loading:
+- Environment variables: `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`
+- AWS credentials file: `~/.aws/credentials`
 - IAM role (when running on EC2)
+
+For custom credentials, use command-line options:
+
+```bash
+snapshot-to-s3 backup ... \
+  --access-key-id YOUR_ACCESS_KEY \
+  --secret-access-key YOUR_SECRET_KEY \
+  --region us-east-1
+```
 
 ### GPG Key Setup
 
-GPG key lookup from the system keyring is not yet implemented. The `find_public_key` function needs to be completed to search for keys by user ID or key ID in the user's GPG keyring.
+You need a GPG key pair to encrypt the backup encryption keys.
 
-Generate a GPG key pair if you don't have one:
+Generate a new GPG key:
 
 ```bash
 gpg --full-generate-key
 ```
 
-## Storage Layout
+Follow the prompts to create a key. Use a strong passphrase to protect your private key.
 
-Each backup creates a single tar file at `s3://bucket/volume_id/snapshot_id/backup.tar` containing:
-
-- `key.gpg`: The AES-256-GCM encryption key, encrypted with your GPG public key
-- `meta.json.encrypted`: Backup metadata (volume ID, snapshot ID, mode, parent info)
-- `stream.encrypted`: The actual snapshot data stream
-- `log.encrypted`: Backup log
-
-User-defined metadata is also stored with the S3 object:
-- `x-amz-meta-gpg-id`: GPG key identifier
-- `x-amz-meta-mode`: `full` or `incremental`
-- `x-amz-meta-parent-vol-id`: Parent volume ID (for incremental)
-- `x-amz-meta-parent-snap-id`: Parent snapshot ID (for incremental)
-
-## Architecture
-
-The codebase is organized into modules:
-
-- `fs/`: Filesystem abstraction layer with support for ZFS and dummy filesystem
-- `crypto/`: Encryption (AES-256-GCM) and GPG key management
-- `storage/`: S3 client wrapper and streaming tar upload
-- `utils/`: Utilities like rate-limited buffering
-- `workflow/`: Backup workflow orchestration
-
-See `docs/design.md` for detailed design documentation.
-
-## Development
-
-Run tests:
+Export your public key (optional, for sharing):
 
 ```bash
-cargo test
+gpg --export -a "user@example.com" > my-public-key.asc
 ```
 
-Run with dummy filesystem for testing:
+**Note:** GPG keyring lookup is currently not implemented. You'll need to ensure your GPG key is available in the system keyring.
 
-```bash
-cargo run -- list-volumes --filesystem dummy
+### S3 Bucket Permissions
+
+Your AWS/S3 account needs the following permissions for the backup bucket:
+
+- `s3:PutObject` - Upload backup files
+- `s3:GetObject` - Read existing backups (for incremental detection)
+- `s3:ListBucket` - List existing backups
+- `s3:PutObjectTagging` - Set metadata on backup objects
+
+Example IAM policy:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "s3:PutObject",
+        "s3:GetObject",
+        "s3:ListBucket",
+        "s3:PutObjectTagging"
+      ],
+      "Resource": [
+        "arn:aws:s3:::my-backup-bucket/*",
+        "arn:aws:s3:::my-backup-bucket"
+      ]
+    }
+  ]
+}
 ```
+
+## Backup Storage
+
+### File Layout
+
+Each backup creates a file at: `s3://bucket/volume_id/snapshot_id/backup.tar`
+
+The tar file contains:
+- `key.gpg` - Backup encryption key (GPG-encrypted)
+- `meta.json.encrypted` - Backup metadata
+- `stream.encrypted` - Snapshot data
+- `log.encrypted` - Backup log
+
+### Object Metadata
+
+The following metadata is stored with each backup object (using the configured metadata prefix, default `x-amz-meta`):
+
+- `x-amz-meta-gpg-id` - GPG key identifier used for encryption
+- `x-amz-meta-mode` - Backup mode: `full` or `incremental`
+- `x-amz-meta-parent-vol-id` - Parent volume ID (for incremental backups)
+- `x-amz-meta-parent-snap-id` - Parent snapshot ID (for incremental backups)
+
+This metadata enables automatic incremental backup detection and chain validation.
+
+### Incremental Backups
+
+The tool automatically detects when an incremental backup is possible by:
+1. Checking for existing backups of the same volume
+2. Verifying the parent snapshot chain exists locally
+3. Using incremental send when possible
+
+For detailed design information, see `docs/design.md`.
 
 ## License
 

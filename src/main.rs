@@ -19,21 +19,31 @@ struct Cli {
 enum Commands {
     /// Backup a snapshot to S3
     Backup {
-        /// Filesystem type (zfs or dummy)
-        #[arg(short, long, default_value = "zfs")]
-        filesystem: String,
+        /// Source snapshot URI (e.g., zfs:pool/dataset@snapshot or dummy:volume@snapshot)
+        source: String,
 
-        /// Snapshot ID or name
-        #[arg(short, long)]
-        snapshot: String,
-
-        /// S3 bucket name
-        #[arg(short, long)]
-        bucket: String,
+        /// Destination S3 URI (e.g., s3://bucket/path/to/backup)
+        destination: String,
 
         /// GPG key ID or user ID
         #[arg(short, long)]
         gpg_key: String,
+
+        /// S3 endpoint URL (optional, for S3-compatible services)
+        #[arg(long)]
+        endpoint: Option<String>,
+
+        /// AWS access key ID (optional, defaults to environment/config)
+        #[arg(long)]
+        access_key_id: Option<String>,
+
+        /// AWS secret access key (optional, defaults to environment/config)
+        #[arg(long)]
+        secret_access_key: Option<String>,
+
+        /// AWS region (optional, defaults to environment/config)
+        #[arg(long)]
+        region: Option<String>,
 
         /// S3 metadata prefix (e.g., x-amz-meta)
         #[arg(long, default_value = "x-amz-meta")]
@@ -67,36 +77,49 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Commands::Backup {
-            filesystem,
-            snapshot,
-            bucket,
+            source,
+            destination,
             gpg_key,
+            endpoint,
+            access_key_id,
+            secret_access_key,
+            region,
             metadata_prefix,
             rate_limit,
         } => {
             println!("Starting backup process...");
-            println!("Filesystem: {}", filesystem);
-            println!("Snapshot: {}", snapshot);
-            println!("Bucket: {}", bucket);
+            println!("Source: {}", source);
+            println!("Destination: {}", destination);
             println!("GPG Key: {}", gpg_key);
 
+            // Parse source URI
+            let source_info = fs::SnapshotSource::parse(&source)?;
+            println!("Filesystem: {}", source_info.filesystem_type);
+            println!("Volume: {}", source_info.volume_path);
+            println!("Snapshot: {}", source_info.snapshot_name);
+
+            // Parse destination URI
+            let dest_info = storage::S3Destination::parse(&destination)?;
+            println!("S3 Bucket: {}", dest_info.bucket);
+            println!("S3 Key: {}", dest_info.key);
+
             // Create filesystem instance
-            let fs: Box<dyn fs::SnapshotableFilesystem> = match filesystem.as_str() {
+            let fs: Box<dyn fs::SnapshotableFilesystem> = match source_info.filesystem_type.as_str() {
                 "zfs" => Box::new(fs::zfs::ZfsFilesystem::new()),
                 "dummy" => {
                     // For dummy filesystem, create a simple test setup
                     let mut dummy_fs = fs::dummy::DummyFilesystem::new();
-                    let mut vol = fs::dummy::DummyVolume::new("test-volume".to_string());
+                    let mut vol = fs::dummy::DummyVolume::new(source_info.volume_path.clone());
                     vol.add_snapshot(fs::dummy::DummySnapshot::new(
-                        "test-snapshot".to_string(),
-                        "test-volume".to_string(),
+                        source_info.full_snapshot_id(),
+                        source_info.volume_path.clone(),
                         b"Test snapshot data".to_vec(),
                     ));
                     dummy_fs.add_volume(vol);
                     Box::new(dummy_fs)
                 }
                 _ => {
-                    eprintln!("Unknown filesystem type: {}", filesystem);
+                    eprintln!("Unknown filesystem type: {}", source_info.filesystem_type);
                     std::process::exit(1);
                 }
             };
@@ -104,17 +127,28 @@ async fn main() -> Result<()> {
             // Find GPG key
             let gpg_public_key = Some(crypto::gpg::find_public_key(&gpg_key).await?);
 
+            // Create S3 client config
+            let s3_config = storage::S3ClientConfig {
+                bucket: dest_info.bucket.clone(),
+                metadata_prefix: Some(metadata_prefix.clone()),
+                endpoint,
+                access_key_id,
+                secret_access_key,
+                region,
+            };
+
             // Create backup config
             let config = workflow::BackupConfig {
-                bucket,
+                bucket: dest_info.bucket,
                 gpg_key_id: gpg_key,
                 gpg_public_key,
                 metadata_prefix,
                 rate_limit,
+                s3_config: Some(s3_config),
             };
 
             // Execute backup
-            workflow::execute_backup(fs.as_ref(), &snapshot, config).await?;
+            workflow::execute_backup(fs.as_ref(), &source_info.full_snapshot_id(), config).await?;
 
             println!("Backup completed successfully!");
         }

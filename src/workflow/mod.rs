@@ -57,6 +57,7 @@ pub struct BackupConfig {
     pub gpg_public_key: Option<pgp::SignedPublicKey>,
     pub metadata_prefix: String,
     pub rate_limit: Option<u64>, // bytes per second
+    pub s3_config: Option<crate::storage::S3ClientConfig>,
 }
 
 /// Execute a backup workflow
@@ -74,7 +75,11 @@ pub async fn execute_backup(
     println!("Starting backup for volume: {}, snapshot: {}", volume_id, snap_id);
     
     // Create S3 client
-    let client = S3Client::new(config.bucket.clone(), Some(config.metadata_prefix.clone())).await?;
+    let client = if let Some(s3_config) = config.s3_config {
+        S3Client::with_config(s3_config).await?
+    } else {
+        S3Client::new(config.bucket.clone(), Some(config.metadata_prefix.clone())).await?
+    };
     
     // Check if backup already exists
     let backup_key = format!("{}/{}/backup.tar", volume_id, snap_id);
