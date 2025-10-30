@@ -100,29 +100,12 @@ Your AWS/S3 account needs the following permissions for the backup bucket:
 - `s3:GetObject` - Read existing backups (for incremental detection)
 - `s3:ListBucket` - List existing backups
 - `s3:PutObjectTagging` - Set metadata on backup objects
+- `s3:CreateMultipartUpload` - Initiate multipart uploads
+- `s3:UploadPart` - Upload parts in multipart uploads
+- `s3:CompleteMultipartUpload` - Complete multipart uploads
+- `s3:AbortMultipartUpload` - Abort incomplete multipart uploads
 
-Example IAM policy:
-
-```json
-{
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Effect": "Allow",
-      "Action": [
-        "s3:PutObject",
-        "s3:GetObject",
-        "s3:ListBucket",
-        "s3:PutObjectTagging"
-      ],
-      "Resource": [
-        "arn:aws:s3:::my-backup-bucket/*",
-        "arn:aws:s3:::my-backup-bucket"
-      ]
-    }
-  ]
-}
-```
+These permissions should be configured in your AWS IAM policy for the bucket.
 
 ## Backup Storage
 
