@@ -1,11 +1,10 @@
 {
   "name": "snapshot-to-s3 Development Container",
-  "image": "mcr.microsoft.com/devcontainers/rust:1-bookworm",
-  
+  "image": "mcr.microsoft.com/devcontainers/rust:2-1-trixie",
   "runArgs": [
-    "--platform=linux/amd64"
+    // "--platform=linux/amd64",
+    // "--userns=keep-id",
   ],
-  
   "customizations": {
     "vscode": {
       "extensions": [
@@ -16,7 +15,6 @@
         "streetsidesoftware.code-spell-checker"
       ],
       "settings": {
-        "rust-analyzer.checkOnSave.command": "clippy",
         "editor.formatOnSave": true,
         "[rust]": {
           "editor.defaultFormatter": "rust-lang.rust-analyzer"
@@ -24,12 +22,10 @@
       }
     }
   },
-  
   // "features": {
   //   "ghcr.io/devcontainers/features/github-cli:1": {}
   // },
-  
   "postCreateCommand": "rustc --version && cargo --version",
-  
-  "remoteUser": "vscode"
+  // "remoteUser": "vscode",
+  // "workspaceMount": "type=bind,source=${localWorkspaceFolder}/,target=/workspaces/snapshot-to-s3,idmap=uids=501-1000-1;gids=20-1000-1"
 }
