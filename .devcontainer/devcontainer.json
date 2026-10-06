@@ -4,6 +4,7 @@
   "runArgs": [
     // "--platform=linux/amd64",
     // "--userns=keep-id",
+    "--device=/dev/zfs"
   ],
   "customizations": {
     "vscode": {
@@ -22,10 +23,23 @@
       }
     }
   },
+  // "mounts": [
+  //   "source=/dev/zfs,target=/dev/zfs,type=device"
+  // ],
+  "capAdd": [
+    "SYS_ADMIN"
+  ],
+  "securityOpt": [
+    "apparmor=unconfined",
+    "label=disable"
+  ],
   // "features": {
   //   "ghcr.io/devcontainers/features/github-cli:1": {}
   // },
-  "postCreateCommand": "rustc --version && cargo --version",
+  "postCreateCommand": {
+    "version check": "rustc --version && cargo --version",
+    "install zfs by host zfs version 2.4.4-1": "sudo DEBIAN_FRONTEND=noninteractive sh .devcontainer/install_zfs.sh"
+  },
   // "remoteUser": "vscode",
   // "workspaceMount": "type=bind,source=${localWorkspaceFolder}/,target=/workspaces/snapshot-to-s3,idmap=uids=501-1000-1;gids=20-1000-1"
 }
