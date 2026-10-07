@@ -9,16 +9,26 @@ use std::sync::Mutex;
 use tokio::io::AsyncReadExt;
 use tokio_util::sync::CancellationToken;
 
+type TestUpload = (String, MetadataMap, BTreeMap<u32, Bytes>);
+
 #[derive(Default)]
 pub struct MemoryStore {
     pub objects: Mutex<BTreeMap<String, (Bytes, MetadataMap)>>,
     pub events: Mutex<Vec<String>>,
     pub failure: Mutex<Option<String>>,
     pub completion_lost: Mutex<bool>,
-    uploads: Mutex<BTreeMap<String, (String, MetadataMap, BTreeMap<u32, Bytes>)>>,
+    pub discard_parts: bool,
+    uploads: Mutex<BTreeMap<String, TestUpload>>,
 }
 
 impl MemoryStore {
+    pub fn discarding_parts() -> Self {
+        Self {
+            discard_parts: true,
+            ..Self::default()
+        }
+    }
+
     fn event(&self, event: String) -> Result<()> {
         self.events.lock().unwrap().push(event.clone());
         if self
@@ -125,7 +135,14 @@ impl ObjectStore for MemoryStore {
             .get_mut(upload)
             .unwrap()
             .2
-            .insert(number, data);
+            .insert(
+                number,
+                if self.discard_parts {
+                    Bytes::new()
+                } else {
+                    data
+                },
+            );
         Ok(format!("etag-{number}"))
     }
     async fn complete_upload(&self, key: &str, upload: &str, parts: &[Part]) -> Result<()> {
@@ -160,6 +177,9 @@ pub struct FakeZfs {
     pub events: Mutex<Vec<String>>,
     pub receive_failure: Option<usize>,
     pub send_failure: bool,
+    pub receive_data: Mutex<Vec<Vec<u8>>>,
+    pub send_bytes: Vec<u8>,
+    pub send_read_failure: bool,
 }
 
 impl FakeZfs {
@@ -179,6 +199,9 @@ impl FakeZfs {
             events: Mutex::new(Vec::new()),
             receive_failure: None,
             send_failure: false,
+            receive_data: Mutex::new(Vec::new()),
+            send_bytes: b"snapshot-stream".to_vec(),
+            send_read_failure: false,
         }
     }
 }
@@ -188,28 +211,45 @@ impl Zfs for FakeZfs {
     async fn snapshot(&self, name: &SnapshotName) -> Result<SnapshotInfo> {
         self.snapshots
             .iter()
-            .find(|s| &s.name == name)
+            .find(|s| s.name.snapshot == name.snapshot)
             .cloned()
+            .map(|mut snapshot| {
+                snapshot.name = name.clone();
+                snapshot
+            })
             .ok_or_else(|| anyhow::anyhow!("snapshot missing"))
     }
     async fn snapshots(&self, _: &str) -> Result<Vec<SnapshotInfo>> {
         Ok(self.snapshots.clone())
     }
-    async fn written(&self, _: &SnapshotName, _: &SnapshotName) -> Result<Option<u64>> {
-        Ok(Some(5))
+    async fn written(&self, base: &SnapshotName, _: &SnapshotName) -> Result<Option<u64>> {
+        Ok(self
+            .snapshots
+            .iter()
+            .find(|s| &s.name == base)
+            .map(|s| s.createtxg))
     }
-    async fn estimate(&self, _: &SnapshotName, _: Option<&SnapshotName>) -> Result<Option<u64>> {
-        self.events.lock().unwrap().push("estimate".into());
+    async fn estimate(&self, _: &SnapshotName, base: Option<&SnapshotName>) -> Result<Option<u64>> {
+        self.events.lock().unwrap().push(format!(
+            "estimate {}",
+            base.map(SnapshotName::full_name)
+                .unwrap_or_else(|| "full".into())
+        ));
         Ok(Some(20))
     }
     async fn send(&self, _: &SnapshotName, _: Option<&SnapshotName>) -> Result<SendStream> {
         let fail = self.send_failure;
         Ok(SendStream {
-            reader: Box::new(std::io::Cursor::new(b"snapshot-stream".to_vec())),
+            reader: if self.send_read_failure {
+                Box::new(FailingRead)
+            } else {
+                Box::new(std::io::Cursor::new(self.send_bytes.clone()))
+            },
             completion: tokio::spawn(async move {
                 if fail {
                     bail!("send failed");
                 }
+
                 Ok(())
             }),
             cancel: CancellationToken::new(),
@@ -239,6 +279,19 @@ impl Zfs for FakeZfs {
         }
         let mut out = Vec::new();
         stream.read_to_end(&mut out).await?;
+        self.receive_data.lock().unwrap().push(out);
         Ok(())
+    }
+}
+
+struct FailingRead;
+
+impl tokio::io::AsyncRead for FailingRead {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+        _: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Err(std::io::Error::other("injected stream read failure")))
     }
 }
