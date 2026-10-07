@@ -1,8 +1,8 @@
 # Storage layout
 
-Each backup creates a file at: `s3://${prefix}/{dataset_name}/{snapshot_name}.tar`. 
+Each backup creates a file at prefix `s3://${prefix}/{dataset_name}/{snapshot_name}/`. 
 
-The resulting backup tar file contains:
+Files under this prefix are:
 
 - `key.gpg` - Backup encryption key (GPG-encrypted)
 - `key.sha256sum` - SHA256 sum for decrypted content of `key.gpg`
@@ -18,7 +18,7 @@ a more precision way to describe it. This allows ~2000TiB encryption per file, w
 
 Associated data of the stream should be the SHA256 checksum value of `meta.json`. Other files have no associated data.
 
-The following metadata is stored with each backup object (using the configured metadata prefix, default `x-amz-meta`):
+The following metadata is stored for `stream.encrypted` (using the configured metadata prefix, default `x-amz-meta`):
 
 - `x-amz-meta-gpg-key-id` - GPG key identifier used for encryption
 - `x-amz-meta-fs-type` - File system type. Now fixed at `zfs`
@@ -47,26 +47,26 @@ Then if you execute this command:
 snapshot-to-s3 backup zfs:vp1/guid_lab/alpha@s1  s3://my-backup-bucket/backups/dataset-snapshot --gpg-key-id ED7C55E60B7543A2
 ```
 
-The resulting file would be:
+The resulting file would be under:
 
 ```bash
-s3://my-backup-bucket/backups/dataset-snapshot/vp1/guid_lab/alpha/s1.tar
+s3://my-backup-bucket/backups/dataset-snapshot/vp1/guid_lab/alpha/s1/
 ```
 
-And it would have these metadata:
+And it would have these metadata for `stream.encrypted`:
 
 - `x-amz-meta-gpg-key-id`: `4E8BBEB1DF8D5C3CCA2F6B51ED7C55E60B7543A2`. Note here ID is expanded to full format.
 - `x-amz-meta-vol-id`: `14066916649205506663`
 - `x-amz-meta-current-snapshot-id`: `16158825896409765662`
 - `x-amz-meta-base-snapshot-id`: empty
 
-If snapshot `s2` is also uploaded and if `s1` is selected as base, the new file would be:
+If snapshot `s2` is also uploaded and if `s1` is selected as base, the new file would be under:
 
 ```bash
-s3://my-backup-bucket/backups/dataset-snapshot/vp1/guid_lab/alpha/s2.tar
+s3://my-backup-bucket/backups/dataset-snapshot/vp1/guid_lab/alpha/s2/
 ```
 
-With these metadata:
+With these metadata for `stream.encrypted`:
 
 - `x-amz-meta-gpg-key-id`: `4E8BBEB1DF8D5C3CCA2F6B51ED7C55E60B7543A2`. Note here ID is expanded to full format.
 - `x-amz-meta-vol-id`: `14066916649205506663`
