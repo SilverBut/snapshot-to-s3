@@ -28,46 +28,44 @@ unencrypted dataset.
 
 ## Component layout
 
-Note, directories mentioned in this paragraph are relative to the source root.
+Module names below are relative to `src/` and describe the current rebuild architecture target.
 
-`fs/` provides compatible layer for different file system. Each struct should implement a set of traits which can:
+### Domain and protocol model
 
-* List volumes (for `zfs` this means all vol and subvols)
-* List snapshots for a volume
-* For a volume or snapshot, get its properties and its ID
-* Get raw stream of a snapshot, or a diff of two snapshots
-* Receive a stream and report the command's result
-* Check an existing filesystem against its latest snapshot during restore preparation
+* `model.rs`: validated snapshot/dataset names, decimal GUID rules, S3 location and per-backup metadata/index
+  structures.
+* `selection.rs`: incremental-base discovery policy and candidate diagnostics.
+* `prepare.rs`: restore Prepare planning, chain validation and local/remote preconditions.
 
-Trait inclues `SnapshotableFilesystem`, `Volume`, `Snapshot`. For now, we need two struct `dummy` and `zfs`.
+### ZFS and process execution
 
-`storage/` mainly wraps client to access S3-compatible object storage to provide those capabilities:
+* `zfs_api.rs`: focused ZFS interface used by backup/restore workflows.
+* `zfs.rs`: Linux `zfs`/`zpool` command integration for filesystem snapshots only.
+* `process.rs`: bounded process I/O capture, child lifecycle and cancellation handling.
 
-* List files in bucket witha optional prefix
-* Stat a file info
-* Get a file's user defined metadata (like `x-amz-meta-*` or `x-cos-meta-`, depends on user config)
-* Upload a file
-* Read an object as a stream
-* Upload stream parts, complete or abort a multipart upload
-* Create a lock object atomically if absent, and delete a held lock
+The rebuild is filesystem-only by design; zvol/block-volume paths are rejected. No generalized dummy filesystem backend
+is part of the required architecture.
 
-Snapshot data is uploaded directly as an encrypted stream, without a tar container. Multipart buffering, publication
-and failure handling follow [storage.md](storage.md).
+### Object-store and transfer pipeline
 
-`crypto/` is where out encryption reload code resides. It can:
+* `store.rs`: object-store trait for HEAD/GET/PUT/list, conditional create and multipart operations.
+* `http_store.rs`: S3-compatible HTTP transport with SigV4 signing, configurable metadata header prefix, endpoint,
+  addressing mode, and signing service.
+* `transfer.rs`: lock handling, bounded multipart buffering, retries for retryable transport failures and commit checks.
 
-* Genearte a random key
-* For a given key, create a encrytion interface which accepts a stream input and send encrypted stream out
-* Decrypt and authenticate each encrypted object's stream through its final segment
-* GPG related
-    * Find (public) encyrpt-capable key indicated by user id or key id
-    * Encrypt with the key
-    * Decrypt the backup key using an available private key
+The object-store layer is implemented without AWS SDK dependencies. Supported credential inputs are documented in
+README; this design does not imply full AWS provider-chain parity.
+
+### Crypto and end-to-end workflows
+
+* `crypto.rs`: per-backup key generation, streaming AEAD (`AES128_GCM_HKDF_1MB`) and GPG key wrap/unwrap helpers.
+* `backup.rs`: lock acquisition, base selection, metadata publication, encrypted stream upload and commit resolution.
+* `restore.rs`: Prepare → Verification → Replay flow, including stdout export mode.
+* `rate.rs`: optional ciphertext throughput limiting in the backup pipeline.
+* `cli.rs`/`main.rs`: command-line parsing and top-level orchestration.
 
 Plaintext backup keys, metadata and stream data must remain in memory or pipes, not application-managed temporary
 files. This does not claim to control operating-system facilities such as swap or core dumps.
-
-`utils/` is a set of tools. `utils/mbuffer.rs` provides [mbuffer][mbuffer] ability so we can apply speed limit.
 
 ## Resource and error handling
 
@@ -105,6 +103,33 @@ These are requirements for later implementation validation, not claims that test
 | Stdout export | Export one stream, keep diagnostics separate, fail explicitly if the export is incomplete |
 | Small and large streams, retries and service limits | Preserve ciphertext, keep memory bounded and report exceeded limits |
 
----
+### Acceptance evidence mapping (current)
 
-[mbuffer]: https://www.maier-komor.de/mbuffer.html
+The table below maps the normative scenarios to concrete tests/scripts. It records evidence sources, not provider-wide
+compatibility guarantees.
+
+| Scenario row | Evidence sources |
+| --- | --- |
+| Full and multi-step incremental recovery | `tests/support/zfs_s3_e2e.sh` (full + `s1/s2/s3` replay), plus `tests/zfs_backend.rs` and `src/prepare.rs` chain planning tests |
+| Incomplete remote chain | `tests/support/zfs_s3_e2e.sh` (removed remote `s1` path: empty target reject + matching local-base continuation) and `src/prepare.rs::local_declared_base_needs_no_remote_parent` |
+| Existing target has changes, or `zfs diff` fails | `src/prepare.rs::dirty_target_stops_before_any_verification_download`, `src/prepare.rs::diff_command_failure_stops_before_verification`, and e2e dirty-target rejection in `tests/support/zfs_s3_e2e.sh` |
+| No matching latest local base | `src/prepare.rs::existing_target_without_matching_latest_is_rejected` |
+| Wrong parent GUID, metadata mismatch or dependency cycle | `src/prepare.rs::parent_mismatch_and_cycles_are_errors`, metadata/auth checks in `src/restore.rs::verify` and `tests/crypto_stream.rs` |
+| Valid prefix followed by corruption or truncation | `tests/crypto_stream.rs::authenticates_aad_segments_and_final_segment`, `tests/crypto_stream.rs::verifies_prefix_with_known_object_length` |
+| Send, encryption, part or log upload failure | `src/backup.rs::publication_failure_matrix_and_authenticated_export`, `src/transfer.rs::small_object_bound_and_cancelled_upload` |
+| Concurrent writers or existing backup content | `src/transfer.rs::only_one_writer_and_partial_content_refused`, plus opt-in real endpoint check `tests/live_http.rs::real_s3_conditions_ranges_and_multipart` |
+| Unknown completion result or stale lock | `src/transfer.rs::completion_response_loss_requires_matching_object`, `src/backup.rs::publication_failure_matrix_and_authenticated_export` |
+| Receive fails after earlier chain steps | failure-handling assertions in `src/restore.rs`/`src/prepare.rs` tests and e2e replay checks in `tests/support/zfs_s3_e2e.sh` |
+| Stdout export | `tests/support/zfs_s3_e2e.sh` stdout single-stream receive path; backup/export failure matrix in `src/backup.rs::publication_failure_matrix_and_authenticated_export` |
+| Small and large streams, retries and service limits | `src/transfer.rs::multipart_limits_and_exact_ciphertext`, `src/transfer.rs::generated_large_stream_has_fixed_buffer_budget`, `tests/zfs_rate.rs`, `tests/http_store.rs` (retry/status/range/multipart capability behavior) |
+
+Additional implementation evidence:
+
+* Tink interop vectors and bidirectional runtime compatibility: `tests/crypto_stream.rs`
+* Opt-in real HTTP object-store smoke coverage: `tests/live_http.rs` (requires isolated endpoint/credentials)
+* Real ZFS + local S3 end-to-end script: `tests/support/zfs_s3_e2e.sh` (safe namespace only)
+
+Provider scope note: local SeaweedFS/OpenZFS acceptance and offline tests do **not** imply live verification on AWS S3,
+MinIO, Backblaze B2, Alibaba OSS, or universal S3 compatibility. Treat each provider as unverified until separately run.
+
+---
