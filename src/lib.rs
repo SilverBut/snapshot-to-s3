@@ -1,4 +1,5 @@
 pub mod crypto;
+pub mod http_store;
 pub mod model;
 pub mod process;
 pub mod rate;
