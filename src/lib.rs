@@ -7,6 +7,7 @@ pub mod zfs;
 pub mod prepare;
 pub mod selection;
 pub mod store;
+pub mod transfer;
 #[cfg(test)]
 pub(crate) mod testing;
 pub mod zfs_api;

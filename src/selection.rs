@@ -94,3 +94,98 @@ pub async fn select_base(
         }),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{BackupMetadata, SnapshotName};
+    use crate::testing::{FakeZfs, MemoryStore};
+    use bytes::Bytes;
+
+    #[tokio::test]
+    async fn candidate_pool_is_shortlisted_and_force_full_skips_remote() {
+        let store = MemoryStore::default();
+        let mut zfs = FakeZfs::new();
+        zfs.snapshots = (1..=21)
+            .map(|n| SnapshotInfo {
+                name: SnapshotName::parse(&format!("zfs:pool/data@s{n}")).unwrap(),
+                guid: (n + 100).to_string(),
+                volume_guid: "1".into(),
+                createtxg: n,
+            })
+            .collect();
+        let location = S3Location::parse("s3://b/backups").unwrap();
+        for s in &zfs.snapshots {
+            let metadata = BackupMetadata {
+                gpg_key_id: "fingerprint".into(),
+                fs_type: "zfs".into(),
+                vol_id: "1".into(),
+                current_snapshot_id: s.guid.clone(),
+                base_snapshot_id: None,
+                base_object_key: None,
+                source_dataset: s.name.dataset.clone(),
+                source_snapshot: s.name.snapshot.clone(),
+            };
+            store
+                .put(
+                    &format!("{}stream.encrypted", location.backup_prefix(&s.name)),
+                    Bytes::from_static(b"stream"),
+                    &metadata.index().unwrap(),
+                )
+                .await
+                .unwrap();
+        }
+        let selected = select_base(
+            &store,
+            &zfs,
+            &location,
+            zfs.snapshots.last().unwrap(),
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(selected.base.is_some());
+        assert_eq!(
+            zfs.events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|e| e.starts_with("estimate "))
+                .count(),
+            8
+        );
+        store.events.lock().unwrap().clear();
+        zfs.events.lock().unwrap().clear();
+        assert!(
+            select_base(&store, &zfs, &location, zfs.snapshots.last().unwrap(), true)
+                .await
+                .unwrap()
+                .base
+                .is_none()
+        );
+        assert!(store.events.lock().unwrap().is_empty());
+        assert_eq!(zfs.events.lock().unwrap().as_slice(), ["estimate full"]);
+    }
+
+    #[tokio::test]
+    async fn remote_operational_error_does_not_fall_back() {
+        let store = MemoryStore::default();
+        *store.failure.lock().unwrap() = Some("HEAD ".into());
+        let mut zfs = FakeZfs::new();
+        let mut current = zfs.snapshots[0].clone();
+        current.createtxg = 2;
+        current.guid = "20".into();
+        current.name.snapshot = "s2".into();
+        zfs.snapshots.push(current.clone());
+        assert!(select_base(
+            &store,
+            &zfs,
+            &S3Location::parse("s3://b/backups").unwrap(),
+            &current,
+            false
+        )
+        .await
+        .is_err());
+        assert!(zfs.events.lock().unwrap().is_empty());
+    }
+}
