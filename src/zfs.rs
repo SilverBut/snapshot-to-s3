@@ -135,7 +135,7 @@ impl SystemZfs {
             "-p".into(),
             "-o".into(),
             "property,value".into(),
-            "type,guid,volume_guid,createtxg".into(),
+            "guid,createtxg".into(),
             name.full_name(),
         ];
         let output = self.run_capture(&self.zfs_bin, &args).await?;
@@ -163,26 +163,38 @@ impl SystemZfs {
         Ok(Some(values))
     }
 
+    async fn filesystem_guid(&self, dataset: &str) -> Result<String> {
+        let args = vec![
+            "get".into(),
+            "-H".into(),
+            "-p".into(),
+            "-o".into(),
+            "value".into(),
+            "guid".into(),
+            dataset.into(),
+        ];
+        let output = self.run_capture(&self.zfs_bin, &args).await?;
+        if !output.status.success() {
+            bail!(
+                "failed reading filesystem guid for {dataset}: {}",
+                output.stderr.trim()
+            );
+        }
+        let guid = output.stdout.trim().to_string();
+        validate_guid(&guid)?;
+        Ok(guid)
+    }
+
     fn snapshot_from_props(
         name: SnapshotName,
         props: BTreeMap<String, String>,
+        volume_guid: String,
     ) -> Result<SnapshotInfo> {
-        match props.get("type").map(String::as_str) {
-            Some("snapshot") => {}
-            Some(other) => bail!("unexpected type for {}: {other}", name.full_name()),
-            None => bail!("missing type for {}", name.full_name()),
-        }
-
         let guid = props
             .get("guid")
             .cloned()
             .ok_or_else(|| anyhow!("missing guid for {}", name.full_name()))?;
         validate_guid(&guid)?;
-
-        let volume_guid = props
-            .get("volume_guid")
-            .cloned()
-            .ok_or_else(|| anyhow!("missing volume_guid for {}", name.full_name()))?;
         validate_guid(&volume_guid)?;
 
         let createtxg = props
@@ -219,7 +231,7 @@ impl SystemZfs {
             bail!("zfs send estimate failed: {}", output.stderr.trim());
         }
 
-        for line in output.stdout.lines() {
+        for line in output.stdout.lines().chain(output.stderr.lines()) {
             if let Some(raw) = line.strip_prefix("size\t") {
                 return raw
                     .trim()
@@ -287,11 +299,12 @@ impl Zfs for SystemZfs {
         validate_dataset(&name.dataset)?;
         self.ensure_filesystem(&name.dataset).await?;
 
+        let volume_guid = self.filesystem_guid(&name.dataset).await?;
         let props = self
             .snapshot_props(name)
             .await?
             .ok_or_else(|| anyhow!("snapshot does not exist: {}", name.full_name()))?;
-        Self::snapshot_from_props(name.clone(), props)
+        Self::snapshot_from_props(name.clone(), props, volume_guid)
     }
 
     async fn snapshots(&self, dataset: &str) -> Result<Vec<SnapshotInfo>> {
