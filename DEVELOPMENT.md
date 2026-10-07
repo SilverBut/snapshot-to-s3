@@ -2,17 +2,39 @@
 
 ## Devcontainer Setup
 
-Devcontainer setup is easy. Ensure your host have OpenZFS installed, then create test zpools from host. Then you can
-see them in the container and use it.
+Ensure the host has OpenZFS installed and an administrator has provided a development pool. The container uses the
+host's ZFS kernel module through `/dev/zfs`; visible pools are not isolated from the host.
 
-Prevent create pools from the container because it requires device access to host, which is hard from container. Label
-test zpool so other people can see it:
+Development tests and agents must only use existing pools. Do not create or recreate pools, prepare backing devices
+or files, import, export or destroy pools, or change pool labels to make them eligible. If no suitable pool exists,
+stop and ask the administrator to provide one.
 
+Discover pools on the current machine rather than hard-coding names or backing paths:
+
+```bash
+zfs version
+zpool list
+zpool get user:isdev
+zpool status -P
+sudo -n true
 ```
-root@localhost:/var/zfs-pools# zpool create -f vp1 ./vp1
-root@localhost:/var/zfs-pools# zpool create -f vp2 ./vp2
-root@localhost:/var/zfs-pools# zpool create -f vp3 ./vp3
-root@localhost:/var/zfs-pools# zpool set user:isdev=yes vp1
-root@localhost:/var/zfs-pools# zpool set user:isdev=yes vp2
-root@localhost:/var/zfs-pools# zpool set user:isdev=yes vp3
+
+Select only an ONLINE pool whose **pool property** `user:isdev` is exactly `yes`, and verify the selected pool:
+
+```bash
+zpool get -H -o value user:isdev "$pool"
 ```
+
+The label permits isolated development testing, not unrestricted destruction. Follow [AGENTS.md](AGENTS.md):
+
+* Use a unique child namespace such as `$pool/smoke_<unique-id>`, and verify it does not already exist before creating it.
+* Change properties, write, receive, roll back and destroy datasets only within the namespace created by the test.
+* Use explicit temporary mountpoints and `canmount=on`; confirm `findmnt -n -o FSTYPE -T "$mountpoint"` reports `zfs`
+  before writing.
+* Set `atime=off` on source and received filesystems so verification reads do not modify the receive target.
+* Use `set -euo pipefail` and an exit trap for cleanup. Report cleanup failures and retain diagnostic files when needed.
+  Never remove a mountpoint tree while its dataset remains mounted.
+* Do not use `zfs receive -F` to hide unexpected target changes.
+
+The acceptance scenarios in [docs/design.md](docs/design.md#acceptance-scenarios) define later validation of the
+backup and restore requirements; preparing this environment does not establish that those behaviors are implemented.
