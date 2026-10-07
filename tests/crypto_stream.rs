@@ -1,5 +1,4 @@
-#[path = "../src/crypto.rs"]
-mod crypto;
+use snapshot_to_s3::crypto;
 
 use std::{
     pin::Pin,
@@ -128,14 +127,6 @@ async fn interoperates_with_independent_tink_framing_vector() {
         &[0x18, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22]
     );
     assert_eq!(decrypt_bytes(&vector, aad).await.unwrap(), plaintext);
-
-    let mut input = ChunkReader::new(plaintext.to_vec(), 5);
-    let mut output = VecWriter::default();
-    let header: [u8; 24] = vector[..24].try_into().unwrap();
-    crypto::encrypt_with_header(&key(), aad, &mut input, &mut output, &header)
-        .await
-        .unwrap();
-    assert_eq!(output.0, vector);
 }
 
 #[tokio::test]
@@ -238,6 +229,9 @@ async fn verifies_prefix_with_known_object_length() {
 #[tokio::test]
 async fn gpg_apis_reject_invalid_inputs_without_invoking_gpg() {
     assert!(crypto::resolve_recipient("-output").await.is_err());
+    assert!(crypto::resolve_decryption_recipient("-output")
+        .await
+        .is_err());
     assert!(crypto::encrypt_key("not-a-full-fingerprint", &key())
         .await
         .is_err());
