@@ -36,42 +36,6 @@ indicates so.
 
 `utils/` is a set of tools. `utils/mbuffer.rs` provides [mbuffer][mbuffer] ability so we can apply speed limit.
 
-## Stream Tar for Multipart Upload
-
-We all know that for a S3 compatible object storage, *multipart upload* is a common feature. It's typical use case is:
-
-* Get a upload ID first
-* Cut a file into series of small parts with increasing part numbers (>5MiB each part except for last piece)
-* Upload each part with upload ID and part number, returning a ETag
-* Finialize the multipart upload with upload ID, all part numbers and their ETags
-* Object stoarge will concatenating the parts in ascending order based on the part number
-
-It can help us to upload a large `tar` file, but our problem is our file (or stream) size, can't be known in advance:
-
-```
-[tar header with file length]
-[file content at length]
-[optional padding]
-[tar header with file length]
-[file content at length]
-[optional padding]
-...
-[eof marker]
-```
-
-Fortunately, most S3 object storage allows overwrite any previous upload part, so actually we can:
-
-1. Upload a pseudo tar header where everything set but size filled to 0
-2. Upload stream content with padding. We can know the stream size meanwhile.
-3. Overwrite the part written in step 1 and fill size back.
-
-Normally, the uploaded part can not be retrieved again, so the part with header will be uploaded later than content, 
-which seems weird but totally legit. This also means the part size is dynamic:
-
-- Size of last part is fine as long as it does not beyond maxium
-- Part with header should be as small as possible but >= 5MiB to meet the minimal part size requirement
-- Other data part should be larger (500MiB for example)
-
 ---
 
 [mbuffer]: https://www.maier-komor.de/mbuffer.html

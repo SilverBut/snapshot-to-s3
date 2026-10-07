@@ -9,7 +9,7 @@ Be aware that the plain text encryption key shall never leave on disk. Always us
 Parse `zfs:` backup source and readout pool name, filesystem name, and snapshot name.
 
 According to [storage format description](storage.md) ensure bucket is accessible and no existing snapshot backup
-file exists.
+file exists under this snapshot's target prefix.
 
 Use method described in [Find parent snapshot automatically](#find-parent-snapshot-automatically), decide whether this
 is an incremental or full send.
@@ -37,21 +37,19 @@ have smallest size to send. Find the smallest one.
 
 ### Send backup
 
-In [design document](design.md) there is a way to upload tar file dynamically using multipart upload. That would be how
-we create the backup file. 
+Upload key file and metadata file first. The metadata file `meta.json` provides all info about snapshot current being
+backup, and the incremental base if any. Both snapshot's ID **must** be saved in `meta.json` for verification. Other
+metainfo can put there too if they are available before sending backup data.
 
 Create the multipart upload job according to the [storage format description](storage.md) with proper metadata set, 
-then fill backup file according to the same spec.
-
-The metadata file `meta.json` provides all info about snapshot current being backup, and the incremental base if any. 
-Both snapshot's ID **must** be saved in `meta.json` for verification. Other metainfo can put there too if they are
-available before sending backup data.
-
-The backup stream is retrieved by `zfs send -w`, which sends a raw stream, or a incremental raw stream. This allows us
-having additional layer of security in additional to the backup encryption.
+then stream encryption the backup stream to this file. The backup stream is retrieved by `zfs send -w`, which sends a
+raw stream, or a incremental raw stream. This allows us having isolated layer of security in additional to the backup
+encryption.
 
 After backup stream is send, all currently available log should be appended to the log file and upload, as a part of
-backup file. Finalize the tar file and multipart upload. Print the uploaded file info into the log.
+backup file. Log should be encrypted, too.
+
+Ensure files under the target snapshot's S3 prefix match the [storage format description](storage.md).
 
 ## Restore
 
@@ -90,8 +88,8 @@ Now we can ensure if we replay *source chain* one by one into the target ZFS fil
 Now either we got a *source chain* with multiple elements, or we got a single *source archive*. Any way, they are all
 backup archives following [storage specification](storage.md).
 
-For each file, we try stream read the tar file to download `key.gpg` and `key.sha256sum`. Decrypt key and verify if
-checksum matches. If key can not be decrypted or the checksum does not meet, report error.
+For each file, we try to download `key.gpg` and `key.sha256sum`. Decrypt key and verify if checksum matches. If key can
+not be decrypted or the checksum does not meet, report error.
 
 Use `key` to decrypt `meta.json.encrypted`. Ensure ID's saved in `meta.json` are same with values read from S3 metadata,
 and they are same with *source chain*. If not, report error. This usually means some weird problem happened.
