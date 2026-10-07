@@ -1,5 +1,8 @@
 pub mod crypto;
 pub mod model;
+pub mod process;
+pub mod rate;
+pub mod zfs;
 pub mod prepare;
 pub mod selection;
 pub mod store;
