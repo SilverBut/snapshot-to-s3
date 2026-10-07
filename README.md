@@ -1,17 +1,18 @@
 # snapshot-to-s3
 
-Encrypt snapshots from modern filesystems and upload to S3-compatible object storage.
+Encrypt ZFS filesystem snapshots and upload to S3-compatible object storage.
 
 This README and the documents in `docs/` describe the target requirements and design, not a claim that every behavior
 has already been implemented.
 
 ## Features
 
-* Stream processing to prevent additional disk usage and risk of plaintext leak
-* ZFS on Linux currently supported
-* Encrypted backups with [AES-GCM-HKDF][aes-gcm-hkdf]
-* GPG-protected backup keys
-* Automatic incremental backup detection
+* Stream-first pipeline: plaintext remains in memory/pipes, not app-managed temporary files
+* Linux ZFS filesystem snapshots (`zfs:dataset@snapshot`) with raw send/receive
+* Explicit rejection of non-filesystem datasets (for example zvol/block volumes)
+* Streaming AEAD encryption (`AES128_GCM_HKDF_1MB`) with per-backup wrapped keys
+* Backup-chain metadata, lock protocol and authenticated restore/stdout export workflow
+* S3-compatible HTTP + SigV4 implementation with configurable endpoint, metadata prefix and signing service
 
 ## Usage
 
@@ -23,7 +24,7 @@ Ensure you have:
 Then install the program by build from source:
 
 ```bash
-cargo build --release
+cargo build --release --locked
 ```
 
 **Before** you run any command, ensure you have setup credentials. See next chapter about now to do this.
@@ -42,7 +43,7 @@ snapshot-to-s3 backup \
 Backup is always collected in raw format from ZFS side. The tool will select a base snapshot automatically. See
 document to understand how it works.
 
-To skip base selection and force a full backup:
+To skip base selection and force a full backup (`force-full` mode):
 
 ```bash
 snapshot-to-s3 backup \
@@ -57,7 +58,7 @@ refuse to overwrite committed or partial backup content. Snapshot scheduling, re
 backup inspection are external responsibilities. Selecting an incremental base does not prove that its entire remote
 chain is intact; preserve required dependencies when applying external lifecycle rules.
 
-With rate limiting:
+With ciphertext rate limiting:
 
 ```bash
 snapshot-to-s3 backup \
@@ -67,7 +68,7 @@ snapshot-to-s3 backup \
   --rate-limit 10485760  # 10 MB/s
 ```
 
-For S3-compatible services (e.g., MinIO, Backblaze B2) you may want to change the endpoint and use another metadata prefix:
+For S3-compatible services (for example MinIO or Backblaze B2), set endpoint, metadata prefix, region, and optional addressing/signing overrides:
 
 ```bash
 snapshot-to-s3 backup \
@@ -76,8 +77,12 @@ snapshot-to-s3 backup \
   --gpg-key-id "user@example.com" \
   --endpoint https://s3.us-west-002.backblazeb2.com \
   --region us-west-002 \
-  --metadata-prefix x-bz-info
+  --metadata-prefix x-bz-info \
+  --signing-service s3 \
+  --virtual-hosted-style
 ```
+
+Addressing defaults to **path-style** when `--endpoint` is set (unless `--virtual-hosted-style` is provided), and to virtual-hosted style for default AWS endpoints. You may force path-style with `--path-style`.
 
 Reusing a snapshot name at the same backup prefix is refused if backup content already exists. Failed uploads may
 leave partial objects or a lock; confirm the writer and upload are stopped before manually cleaning them.
@@ -101,8 +106,10 @@ snapshot-to-s3 restore \
   zfs:pool/dataset@snapshot-name \
   --gpg-key-id "user@example.com" \
   --target-pool optional_target_pool \
-  --target-dataset optional_target_dataset
+  --target-dataset relative/dataset/path
 ```
+
+`--target-dataset` is interpreted relative to `--target-pool`. It must not include another pool segment.
 
 For ZFS restore, follow the parent object keys and replay only the required chain, stopping at a matching latest local
 snapshot or a full backup. An incomplete remote chain cannot recover an empty target, but may still work with a matching
@@ -130,19 +137,34 @@ Stdout exports only this backup's send stream, including a single incremental st
 concatenate dependencies or inspect a local target. Diagnostics go to stderr; a nonzero exit status may follow partial
 output if decryption or writing fails.
 
+## Multipart and memory controls
+
+Backup upload limits are explicit CLI controls:
+
+* `--min-part-size` (default 5 MiB)
+* `--max-part-size` (default 5 GiB)
+* `--max-parts` (default 10,000)
+* `--max-object-size` (default 5 TiB)
+* `--part-buffer-size` (default 64 MiB)
+
+`--part-buffer-size` caps in-process part buffering for the single active multipart stream. Effective memory also includes
+crypto/rate pipes and runtime overhead; it is bounded and does not grow with total stream size. Large objects near a
+service's maximum may require a larger explicit buffer and limits aligned to that service's part/object constraints.
+
 ## Configuration
 
 ### S3 Credentials
 
-The tool uses standard AWS credential loading:
+The binary does **not** use the AWS Rust SDK provider chain. It implements the currently supported credential sources:
 
-- Environment variables: `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`
-- AWS credentials file: `~/.aws/credentials`
-- IAM role (when running on EC2)
+- Environment variables: `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` (optional `AWS_SESSION_TOKEN`)
+- Shared credentials file (`~/.aws/credentials` or `AWS_SHARED_CREDENTIALS_FILE`) with `AWS_PROFILE`
+- EC2 IMDSv2 role credentials
 
-Define credentials by options is not supported, to reduce risk of leaking credentials.
+Command-line credential flags are intentionally unsupported to reduce secret leakage risk.
 
-If you are using a S3-compatible service, just ensure they support S3-style auth.
+Other AWS provider-chain sources (for example SSO, ECS task role, EKS IRSA, web identity, process providers) are not
+currently claimed unless separately implemented and validated.
 
 ### GPG Key Setup
 
@@ -178,8 +200,15 @@ Your AWS/S3 account needs the following permissions for the backup bucket:
 the lock. User-defined metadata is not object tagging. The endpoint must support atomic create-if-absent for locks;
 ordinary HEAD followed by PUT is insufficient.
 
+Before publication, backup performs atomic-condition and metadata capability probes under:
+`{configured-s3-prefix}/.snapshot-to-s3-probes/<random>/.lock`.
+The HTTP layer enforces a `.lock` probe-key suffix.
+
+Endpoints that ignore `If-None-Match: *` or do not preserve the configured metadata-header prefix are rejected early.
+Probe lock keys are transient and are deleted after verification.
+
 Configure bucket and object permissions in your AWS IAM policy. Restrict the application's `s3:DeleteObject` permission
-to lock objects; manual cleanup of partial backups is a separate operator action.
+to lock-suffix objects (including transient probe locks); manual cleanup of partial backups is a separate operator action.
 
 ## Internals
 

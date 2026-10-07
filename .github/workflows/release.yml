@@ -45,30 +45,13 @@ jobs:
           key: ${{ runner.os }}-cargo-build-release-${{ hashFiles('**/Cargo.lock') }}
       
       - name: Build release binary
-        run: cargo build --release --target x86_64-unknown-linux-musl
-        
-      - name: Extract debug symbols
-        run: |
-          cd target/x86_64-unknown-linux-musl/release
-          # Copy binary before stripping to preserve debug info
-          cp snapshot-to-s3 snapshot-to-s3.debug
-          # Extract debug symbols into separate file
-          objcopy --only-keep-debug snapshot-to-s3.debug snapshot-to-s3.dbg
-          # Add debuglink to stripped binary
-          objcopy --add-gnu-debuglink=snapshot-to-s3.dbg snapshot-to-s3
-        
-      - name: Strip binary
-        run: strip target/x86_64-unknown-linux-musl/release/snapshot-to-s3
+        run: cargo build --release --locked --target x86_64-unknown-linux-musl
         
       - name: Create tarballs
         run: |
           cd target/x86_64-unknown-linux-musl/release
-          # Create tarball for stripped binary
           tar -czf snapshot-to-s3-linux-x86_64.tar.gz snapshot-to-s3
-          # Create tarball for debug symbols
-          tar -czf snapshot-to-s3-linux-x86_64-debug.tar.gz snapshot-to-s3.dbg
-          # Generate checksums for all tarballs in one file
-          sha256sum snapshot-to-s3-linux-x86_64.tar.gz snapshot-to-s3-linux-x86_64-debug.tar.gz > SHA256SUMS
+          sha256sum snapshot-to-s3-linux-x86_64.tar.gz > SHA256SUMS
           
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
@@ -76,7 +59,6 @@ jobs:
           name: snapshot-to-s3-linux-x86_64
           path: |
             target/x86_64-unknown-linux-musl/release/snapshot-to-s3-linux-x86_64.tar.gz
-            target/x86_64-unknown-linux-musl/release/snapshot-to-s3-linux-x86_64-debug.tar.gz
             target/x86_64-unknown-linux-musl/release/SHA256SUMS
 
   release:
@@ -117,6 +99,5 @@ jobs:
           prerelease: ${{ steps.release_type.outputs.prerelease }}
           files: |
             ./artifacts/snapshot-to-s3-linux-x86_64.tar.gz
-            ./artifacts/snapshot-to-s3-linux-x86_64-debug.tar.gz
             ./artifacts/SHA256SUMS
           generate_release_notes: true
