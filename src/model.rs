@@ -250,5 +250,12 @@ mod tests {
         assert!(meta.validate().is_err());
         meta.base_object_key = Some("backups/pool/data/base/stream.encrypted".into());
         assert!(meta.validate().is_ok());
+        let index = StreamIndex::parse(&meta.index().unwrap()).unwrap();
+        let mut different = meta.clone();
+        different.current_snapshot_id = "9".into();
+        assert!(index.verify(&different).is_err());
+        different = meta;
+        different.base_object_key = None;
+        assert!(index.verify(&different).is_err());
     }
 }

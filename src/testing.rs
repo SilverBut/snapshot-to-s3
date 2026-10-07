@@ -174,6 +174,7 @@ pub struct FakeZfs {
     pub snapshots: Vec<SnapshotInfo>,
     pub target: TargetInfo,
     pub dirty: bool,
+    pub diff_failure: bool,
     pub events: Mutex<Vec<String>>,
     pub receive_failure: Option<usize>,
     pub send_failure: bool,
@@ -196,6 +197,7 @@ impl FakeZfs {
                 snapshots: vec![],
             },
             dirty: false,
+            diff_failure: false,
             events: Mutex::new(Vec::new()),
             receive_failure: None,
             send_failure: false,
@@ -260,6 +262,9 @@ impl Zfs for FakeZfs {
     }
     async fn check_clean(&self, _: &SnapshotName) -> Result<()> {
         self.events.lock().unwrap().push("diff".into());
+        if self.diff_failure {
+            bail!("zfs diff command failed");
+        }
         if self.dirty {
             bail!("target changed");
         }

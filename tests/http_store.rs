@@ -6,6 +6,7 @@ use snapshot_to_s3::{
     http_store::{is_definite_rejection, is_retryable, HttpConfig, HttpStore},
     model::MetadataMap,
     store::{ObjectStore, Part},
+    transfer::{upload_parts, UploadLimits},
 };
 use std::{
     io,
@@ -206,6 +207,36 @@ fn verify_wire_signature(request: &str, secret: &str) {
     let expected_signature = hex::encode(hmac(&signing_key, string_to_sign.as_bytes()));
     let actual_signature = authorization.split("Signature=").nth(1).unwrap().trim();
     assert_eq!(actual_signature, expected_signature);
+}
+
+fn split_captured_requests(raw: &[u8]) -> Vec<(String, Vec<u8>)> {
+    let mut requests = Vec::new();
+    let mut offset = 0;
+    while offset < raw.len() {
+        let relative_end = raw[offset..]
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .expect("request header terminator");
+        let header_end = offset + relative_end;
+        let head = &raw[offset..header_end];
+        let content_length = std::str::from_utf8(head)
+            .unwrap()
+            .lines()
+            .filter_map(|line| line.split_once(':'))
+            .find_map(|(name, value)| {
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().unwrap())
+            })
+            .unwrap_or(0);
+        let body_start = header_end + 4;
+        let body_end = body_start + content_length;
+        requests.push((
+            String::from_utf8(head.to_vec()).expect("request headers are UTF-8"),
+            raw[body_start..body_end].to_vec(),
+        ));
+        offset = body_end;
+    }
+    requests
 }
 
 fn percent_decode(input: &str) -> String {
@@ -444,6 +475,56 @@ async fn retry_classifier_only_marks_transient_statuses() -> Result<()> {
     assert!(!is_definite_rejection(&anyhow::anyhow!(
         "unparsed successful response"
     )));
+    Ok(())
+}
+
+#[tokio::test]
+async fn upload_parts_retries_identical_bytes_and_returns_only_final_etag() -> Result<()> {
+    let _env = EnvGuard::new();
+    let responses = [
+        "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nETag: \"final-etag\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect();
+    let (endpoint, server) = fixture_sequence(responses).await?;
+    let store = HttpStore::new(config(endpoint)).await?;
+    let ciphertext = b"tiny".to_vec();
+    let mut reader: snapshot_to_s3::model::Reader =
+        Box::new(std::io::Cursor::new(ciphertext.clone()));
+    let result = upload_parts(
+        &store,
+        "stream",
+        "upload +/雪",
+        &mut reader,
+        ciphertext.len() as u64,
+        &UploadLimits {
+            min_part_size: 1,
+            max_part_size: ciphertext.len() as u64,
+            max_parts: 1,
+            max_object_size: ciphertext.len() as u64,
+            buffer_limit: ciphertext.len() as u64,
+        },
+        &tokio_util::sync::CancellationToken::new(),
+    )
+    .await?;
+    assert_eq!(result.bytes, ciphertext.len() as u64);
+    assert_eq!(result.parts.len(), 1);
+    assert_eq!(result.parts[0].number, 1);
+    assert_eq!(result.parts[0].etag, "\"final-etag\"");
+
+    let requests = split_captured_requests(&server.await?);
+    assert_eq!(requests.len(), 3);
+    for (head, body) in &requests {
+        assert!(head.starts_with(
+            "PUT /fixture-bucket/stream?partNumber=1&uploadId=upload%20%2B%2F%E9%9B%AA HTTP/1.1"
+        ));
+        assert_eq!(body, &ciphertext);
+    }
+    assert_eq!(requests[0].1, requests[1].1);
+    assert_eq!(requests[1].1, requests[2].1);
     Ok(())
 }
 
