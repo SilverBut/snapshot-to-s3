@@ -51,19 +51,23 @@ case "$cmd" in
       fi
       exit 0
     fi
+    if [[ "$joined" == *" value guid "* ]]; then
+      if [[ "$last" == "pool/fs" || "$last" == "pool/new" ]]; then
+        printf '22\n'
+        exit 0
+      fi
+      echo "dataset does not exist" >&2
+      exit 1
+    fi
 
     if [[ "$joined" == *" property,value "* ]]; then
       if [[ "$last" == "pool/fs@s1" || "$last" == "pool/fs@s2" ]]; then
-        printf 'type\tsnapshot\n'
         printf 'guid\t11\n'
-        printf 'volume_guid\t22\n'
         printf 'createtxg\t101\n'
         exit 0
       fi
       if [[ "$last" == "pool/fs/child@sx" ]]; then
-        printf 'type\tsnapshot\n'
         printf 'guid\t33\n'
-        printf 'volume_guid\t44\n'
         printf 'createtxg\t99\n'
         exit 0
       fi
