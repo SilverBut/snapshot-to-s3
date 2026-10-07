@@ -262,4 +262,74 @@ mod tests {
         assert!(plan.nodes.is_empty());
         assert_eq!(zfs.events.lock().unwrap().as_slice(), ["diff"]);
     }
+
+    #[tokio::test]
+    async fn diff_command_failure_stops_before_verification() {
+        let store = MemoryStore::default();
+        backup(&store, "s2", "20", Some(("10", "s1"))).await;
+        let mut zfs = FakeZfs::new();
+        zfs.target = TargetInfo {
+            exists: true,
+            snapshots: zfs.snapshots.clone(),
+        };
+        zfs.diff_failure = true;
+        let error = prepare(
+            &store,
+            &zfs,
+            &S3Location::parse("s3://b/backups").unwrap(),
+            &SnapshotName::parse("zfs:pool/data@s2").unwrap(),
+            Some("pool/target"),
+        )
+        .await
+        .err()
+        .unwrap();
+        assert!(format!("{error:#}").contains("diff command failed"));
+        assert!(!store
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|e| e.starts_with("GET ")));
+    }
+
+    #[tokio::test]
+    async fn existing_target_without_matching_latest_is_rejected() {
+        let store = MemoryStore::default();
+        backup(&store, "s1", "10", None).await;
+        backup(&store, "s2", "20", Some(("10", "s1"))).await;
+        let location = S3Location::parse("s3://b/backups").unwrap();
+        let selected = SnapshotName::parse("zfs:pool/data@s2").unwrap();
+        let mut zfs = FakeZfs::new();
+        zfs.target = TargetInfo {
+            exists: true,
+            snapshots: vec![],
+        };
+        assert!(
+            prepare(&store, &zfs, &location, &selected, Some("pool/target"))
+                .await
+                .is_err()
+        );
+        let mut unrelated = zfs.snapshots[0].clone();
+        unrelated.guid = "99".into();
+        unrelated.createtxg = 10;
+        zfs.target.snapshots = vec![unrelated.clone()];
+        let error = prepare(&store, &zfs, &location, &selected, Some("pool/target"))
+            .await
+            .err()
+            .unwrap();
+        assert!(format!("{error:#}").contains("latest local snapshot does not match"));
+        zfs.target.snapshots.insert(0, zfs.snapshots[0].clone());
+        let error = prepare(&store, &zfs, &location, &selected, Some("pool/target"))
+            .await
+            .err()
+            .unwrap();
+        assert!(format!("{error:#}").contains("clone"));
+        assert!(zfs.events.lock().unwrap().is_empty());
+        assert!(!store
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|e| e.starts_with("GET ")));
+    }
 }
