@@ -374,6 +374,25 @@ fn make_nonce(prefix: &[u8], index: u32, is_last: bool) -> [u8; 12] {
 
 /// Resolve a selector to exactly one full fingerprint with an encryption-capable key.
 pub async fn resolve_recipient(selector: &str) -> Result<String> {
+    select_unique_fingerprint(&list_recipient_keys(selector).await?, true)
+}
+
+/// Resolve a selector to one primary fingerprint for decrypting historical backups.
+///
+/// Unlike [`resolve_recipient`], this lookup does not require the public key to be
+/// currently encryption-capable. Expired, revoked, or encryption-ineligible keys may
+/// still identify the matching historical secret key in the user's GPG keyring.
+pub async fn resolve_decryption_recipient(selector: &str) -> Result<String> {
+    select_unique_fingerprint(&list_recipient_keys(selector).await?, false)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ListedRecipient {
+    fingerprint: String,
+    encryption_capable: bool,
+}
+
+async fn list_recipient_keys(selector: &str) -> Result<Vec<ListedRecipient>> {
     ensure!(
         !selector.is_empty()
             && !selector.starts_with('-')
@@ -396,19 +415,30 @@ pub async fn resolve_recipient(selector: &str) -> Result<String> {
     .context("list GPG recipient keys")?;
 
     let text = std::str::from_utf8(&output).context("GPG key listing is not UTF-8")?;
-    let mut matches = HashSet::new();
+    Ok(parse_gpg_key_listing(text))
+}
+
+fn parse_gpg_key_listing(text: &str) -> Vec<ListedRecipient> {
+    let mut recipients = Vec::new();
+    let mut seen = HashSet::new();
     let mut primary_fingerprint = None::<String>;
     let mut encryption_capable = false;
+    let mut primary_is_current = false;
     let mut awaiting_primary_fingerprint = false;
 
-    let finish_key =
-        |fingerprint: &mut Option<String>, capable: &mut bool, matches: &mut HashSet<String>| {
-            if *capable {
-                if let Some(fingerprint) = fingerprint.take() {
-                    matches.insert(fingerprint);
-                }
+    let finish_key = |fingerprint: &mut Option<String>,
+                      capable: &mut bool,
+                      recipients: &mut Vec<ListedRecipient>,
+                      seen: &mut HashSet<String>| {
+        if let Some(fingerprint) = fingerprint.take() {
+            if seen.insert(fingerprint.clone()) {
+                recipients.push(ListedRecipient {
+                    fingerprint,
+                    encryption_capable: *capable,
+                });
             }
-        };
+        }
+    };
 
     for line in text.lines() {
         let fields: Vec<&str> = line.split(':').collect();
@@ -417,18 +447,23 @@ pub async fn resolve_recipient(selector: &str) -> Result<String> {
                 finish_key(
                     &mut primary_fingerprint,
                     &mut encryption_capable,
-                    &mut matches,
+                    &mut recipients,
+                    &mut seen,
                 );
                 primary_fingerprint = None;
-                encryption_capable = fields
-                    .get(11)
-                    .is_some_and(|caps| caps.to_ascii_lowercase().contains('e'));
+                primary_is_current = record_is_current(&fields);
+                encryption_capable = primary_is_current
+                    && fields
+                        .get(11)
+                        .is_some_and(|caps| caps.to_ascii_lowercase().contains('e'));
                 awaiting_primary_fingerprint = true;
             }
             Some("sub") => {
-                encryption_capable |= fields
-                    .get(11)
-                    .is_some_and(|caps| caps.to_ascii_lowercase().contains('e'));
+                encryption_capable |= primary_is_current
+                    && record_is_current(&fields)
+                    && fields
+                        .get(11)
+                        .is_some_and(|caps| caps.to_ascii_lowercase().contains('e'));
                 awaiting_primary_fingerprint = false;
             }
             Some("fpr") if awaiting_primary_fingerprint => {
@@ -443,15 +478,35 @@ pub async fn resolve_recipient(selector: &str) -> Result<String> {
     finish_key(
         &mut primary_fingerprint,
         &mut encryption_capable,
-        &mut matches,
+        &mut recipients,
+        &mut seen,
     );
+    recipients
+}
 
+fn record_is_current(fields: &[&str]) -> bool {
+    !fields.get(1).is_some_and(|validity| {
+        ["e", "r", "d", "i"]
+            .iter()
+            .any(|invalid| validity.eq_ignore_ascii_case(invalid))
+    })
+}
+
+fn select_unique_fingerprint(
+    recipients: &[ListedRecipient],
+    require_encryption: bool,
+) -> Result<String> {
+    let mut matches = recipients
+        .iter()
+        .filter(|recipient| !require_encryption || recipient.encryption_capable);
+    let recipient = matches
+        .next()
+        .context("GPG selector did not match a suitable primary key")?;
     ensure!(
-        matches.len() == 1,
-        "GPG selector must resolve to exactly one encryption-capable primary key (found {})",
-        matches.len()
+        matches.next().is_none(),
+        "GPG selector must resolve to exactly one suitable primary key"
     );
-    let fingerprint = matches.into_iter().next().expect("one match");
+    let fingerprint = recipient.fingerprint.clone();
     ensure!(
         (fingerprint.len() == 40 || fingerprint.len() == 64)
             && fingerprint.bytes().all(|byte| byte.is_ascii_hexdigit()),
@@ -580,4 +635,80 @@ async fn collect_limited<R: AsyncRead + Unpin>(
         buffer[..count].zeroize();
     }
     Ok((collected, overflow))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{
+        pin::Pin,
+        task::{Context as TaskContext, Poll},
+    };
+    #[derive(Default)]
+    struct VecWriter(Vec<u8>);
+
+    impl AsyncWrite for VecWriter {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _: &mut TaskContext<'_>,
+            input: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            self.0.extend_from_slice(input);
+            Poll::Ready(Ok(input.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn matches_independent_tink_wire_reference() {
+        let vector = hex::decode(include_str!("../tests/crypto_tink_vector.hex").trim()).unwrap();
+        let plaintext = b"Tink-compatible reference payload";
+        let aad = b"tink cross-language vector";
+        let header: [u8; HEADER_SIZE] = vector[..HEADER_SIZE].try_into().unwrap();
+        let mut input = &plaintext[..];
+        let mut output = VecWriter::default();
+
+        encrypt_with_header(
+            &(std::array::from_fn(|index| index as u8)),
+            aad,
+            &mut input,
+            &mut output,
+            &header,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(output.0, vector);
+    }
+
+    #[test]
+    fn historical_recipient_selection_ignores_expiry_and_encryption_capability() {
+        let fixtures = [
+            (
+                include_str!("../tests/crypto_gpg_expired_key.colons"),
+                "A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1",
+            ),
+            (
+                include_str!("../tests/crypto_gpg_no_encrypt_key.colons"),
+                "B2B2B2B2B2B2B2B2B2B2B2B2B2B2B2B2B2B2B2B2",
+            ),
+        ];
+        for (fixture, expected_fingerprint) in fixtures {
+            let listed = parse_gpg_key_listing(fixture);
+            assert_eq!(listed.len(), 1);
+            assert!(!listed[0].encryption_capable);
+            assert_eq!(
+                select_unique_fingerprint(&listed, false).unwrap(),
+                expected_fingerprint
+            );
+            assert!(select_unique_fingerprint(&listed, true).is_err());
+        }
+    }
 }
