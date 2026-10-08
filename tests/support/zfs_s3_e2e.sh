@@ -140,7 +140,9 @@ mkdir -m 700 "$gpg_public_home"
 gpg --batch --export "$fingerprint" | gpg --batch --homedir "$gpg_public_home" --import
 printf '%s:6:\n' "$fingerprint" | gpg --batch --homedir "$gpg_public_home" --import-ownertrust
 free="$(df -B1 --output=avail "$runtime" | tail -1 | tr -d ' ')"
-[[ "$free" -ge 21474836480 ]] || { echo "requires at least 20GiB free" >&2; exit 1; }
+min_free="${E2E_MIN_FREE_BYTES:-21474836480}"
+[[ "$min_free" =~ ^[1-9][0-9]*$ ]] || { echo "invalid E2E_MIN_FREE_BYTES" >&2; exit 1; }
+[[ "$free" -ge "$min_free" ]] || { echo "requires at least $min_free bytes free" >&2; exit 1; }
 sudo -n zfs create -o mountpoint=none -o canmount=off -o atime=off "$namespace"
 created=true
 mkdir "$runtime/source"
