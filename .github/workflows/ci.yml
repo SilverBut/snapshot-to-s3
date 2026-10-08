@@ -106,10 +106,7 @@ jobs:
       - name: Install hosted ZFS and test dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends \
-            zfsutils-linux python3-venv gnupg build-essential autoconf automake libtool \
-            gawk pkg-config libaio-dev libattr1-dev libblkid-dev libelf-dev libssl-dev \
-            libudev-dev libtirpc-dev uuid-dev zlib1g-dev "linux-headers-$(uname -r)"
+          sudo apt-get install --yes --no-install-recommends zfsutils-linux python3-venv gnupg
           sudo modprobe zfs
       - name: Prepare disposable pool and run every infrastructure-backed test
         run: bash tests/support/ci_e2e.sh
