@@ -22,19 +22,21 @@ jobs:
     # Administrators provision this dedicated runner and its existing ONLINE
     # user:isdev=yes pool out of band. CI never provisions or labels pools.
     # Restrict its runner group to this repository and trusted contributors;
-    # run only one runner process per dedicated pool. Fork PRs use hosted jobs.
+    # run only one runner process per dedicated pool. Use a short runner work
+    # root (for example /w) so GnuPG UNIX socket paths fit below 108 bytes.
+    # Fork PRs use hosted jobs.
     runs-on: [self-hosted, Linux, X64, zfs-e2e]
     timeout-minutes: 45
     defaults:
       run:
-        working-directory: ci-workspaces/${{ github.run_id }}-${{ github.run_attempt }}
+        working-directory: e/${{ github.run_id }}-${{ github.run_attempt }}
         shell: bash
     steps:
       - uses: actions/checkout@v4
         with:
           # A failed harness may retain mounted diagnostic data. Never clean a
           # previous checkout automatically or reuse another run's workspace.
-          path: ci-workspaces/${{ github.run_id }}-${{ github.run_attempt }}
+          path: e/${{ github.run_id }}-${{ github.run_attempt }}
           clean: false
           persist-credentials: false
 
@@ -50,9 +52,9 @@ jobs:
         with:
           name: e2e-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
-            ci-workspaces/${{ github.run_id }}-${{ github.run_attempt }}/.ci-e2e/logs/
-            ci-workspaces/${{ github.run_id }}-${{ github.run_attempt }}/.ci-e2e/s3/logs/
-            ci-workspaces/${{ github.run_id }}-${{ github.run_attempt }}/.ci-e2e/s3/disk-budget-*.txt
+            e/${{ github.run_id }}-${{ github.run_attempt }}/.ci-e2e/logs/
+            e/${{ github.run_id }}-${{ github.run_attempt }}/.ci-e2e/s3/logs/
+            e/${{ github.run_id }}-${{ github.run_attempt }}/.ci-e2e/s3/disk-budget-*.txt
           include-hidden-files: true
           if-no-files-found: warn
           retention-days: 7
