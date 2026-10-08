@@ -4,6 +4,8 @@
 
 ### Use existing labeled pools only
 
+This section ONLY applies to local running agents's unit/e2e test procedure.
+
 Agents must not create or recreate zpools, prepare backing devices or
 files, or import, export, or destroy pools. Use only existing development
 pools marked with the pool property `user:isdev=yes`. This is a **zpool
