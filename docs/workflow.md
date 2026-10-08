@@ -4,10 +4,11 @@ Be aware that the plain text encryption key shall never leave on disk. Always us
 
 ## ZFS command interfaces
 
-All programmatic `zfs`/`zpool` `get` and `list` reads use `-j -p`: versioned JSON with raw numeric strings,
-not human tables or legacy tab-delimited property output. Require JSON-capable OpenZFS (usually 2.3+), validate
-the named-object schema and exact object identities, and report unsupported output, malformed/missing values,
-permission failures and other command errors explicitly. Never silently fall back to a display parser.
+All programmatic `zfs`/`zpool` `get` and `list` reads use `-j -p`: JSON with raw numeric strings,
+not human tables or legacy tab-delimited property output. Require JSON-capable OpenZFS (usually 2.3+), decode
+the fields needed by the operation with ordinary serde structs, and validate object identities, types and
+required property values. Ignore unrelated fields and envelope versions; report malformed/missing required
+data, permission failures and other command errors explicitly. Never silently fall back to a display parser.
 GUIDs remain exact decimal strings; do not request `--json-int` or convert them through floating point.
 See [the JSON command contract](design.md#zfs-json-command-contract).
 
