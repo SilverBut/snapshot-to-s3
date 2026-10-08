@@ -113,3 +113,28 @@ Prefer generated streams and bounded fixtures over large persistent objects when
 
 Use small, frequent, locally verified commits coordinated by the parent integration owner. Do not rely on automatic
 push/release actions for in-progress rebuild branches.
+
+## Local checks and remote acceptance
+
+Before committing, run the offline tests and checks:
+
+```bash
+cargo test --locked
+cargo fmt --all -- --check
+cargo clippy --locked --all-targets --all-features -- -D warnings
+```
+
+Every push and same-repository pull request also schedules the real ZFS/S3 acceptance job in
+[CI](.github/workflows/ci.yml). The job checks pinned SeaweedFS 4.48, live HTTP capabilities, multi-step recovery
+and bidirectional official Tink 1.16.1 interoperability using [ci_e2e.sh](tests/support/ci_e2e.sh).
+
+Administrators must provide a dedicated runner labeled `self-hosted`, `Linux`, `X64`, `zfs-e2e`, with an existing
+`ONLINE` pool whose pool property is exactly `user:isdev=yes`. It needs OpenZFS userspace and kernel module 2.3+,
+Python 3.11+ with venv, GnuPG, Rust, passwordless sudo and at least 20 GiB free disk space. Use a short runner work
+root (for example `/w`) so isolated GnuPG socket paths fit Linux's limit. Only one runner process should use each
+dedicated development pool.
+
+Restrict the privileged runner group to this repository and trusted contributors. Fork pull requests run hosted
+offline checks only; their code must not run on the persistent privileged runner. Each acceptance run uses an
+isolated checkout and dataset namespace, stops its own local service, and uploads diagnostic logs. Failed dataset
+cleanup retains the namespace and runtime for operator inspection rather than deleting a mounted directory.
