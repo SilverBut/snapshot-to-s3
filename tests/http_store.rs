@@ -3,7 +3,7 @@ use bytes::Bytes;
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
 use snapshot_to_s3::{
-    http_store::{is_definite_rejection, is_retryable, HttpConfig, HttpStore},
+    http_store::{is_definite_rejection, is_retryable, HttpConfig, HttpPolicy, HttpStore},
     model::MetadataMap,
     store::{ObjectStore, Part},
     transfer::{upload_parts, UploadLimits},
@@ -11,6 +11,7 @@ use snapshot_to_s3::{
 use std::{
     io,
     sync::{Mutex, MutexGuard},
+    time::Duration,
 };
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
@@ -125,6 +126,345 @@ async fn fixture_sequence(responses: Vec<String>) -> Result<(String, JoinHandle<
         captured
     });
     Ok((format!("http://{address}"), task))
+}
+
+fn fast_policy() -> HttpPolicy {
+    HttpPolicy {
+        throughput_window: Duration::from_millis(100),
+        minimum_bytes_per_window: 8,
+        control_timeout: Duration::from_millis(25),
+        get_retries: 2,
+        retry_backoff: Duration::from_millis(1),
+    }
+}
+
+fn get_reply(range: Option<&str>, length: usize, etag: &str, body: &str) -> String {
+    let status = if range.is_some() {
+        "206 Partial Content"
+    } else {
+        "200 OK"
+    };
+    let range = range
+        .map(|range| format!("Content-Range: {range}\r\n"))
+        .unwrap_or_default();
+    format!("HTTP/1.1 {status}\r\nContent-Length: {length}\r\nETag: {etag}\r\n{range}Connection: close\r\n\r\n{body}")
+}
+
+async fn paced_fixture(
+    responses: Vec<Vec<(Duration, String)>>,
+) -> Result<(String, JoinHandle<Vec<u8>>)> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(async move {
+        let mut captured = Vec::new();
+        let mut writers = Vec::new();
+        for pieces in responses {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut reader = BufReader::new(stream);
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).await.unwrap();
+                captured.extend_from_slice(line.as_bytes());
+                if line == "\r\n" {
+                    break;
+                }
+            }
+            writers.push(tokio::spawn(async move {
+                for (delay, piece) in pieces {
+                    tokio::time::sleep(delay).await;
+                    if reader.get_mut().write_all(piece.as_bytes()).await.is_err() {
+                        break;
+                    }
+                }
+            }));
+        }
+        for writer in writers {
+            writer.await.unwrap();
+        }
+        captured
+    });
+    Ok((format!("http://{address}"), server))
+}
+
+#[tokio::test]
+async fn get_disconnect_resumes_exact_ciphertext_offset_and_caller_range() -> Result<()> {
+    let _env = EnvGuard::new();
+    for range in [None, Some((4, 11))] {
+        let (initial_range, resume_range, expected) = if range.is_some() {
+            (Some("bytes 4-11/20"), "bytes 7-11/20", "bytes=7-11")
+        } else {
+            (None, "bytes 3-7/8", "bytes=3-7")
+        };
+        let (endpoint, server) = fixture_sequence(vec![
+            get_reply(initial_range, 8, "\"pinned\"", "abc"),
+            get_reply(Some(resume_range), 5, "\"pinned\"", "defgh"),
+        ])
+        .await?;
+        let store = HttpStore::new_with_policy(config(endpoint), fast_policy()).await?;
+        let mut reader = store.get("ciphertext", Some("\"pinned\""), range).await?;
+        let mut first = [0; 1];
+        reader.read_exact(&mut first).await?;
+        // Buffered ciphertext is consumed before issuing the resumed request.
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        let mut bytes = first.to_vec();
+        reader.read_to_end(&mut bytes).await?;
+        assert_eq!(bytes, b"abcdefgh");
+        let raw = String::from_utf8(server.await?)?;
+        let requests = split_captured_requests(raw.as_bytes());
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1].0.contains(expected));
+        assert!(requests[1].0.contains("if-match: \"pinned\""));
+        assert!(requests[1].0.contains("accept-encoding: identity"));
+        verify_wire_signature(&format!("{}\r\n\r\n", requests[1].0), "fixture-secret");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn get_pins_discovered_etag_and_retries_transient_headers() -> Result<()> {
+    let _env = EnvGuard::new();
+    let (endpoint, server) = fixture_sequence(vec![
+        String::new(),
+        "HTTP/1.1 503 Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into(),
+        get_reply(None, 6, "\"discovered\"", "abc"),
+        get_reply(Some("bytes 3-5/6"), 3, "\"discovered\"", "def"),
+    ])
+    .await?;
+    let mut policy = fast_policy();
+    policy.get_retries = 3;
+    let store = HttpStore::new_with_policy(config(endpoint), policy).await?;
+    let mut reader = store.get("stream", None, None).await?;
+    let mut bytes = Vec::new();
+    reader.read_to_end(&mut bytes).await?;
+    assert_eq!(bytes, b"abcdef");
+    let requests = split_captured_requests(&server.await?);
+    assert_eq!(requests.len(), 4);
+    assert!(requests[3].0.contains("if-match: \"discovered\""));
+    Ok(())
+}
+
+#[tokio::test]
+async fn get_resume_rejects_changed_identity_range_and_length() -> Result<()> {
+    let _env = EnvGuard::new();
+    let resumes = [
+        get_reply(Some("bytes 3-5/6"), 3, "\"changed\"", "def"),
+        get_reply(Some("bytes 2-4/6"), 3, "\"pinned\"", "def"),
+        get_reply(Some("bytes 3-5/7"), 3, "\"pinned\"", "def"),
+        get_reply(Some("bytes 3-5/6"), 2, "\"pinned\"", "de"),
+        get_reply(None, 3, "\"pinned\"", "def"),
+        get_reply(Some("bytes 3-5/6"), 3, "\"pinned\"", "def").replace(
+            "Content-Length:",
+            "Content-Encoding: gzip\r\nContent-Length:",
+        ),
+        get_reply(Some("bytes 3-5/6"), 3, "W/\"pinned\"", "def"),
+        "HTTP/1.1 412 Precondition Failed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into(),
+    ];
+    for resume in resumes {
+        let (endpoint, server) =
+            fixture_sequence(vec![get_reply(None, 6, "\"pinned\"", "abc"), resume]).await?;
+        let store = HttpStore::new_with_policy(config(endpoint), fast_policy()).await?;
+        let mut reader = store.get("stream", None, None).await?;
+        let mut bytes = Vec::new();
+        assert!(reader.read_to_end(&mut bytes).await.is_err());
+        assert_eq!(bytes, b"abc", "never emit unvalidated resumed bytes");
+        assert_eq!(split_captured_requests(&server.await?).len(), 2);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn get_disconnect_retry_budget_is_not_reset_after_progress() -> Result<()> {
+    let _env = EnvGuard::new();
+    let (endpoint, server) = fixture_sequence(vec![
+        get_reply(None, 6, "\"pinned\"", "a"),
+        get_reply(Some("bytes 1-5/6"), 5, "\"pinned\"", "b"),
+        get_reply(Some("bytes 2-5/6"), 4, "\"pinned\"", "c"),
+    ])
+    .await?;
+    let store = HttpStore::new_with_policy(config(endpoint), fast_policy()).await?;
+    let mut reader = store.get("stream", None, None).await?;
+    let mut bytes = Vec::new();
+    let error = reader.read_to_end(&mut bytes).await.unwrap_err();
+    assert!(error.to_string().contains("retries exhausted"));
+    assert_eq!(bytes, b"abc");
+    assert_eq!(split_captured_requests(&server.await?).len(), 3);
+    Ok(())
+}
+
+#[tokio::test]
+async fn healthy_get_outlives_control_timeout_and_many_throughput_windows() -> Result<()> {
+    let _env = EnvGuard::new();
+    let mut pieces = vec![(Duration::ZERO, get_reply(None, 128, "\"pinned\"", ""))];
+    pieces.extend((0..16).map(|_| (Duration::from_millis(25), "abcdefgh".into())));
+    let (endpoint, server) = paced_fixture(vec![pieces]).await?;
+    let store = HttpStore::new_with_policy(config(endpoint), fast_policy()).await?;
+    let mut reader = store.get("stream", None, None).await?;
+    let mut bytes = Vec::new();
+    reader.read_to_end(&mut bytes).await?;
+    assert_eq!(bytes, b"abcdefgh".repeat(16));
+    assert_eq!(split_captured_requests(&server.await?).len(), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn get_throughput_detects_dribble_not_only_idle() -> Result<()> {
+    let _env = EnvGuard::new();
+    let mut slow = vec![(Duration::ZERO, get_reply(None, 16, "\"pinned\"", ""))];
+    slow.extend((0..8).map(|_| (Duration::from_millis(30), "a".into())));
+    let (endpoint, server) = paced_fixture(vec![slow]).await?;
+    let mut policy = fast_policy();
+    policy.get_retries = 0;
+    let store = HttpStore::new_with_policy(config(endpoint), policy).await?;
+    let mut reader = store.get("stream", None, None).await?;
+    let mut bytes = Vec::new();
+    let error = reader.read_to_end(&mut bytes).await.unwrap_err();
+    assert!(error.to_string().contains("throughput below"));
+    assert!(bytes.len() < 8);
+    assert_eq!(split_captured_requests(&server.await?).len(), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn get_stall_resumes_from_consumed_offset() -> Result<()> {
+    let _env = EnvGuard::new();
+    let (endpoint, server) = paced_fixture(vec![
+        vec![
+            (Duration::ZERO, get_reply(None, 8, "\"pinned\"", "abc")),
+            (Duration::from_millis(250), "unused".into()),
+        ],
+        vec![(
+            Duration::ZERO,
+            get_reply(Some("bytes 3-7/8"), 5, "\"pinned\"", "defgh"),
+        )],
+    ])
+    .await?;
+    let store = HttpStore::new_with_policy(config(endpoint), fast_policy()).await?;
+    let mut reader = store.get("stream", None, None).await?;
+    let mut bytes = Vec::new();
+    reader.read_to_end(&mut bytes).await?;
+    assert_eq!(bytes, b"abcdefgh");
+    assert_eq!(split_captured_requests(&server.await?).len(), 2);
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "takes 125 seconds to regress the former 120-second whole-request timeout"]
+async fn healthy_get_exceeds_former_120_second_transfer_cap() -> Result<()> {
+    let _env = EnvGuard::new();
+    let chunk = "x".repeat(2048);
+    let mut pieces = vec![(
+        Duration::ZERO,
+        get_reply(None, 125 * chunk.len(), "\"pinned\"", ""),
+    )];
+    pieces.extend((0..125).map(|_| (Duration::from_secs(1), chunk.clone())));
+    let (endpoint, server) = paced_fixture(vec![pieces]).await?;
+    let store = HttpStore::new(config(endpoint)).await?;
+    let started = tokio::time::Instant::now();
+    let mut reader = store.get("long-stream", None, None).await?;
+    let mut bytes = Vec::new();
+    reader.read_to_end(&mut bytes).await?;
+    assert!(started.elapsed() > Duration::from_secs(120));
+    assert_eq!(bytes.len(), 125 * 2048);
+    assert_eq!(split_captured_requests(&server.await?).len(), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn blocked_put_body_fails_throughput_without_retry_or_definite_rejection() -> Result<()> {
+    let _env = EnvGuard::new();
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut reader = BufReader::with_capacity(1, stream);
+        let mut request = String::new();
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).await.unwrap();
+            request.push_str(&line);
+            if line == "\r\n" {
+                break;
+            }
+        }
+        // Deliberately never consume the body: transport backpressure must trip the guard.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), listener.accept())
+                .await
+                .is_err(),
+            "mutating PUT must not be retried internally"
+        );
+        request
+    });
+    let store =
+        HttpStore::new_with_policy(config(format!("http://{address}")), fast_policy()).await?;
+    let error = store
+        .put(
+            "stream",
+            Bytes::from(vec![0u8; 16 * 1024 * 1024]),
+            &MetadataMap::new(),
+        )
+        .await
+        .expect_err("blocked transfer must fail throughput policy");
+    assert!(format!("{error:#}").contains("throughput below"));
+    assert!(
+        is_retryable(&error),
+        "retained multipart bytes may be retried by the caller"
+    );
+    assert!(!is_definite_rejection(&error));
+    assert!(server.await?.starts_with("PUT "));
+    Ok(())
+}
+
+#[tokio::test]
+async fn stalled_post_completion_remains_unknown_and_is_not_retried() -> Result<()> {
+    let _env = EnvGuard::new();
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut reader = BufReader::new(stream);
+        let mut request = String::new();
+        let mut length = 0;
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).await.unwrap();
+            request.push_str(&line);
+            if line == "\r\n" {
+                break;
+            }
+            if let Some(value) = line.strip_prefix("content-length: ") {
+                length = value.trim().parse::<usize>().unwrap();
+            }
+        }
+        let mut body = vec![0; length];
+        reader.read_exact(&mut body).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), listener.accept())
+                .await
+                .is_err(),
+            "completion POST must not be retried internally"
+        );
+        request
+    });
+    let store =
+        HttpStore::new_with_policy(config(format!("http://{address}")), fast_policy()).await?;
+    let error = store
+        .complete_upload(
+            "stream",
+            "upload",
+            &[Part {
+                number: 1,
+                etag: "\"part\"".into(),
+            }],
+        )
+        .await
+        .expect_err("stalled completion must fail");
+    assert!(format!("{error:#}").contains("throughput below"));
+    assert!(!is_definite_rejection(&error));
+    assert!(server.await?.starts_with("POST "));
+    Ok(())
 }
 
 fn verify_wire_signature(request: &str, secret: &str) {

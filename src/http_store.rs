@@ -6,7 +6,6 @@ use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
-use futures_util::StreamExt;
 use hmac::{Hmac, Mac};
 use quick_xml::de::from_reader;
 use reqwest::{
@@ -16,15 +15,18 @@ use reqwest::{
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     env,
+    future::Future,
     io::{self, Read},
     path::PathBuf,
-    pin::Pin,
-    task::{Context as TaskContext, Poll},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
     time::Duration,
 };
-use tokio::{io::AsyncRead, sync::Mutex};
+use tokio::{sync::Mutex, time::Instant};
 use tokio_util::io::StreamReader;
 
 const MAX_XML_BYTES: usize = 1024 * 1024;
@@ -55,12 +57,75 @@ struct CredentialProvider {
     metadata_disabled: bool,
 }
 
+/// Transfer limits are based on recent progress, never total transfer duration.
+#[derive(Clone, Debug)]
+pub struct HttpPolicy {
+    pub throughput_window: Duration,
+    pub minimum_bytes_per_window: u64,
+    pub control_timeout: Duration,
+    pub get_retries: usize,
+    pub retry_backoff: Duration,
+}
+
+impl Default for HttpPolicy {
+    fn default() -> Self {
+        Self {
+            throughput_window: Duration::from_secs(30),
+            minimum_bytes_per_window: 1024,
+            control_timeout: Duration::from_secs(120),
+            get_retries: 3,
+            retry_backoff: Duration::from_millis(200),
+        }
+    }
+}
+
+impl HttpPolicy {
+    fn from_env() -> Result<Self> {
+        fn value(name: &str, default: u64) -> Result<u64> {
+            match env::var(name) {
+                Ok(value) => value
+                    .parse()
+                    .with_context(|| format!("{name} must be an unsigned integer")),
+                Err(env::VarError::NotPresent) => Ok(default),
+                Err(error) => Err(error).with_context(|| format!("read {name}")),
+            }
+        }
+        let default = Self::default();
+        Ok(Self {
+            throughput_window: Duration::from_secs(value(
+                "SNAPSHOT_TO_S3_HTTP_WINDOW_SECS",
+                default.throughput_window.as_secs(),
+            )?),
+            minimum_bytes_per_window: value(
+                "SNAPSHOT_TO_S3_HTTP_MIN_BYTES",
+                default.minimum_bytes_per_window,
+            )?,
+            control_timeout: Duration::from_secs(value(
+                "SNAPSHOT_TO_S3_HTTP_CONTROL_TIMEOUT_SECS",
+                default.control_timeout.as_secs(),
+            )?),
+            get_retries: value(
+                "SNAPSHOT_TO_S3_HTTP_GET_RETRIES",
+                default.get_retries as u64,
+            )?
+            .try_into()
+            .context("HTTP GET retry count exceeds platform limit")?,
+            retry_backoff: Duration::from_millis(value(
+                "SNAPSHOT_TO_S3_HTTP_BACKOFF_MILLIS",
+                default.retry_backoff.as_millis() as u64,
+            )?),
+        })
+    }
+}
+
+#[derive(Clone)]
 pub struct HttpStore {
     config: HttpConfig,
     client: reqwest::Client,
-    credentials: CredentialProvider,
+    credentials: Arc<CredentialProvider>,
     metadata_header_prefix: String,
     endpoint: Url,
+    policy: HttpPolicy,
 }
 
 #[derive(Debug, Deserialize)]
@@ -132,7 +197,7 @@ pub fn is_retryable(error: &anyhow::Error) -> bool {
                 || failure.status.is_server_error();
         }
         if let Some(error) = cause.downcast_ref::<reqwest::Error>() {
-            if error.is_timeout() || error.is_connect() {
+            if error.is_timeout() || error.is_connect() || error.is_request() || error.is_body() {
                 return true;
             }
         }
@@ -149,6 +214,7 @@ pub fn is_retryable(error: &anyhow::Error) -> bool {
                     | io::ErrorKind::NetworkUnreachable
                     | io::ErrorKind::HostUnreachable
                     | io::ErrorKind::WouldBlock
+                    | io::ErrorKind::UnexpectedEof
             ) {
                 return true;
             }
@@ -171,6 +237,20 @@ pub fn is_definite_rejection(error: &anyhow::Error) -> bool {
 
 impl HttpStore {
     pub async fn new(config: HttpConfig) -> Result<Self> {
+        Self::new_with_policy(config, HttpPolicy::from_env()?).await
+    }
+
+    pub async fn new_with_policy(config: HttpConfig, policy: HttpPolicy) -> Result<Self> {
+        if policy.throughput_window.is_zero()
+            || policy.throughput_window > Duration::from_secs(86400)
+            || policy.minimum_bytes_per_window == 0
+            || policy.control_timeout.is_zero()
+            || policy.control_timeout > Duration::from_secs(86400)
+            || policy.get_retries > 100
+            || policy.retry_backoff > Duration::from_secs(60)
+        {
+            bail!("invalid HTTP transfer policy");
+        }
         if config.bucket.is_empty()
             || config.bucket.contains(['/', '@', '?', '#', '\0'])
             || config.region.trim().is_empty()
@@ -199,7 +279,6 @@ impl HttpStore {
 
         let client = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(120))
             .build()
             .context("create S3 HTTP client")?;
         let static_credentials = load_static_credentials()?;
@@ -212,14 +291,15 @@ impl HttpStore {
         Ok(Self {
             config,
             client: client.clone(),
-            credentials: CredentialProvider {
+            credentials: Arc::new(CredentialProvider {
                 static_credentials,
                 cache: Mutex::new(None),
                 client,
                 metadata_disabled,
-            },
+            }),
             metadata_header_prefix: prefix,
             endpoint,
+            policy,
         })
     }
 
@@ -443,14 +523,45 @@ impl HttpStore {
             credentials.access_key
         );
         put_header(&mut headers, "authorization", &authorization)?;
+        let control = method == Method::HEAD
+            || method == Method::DELETE
+            || (method == Method::GET && !query.is_empty());
+        let transfer_body = method == Method::PUT || method == Method::POST;
         let mut request = self.client.request(method, url);
+        if control {
+            request = request.timeout(self.policy.control_timeout);
+        }
         for (name, value) in headers.iter() {
             request = request.header(name, value);
         }
-        if !body.is_empty() {
-            request = request.body(body);
+        let progress = Arc::new(AtomicU64::new(0));
+        if transfer_body && !body.is_empty() {
+            let length = body.len();
+            let counter = progress.clone();
+            let stream = futures_util::stream::unfold(body, move |mut remaining| {
+                let counter = counter.clone();
+                async move {
+                    if remaining.is_empty() {
+                        None
+                    } else {
+                        let chunk = remaining.split_to(remaining.len().min(64 * 1024));
+                        counter.fetch_add(chunk.len() as u64, Ordering::Relaxed);
+                        Some((Ok::<_, io::Error>(chunk), remaining))
+                    }
+                }
+            });
+            request = request
+                .header(reqwest::header::CONTENT_LENGTH, length)
+                .body(reqwest::Body::wrap_stream(stream));
         }
-        request.send().await.context("send signed S3 request")
+        if control {
+            request.send().await.context("send signed S3 request")
+        } else {
+            ThroughputGuard::new(&self.policy)
+                .wait(request.send(), Some(&progress))
+                .await?
+                .context("send signed S3 request")
+        }
     }
 
     async fn response_error(&self, operation: &str, response: Response) -> anyhow::Error {
@@ -460,7 +571,7 @@ impl HttpStore {
             .get("x-amz-error-code")
             .and_then(|value| value.to_str().ok())
             .map(str::to_owned);
-        let body = match read_limited(response, MAX_XML_BYTES).await {
+        let body = match self.read_body(response).await {
             Ok(body) => body,
             Err(error) => {
                 return anyhow::Error::new(HttpStatusFailure {
@@ -501,11 +612,61 @@ impl HttpStore {
 
     async fn read_response(&self, operation: &str, response: Response) -> Result<Vec<u8>> {
         let response = self.require_success(operation, response).await?;
-        read_limited(response, MAX_XML_BYTES)
-            .await
-            .with_context(|| {
-                format!("{operation}: response exceeds {MAX_XML_BYTES} bytes or failed")
-            })
+        self.read_body(response).await.with_context(|| {
+            format!("{operation}: response exceeds {MAX_XML_BYTES} bytes or failed")
+        })
+    }
+
+    async fn read_body(&self, mut response: Response) -> Result<Vec<u8>> {
+        let mut guard = ThroughputGuard::new(&self.policy);
+        let mut bytes = Vec::new();
+        while let Some(chunk) = guard.wait(response.chunk(), None).await?? {
+            guard.add(chunk.len() as u64);
+            if bytes.len().saturating_add(chunk.len()) > MAX_XML_BYTES {
+                bail!("HTTP response exceeds {MAX_XML_BYTES}-byte limit");
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        Ok(bytes)
+    }
+
+    async fn get_response(
+        &self,
+        key: &str,
+        etag: Option<&str>,
+        range: Option<(u64, u64)>,
+    ) -> Result<Response> {
+        let mut headers = HeaderMap::new();
+        // Ciphertext offsets must refer to the wire representation, never decoded bytes.
+        put_header(&mut headers, "accept-encoding", "identity")?;
+        if let Some(etag) = etag {
+            put_header(&mut headers, "if-match", etag)?;
+        }
+        if let Some((start, end)) = range {
+            put_header(&mut headers, "range", &format!("bytes={start}-{end}"))?;
+        }
+        let response = self
+            .send_signed(Method::GET, key, &[], headers, Bytes::new())
+            .await?;
+        let expected_status = if range.is_some() {
+            StatusCode::PARTIAL_CONTENT
+        } else {
+            StatusCode::OK
+        };
+        if response.status() != expected_status {
+            return Err(self.response_error("GET object", response).await);
+        }
+        Ok(response)
+    }
+
+    async fn retry_delay(&self, retry: usize) {
+        tokio::time::sleep(
+            self.policy
+                .retry_backoff
+                .saturating_mul(1 << retry.min(8))
+                .min(Duration::from_secs(60)),
+        )
+        .await;
     }
 
     fn metadata_headers(&self, metadata: &MetadataMap) -> Result<HeaderMap> {
@@ -596,73 +757,125 @@ impl ObjectStore for HttpStore {
             if start > end {
                 bail!("invalid byte range: start exceeds end");
             }
+            (end - start)
+                .checked_add(1)
+                .context("GET range length overflow")?;
         }
-        let mut headers = HeaderMap::new();
-        if let Some(etag) = etag {
-            put_header(&mut headers, "if-match", etag)?;
-        }
-        if let Some((start, end)) = range {
-            put_header(&mut headers, "range", &format!("bytes={start}-{end}"))?;
-        }
-        let response = self
-            .send_signed(Method::GET, key, &[], headers, Bytes::new())
-            .await
-            .with_context(|| format!("GET s3://{}/{}", self.config.bucket, key))?;
-        let expected_len = if let Some((start, end)) = range {
-            if response.status() != StatusCode::PARTIAL_CONTENT {
-                return Err(self.response_error("range GET object", response).await);
+        let mut retries = 0;
+        let response = loop {
+            match self.get_response(key, etag, range).await {
+                Ok(response) => break response,
+                Err(error) if is_retryable(&error) && retries < self.policy.get_retries => {
+                    self.retry_delay(retries).await;
+                    retries += 1;
+                }
+                Err(error) => return Err(error),
             }
-            let content_range = response
-                .headers()
-                .get("content-range")
-                .and_then(|value| value.to_str().ok())
-                .context("range GET response omitted valid Content-Range")?;
-            let expected_range = format!("bytes {start}-{end}/");
-            let total = content_range
-                .strip_prefix(&expected_range)
-                .and_then(|total| total.parse::<u64>().ok())
-                .context("range GET returned malformed or mismatched Content-Range")?;
-            if total <= end {
-                bail!(
-                    "range GET Content-Range total {total} does not include requested end byte {end}"
-                );
-            }
-            Some(end - start + 1)
-        } else {
-            if response.status() != StatusCode::OK {
-                return Err(self.response_error("GET object", response).await);
-            }
-            None
         };
-        let advertised_len = response
-            .headers()
-            .get(reqwest::header::CONTENT_LENGTH)
-            .map(|value| {
-                value
-                    .to_str()
-                    .context("invalid GET Content-Length")?
-                    .parse::<u64>()
-                    .context("invalid GET Content-Length")
-            })
-            .transpose()?;
-        if let Some(expected) = expected_len {
-            if advertised_len != Some(expected) {
-                bail!(
-                    "range GET Content-Length mismatch: expected {expected}, got {advertised_len:?}"
-                );
-            }
-        }
-        let expected_len = advertised_len.or(expected_len);
-        let stream = response
-            .bytes_stream()
-            .map(|result| result.map_err(|error| io::Error::other(error.to_string())));
-        let reader = StreamReader::new(stream);
-        Ok(Box::new(CheckedReader {
-            inner: Box::pin(reader),
-            expected: expected_len,
-            read: 0,
+        let identity = GetIdentity::validate(&response, range, etag, None)?;
+        let state = GetStream {
+            store: self.clone(),
+            key: key.to_owned(),
+            response: Some(response),
+            identity,
+            consumed: 0,
+            retries,
             failed: false,
-        }))
+            guard: ThroughputGuard::new(&self.policy),
+        };
+        let stream = futures_util::stream::unfold(state, |mut state| async move {
+            if state.failed || state.consumed == state.identity.length {
+                return None;
+            }
+            loop {
+                let result = state
+                    .guard
+                    .wait(
+                        state
+                            .response
+                            .as_mut()
+                            .expect("active GET response")
+                            .chunk(),
+                        None,
+                    )
+                    .await;
+                let error = match result {
+                    Ok(Ok(Some(chunk))) => {
+                        if chunk.len() as u64 > state.identity.length - state.consumed {
+                            state.failed = true;
+                            return Some((
+                                Err(io::Error::new(
+                                    io::ErrorKind::InvalidData,
+                                    "GET exceeded expected length",
+                                )),
+                                state,
+                            ));
+                        }
+                        state.consumed += chunk.len() as u64;
+                        state.guard.add(chunk.len() as u64);
+                        return Some((Ok(chunk), state));
+                    }
+                    Ok(Ok(None)) => anyhow!(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "GET ended before advertised length"
+                    )),
+                    Ok(Err(error)) => anyhow!(error),
+                    Err(error) => error,
+                };
+                state.response = None;
+                if state.retries >= state.store.policy.get_retries {
+                    state.failed = true;
+                    return Some((
+                        Err(io::Error::other(format!(
+                            "GET retries exhausted: {error:#}"
+                        ))),
+                        state,
+                    ));
+                }
+                loop {
+                    state.store.retry_delay(state.retries).await;
+                    state.retries += 1;
+                    let range = Some((state.identity.start + state.consumed, state.identity.end));
+                    match state
+                        .store
+                        .get_response(&state.key, Some(&state.identity.etag), range)
+                        .await
+                    {
+                        Ok(response) => {
+                            if let Err(error) = GetIdentity::validate(
+                                &response,
+                                range,
+                                Some(&state.identity.etag),
+                                Some(state.identity.total),
+                            ) {
+                                state.failed = true;
+                                return Some((
+                                    Err(io::Error::new(
+                                        io::ErrorKind::InvalidData,
+                                        error.to_string(),
+                                    )),
+                                    state,
+                                ));
+                            }
+                            state.response = Some(response);
+                            state.guard = ThroughputGuard::new(&state.store.policy);
+                            break;
+                        }
+                        Err(error)
+                            if is_retryable(&error)
+                                && state.retries < state.store.policy.get_retries => {}
+                        Err(error) => {
+                            state.failed = true;
+                            return Some((
+                                Err(io::Error::other(format!("GET resume failed: {error:#}"))),
+                                state,
+                            ));
+                        }
+                    }
+                }
+            }
+        });
+        Ok(Box::new(StreamReader::new(Box::pin(stream))))
     }
 
     async fn put(&self, key: &str, data: Bytes, metadata: &MetadataMap) -> Result<()> {
@@ -846,55 +1059,175 @@ impl ObjectStore for HttpStore {
     }
 }
 
-struct CheckedReader {
-    inner: Pin<Box<dyn AsyncRead + Send>>,
-    expected: Option<u64>,
-    read: u64,
+struct GetStream {
+    store: HttpStore,
+    key: String,
+    response: Option<Response>,
+    identity: GetIdentity,
+    consumed: u64,
+    retries: usize,
     failed: bool,
+    guard: ThroughputGuard,
 }
 
-impl AsyncRead for CheckedReader {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        cx: &mut TaskContext<'_>,
-        buffer: &mut tokio::io::ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
-        if self.failed {
-            return Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "S3 response length validation already failed",
-            )));
+struct GetIdentity {
+    etag: String,
+    start: u64,
+    end: u64,
+    length: u64,
+    total: u64,
+}
+
+impl GetIdentity {
+    fn validate(
+        response: &Response,
+        range: Option<(u64, u64)>,
+        pin: Option<&str>,
+        total: Option<u64>,
+    ) -> Result<Self> {
+        let headers = response.headers();
+        if headers
+            .get("content-encoding")
+            .is_some_and(|v| v != "identity")
+        {
+            bail!("GET returned non-identity Content-Encoding");
         }
-        if buffer.remaining() == 0 {
-            return Poll::Ready(Ok(()));
+        let etag = headers
+            .get(ETAG)
+            .context("GET response omitted ETag")?
+            .to_str()?
+            .to_owned();
+        if !etag.starts_with('"') || !etag.ends_with('"') || etag.len() < 2 {
+            bail!("GET requires a strong ETag");
         }
-        let before = buffer.filled().len();
-        match self.inner.as_mut().poll_read(cx, buffer) {
-            Poll::Pending => Poll::Pending,
-            Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
-            Poll::Ready(Ok(())) => {
-                let count = (buffer.filled().len() - before) as u64;
-                self.read += count;
-                if let Some(expected) = self.expected {
-                    if self.read > expected {
-                        self.failed = true;
-                        return Poll::Ready(Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            format!("S3 response exceeded advertised length {expected}"),
-                        )));
+        if pin.is_some_and(|pin| pin != etag) {
+            bail!("GET ETag mismatch");
+        }
+        let length = headers
+            .get(reqwest::header::CONTENT_LENGTH)
+            .context("GET response omitted Content-Length")?
+            .to_str()?
+            .parse::<u64>()?;
+        let (start, end, actual_total) = if let Some((start, end)) = range {
+            let value = headers
+                .get("content-range")
+                .context("range GET omitted Content-Range")?
+                .to_str()?;
+            let actual_total = value
+                .strip_prefix(&format!("bytes {start}-{end}/"))
+                .and_then(|value| value.parse::<u64>().ok())
+                .context("range GET returned malformed or mismatched Content-Range")?;
+            let expected = end
+                .checked_sub(start)
+                .and_then(|v| v.checked_add(1))
+                .context("GET range length overflow")?;
+            if actual_total <= end || length != expected {
+                bail!("range GET Content-Range/Content-Length mismatch");
+            }
+            (start, end, actual_total)
+        } else {
+            if headers.contains_key("content-range") {
+                bail!("full GET unexpectedly returned Content-Range");
+            }
+            (0, length.saturating_sub(1), length)
+        };
+        if total.is_some_and(|total| total != actual_total) {
+            bail!("GET resumed object length changed");
+        }
+        Ok(Self {
+            etag,
+            start,
+            end,
+            length,
+            total: actual_total,
+        })
+    }
+}
+
+/// Only time spent polling the network counts: caller/decryptor backpressure is not a stall.
+struct ThroughputGuard {
+    window: Duration,
+    minimum: u64,
+    elapsed: Duration,
+    bytes: u64,
+    samples: VecDeque<(Duration, u64)>,
+}
+
+impl ThroughputGuard {
+    fn new(policy: &HttpPolicy) -> Self {
+        Self {
+            window: policy.throughput_window,
+            minimum: policy.minimum_bytes_per_window,
+            elapsed: Duration::ZERO,
+            bytes: 0,
+            samples: VecDeque::from([(Duration::ZERO, 0)]),
+        }
+    }
+
+    fn add(&mut self, bytes: u64) {
+        self.bytes = self.bytes.saturating_add(bytes);
+        if self
+            .samples
+            .back()
+            .is_some_and(|sample| sample.0 == self.elapsed)
+        {
+            self.samples.back_mut().unwrap().1 = self.bytes;
+        } else {
+            self.samples.push_back((self.elapsed, self.bytes));
+        }
+        self.prune();
+    }
+
+    fn prune(&mut self) {
+        let cutoff = self.elapsed.saturating_sub(self.window);
+        while self.samples.len() > 1 && self.samples[1].0 <= cutoff {
+            self.samples.pop_front();
+        }
+    }
+
+    fn check(&mut self) -> Result<()> {
+        self.prune();
+        if self.elapsed >= self.window
+            && self.bytes.saturating_sub(self.samples[0].1) < self.minimum
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "HTTP throughput below {} bytes per {:?}",
+                    self.minimum, self.window
+                ),
+            )
+            .into());
+        }
+        Ok(())
+    }
+
+    async fn wait<F: Future>(
+        &mut self,
+        future: F,
+        progress: Option<&AtomicU64>,
+    ) -> Result<F::Output> {
+        self.check()?;
+        tokio::pin!(future);
+        let mut last = Instant::now();
+        let tick = (self.window / 4).max(Duration::from_nanos(1));
+        loop {
+            tokio::select! {
+                output = &mut future => {
+                    self.elapsed += last.elapsed();
+                    if let Some(progress) = progress {
+                        self.add(progress.load(Ordering::Relaxed).saturating_sub(self.bytes));
                     }
-                    if count == 0 && self.read != expected {
-                        self.failed = true;
-                        return Poll::Ready(Err(io::Error::new(
-                            io::ErrorKind::UnexpectedEof,
-                            format!(
-                                "S3 response ended at {} bytes; expected {expected}",
-                                self.read
-                            ),
-                        )));
-                    }
+                    return Ok(output);
                 }
-                Poll::Ready(Ok(()))
+                _ = tokio::time::sleep(tick) => {
+                    self.elapsed += last.elapsed();
+                    last = Instant::now();
+                    if let Some(progress) = progress {
+                        self.add(progress.load(Ordering::Relaxed).saturating_sub(self.bytes));
+                    }
+                    self.check()?;
+                }
             }
         }
     }
@@ -1201,6 +1534,81 @@ mod tests {
         assert_eq!(credentials.secret_key, "selected-secret");
         assert_eq!(credentials.session_token.as_deref(), Some("session-token"));
         assert!(parse_credentials_file("[partial]\naws_access_key_id=only\n", "partial").is_err());
+    }
+}
+
+#[cfg(test)]
+mod throughput_tests {
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn healthy_receive_and_upload_exceed_120_seconds() {
+        let policy = HttpPolicy::default();
+        let mut receive = ThroughputGuard::new(&policy);
+        for _ in 0..150 {
+            receive
+                .wait(tokio::time::sleep(Duration::from_secs(1)), None)
+                .await
+                .unwrap();
+            receive.add(2048);
+        }
+        assert!(receive.elapsed > Duration::from_secs(120));
+
+        let progress = AtomicU64::new(0);
+        let mut upload = ThroughputGuard::new(&policy);
+        let producer = async {
+            for _ in 0..150 {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                progress.fetch_add(2048, Ordering::Relaxed);
+            }
+        };
+        upload.wait(producer, Some(&progress)).await.unwrap();
+        assert!(upload.elapsed > Duration::from_secs(120));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn rolling_window_rejects_dribble_and_does_not_bank_an_early_burst() {
+        let mut guard = ThroughputGuard::new(&HttpPolicy::default());
+        guard.add(1024 * 1024);
+        let error = loop {
+            match guard
+                .wait(tokio::time::sleep(Duration::from_secs(1)), None)
+                .await
+            {
+                Ok(()) => guard.add(1),
+                Err(error) => break error,
+            }
+        };
+        assert!(guard.elapsed >= Duration::from_secs(30));
+        assert!(guard.elapsed < Duration::from_secs(32));
+        assert!(is_retryable(&error));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_receive_upload_and_consumer_pause() {
+        let policy = HttpPolicy::default();
+        let mut receive = ThroughputGuard::new(&policy);
+        receive
+            .wait(tokio::time::sleep(Duration::from_secs(1)), None)
+            .await
+            .unwrap();
+        receive.add(2048);
+        tokio::time::sleep(Duration::from_secs(1000)).await;
+        receive
+            .wait(tokio::time::sleep(Duration::from_secs(1)), None)
+            .await
+            .unwrap();
+        receive.add(2048);
+        assert_eq!(receive.elapsed, Duration::from_secs(2));
+        assert!(receive
+            .wait(std::future::pending::<()>(), None)
+            .await
+            .is_err());
+        let progress = AtomicU64::new(0);
+        assert!(ThroughputGuard::new(&policy)
+            .wait(std::future::pending::<()>(), Some(&progress))
+            .await
+            .is_err());
     }
 }
 
