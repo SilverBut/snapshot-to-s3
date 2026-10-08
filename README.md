@@ -19,7 +19,16 @@ has already been implemented.
 Ensure you have:
 
 * GPG CLI
-* ZFS CLI
+* OpenZFS `zfs` and `zpool` CLIs with `get`/`list` JSON output (`-j`, usually OpenZFS 2.3+)
+
+Programmatic discovery and property reads require the strict OpenZFS JSON interface, using `-j -p` for raw
+numeric strings. Unsupported JSON versions, malformed/missing values, and command or permission failures are
+explicit errors; there is no fallback to human-readable tables or legacy `-H` property parsing. Snapshot GUIDs
+are validated as exact decimal strings, including values above JavaScript's safe-integer range; `--json-int` is
+not used. See [the JSON command contract](docs/design.md#zfs-json-command-contract).
+
+`zfs diff -H` and `zfs send -nP` use their dedicated machine-readable record/estimate formats, not display
+tables: these subcommands do not support `-j` in OpenZFS 2.4.4. Actual send/receive streams remain binary.
 
 Then install the program by build from source:
 

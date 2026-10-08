@@ -46,6 +46,30 @@ Module names below are relative to `src/` and describe the current rebuild archi
 The rebuild is filesystem-only by design; zvol/block-volume paths are rejected. No generalized dummy filesystem backend
 is part of the required architecture.
 
+#### ZFS JSON command contract
+
+Programmatic `zfs get`, `zfs list`, `zpool get` and `zpool list` require OpenZFS JSON output (`-j`, usually
+OpenZFS 2.3+). Read with `-j -p`, without `--json-int`; do not silently fall back to human-readable tables
+or legacy `-H` property parsing when a version lacks JSON support.
+
+The OpenZFS 2.4.4 schema has `output_version` containing the exact command name, `vers_major: 0` and
+`vers_minor: 1`; major version 0 is required and minor versions are unsigned 32-bit integers. ZFS results
+contain a `datasets` map; zpool results contain a `pools` map. Each map key
+must equal its object's `name`. Dataset types are `FILESYSTEM`, `SNAPSHOT` or `VOLUME` (the application
+rejects volumes); pool type is `POOL`. Properties live under `properties[PROPERTY].value` as raw strings,
+with source metadata under `source`. Pool discovery checks `ONLINE` state/health and the exact pool property
+`user:isdev=yes` before isolated development testing; this is not a dataset property.
+
+Validate command/version, object identity and required property values. Missing, null, empty, wrongly typed
+or malformed values, unsupported output versions, duplicate object keys, and command/permission failures
+are explicit errors. A failed existence query is not proof that a dataset is absent. Snapshot GUIDs are
+validated as positive decimal strings within the unsigned 64-bit range, without floating-point conversion;
+large GUIDs must retain every digit.
+
+`zfs diff -H` and `zfs send -nP` have separate machine-readable change-record and raw size-estimate formats;
+they do not support `-j` in OpenZFS 2.4.4. Actual send output and receive input remain binary. Commands such
+as create, set, snapshot, mount and destroy are checked by exit status and do not need JSON output.
+
 ### Object-store and transfer pipeline
 
 * `store.rs`: object-store trait for HEAD/GET/PUT/list, conditional create and multipart operations.

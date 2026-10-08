@@ -7,22 +7,93 @@ umask 077
 : "${AWS_ACCESS_KEY_ID:?set test credentials}"
 : "${AWS_SECRET_ACCESS_KEY:?set test credentials}"
 binary="$(realpath "${SNAPSHOT_TO_S3_BIN:-target/debug/snapshot-to-s3}")"
+# Read only the OpenZFS JSON machine interface; never parse display tables.
+json_read() {
+    python3 -c '
+import json, re, sys
+
+def unique_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate JSON key: " + key)
+        result[key] = value
+    return result
+
+try:
+    tool, command, mode, *args = sys.argv[1:]
+    document = json.load(sys.stdin, object_pairs_hook=unique_object)
+    version = document["output_version"]
+    if (version["command"] != tool + " " + command
+            or type(version["vers_major"]) is not int or version["vers_major"] != 0
+            or type(version["vers_minor"]) is not int
+            or not 0 <= version["vers_minor"] <= 4294967295):
+        raise ValueError("unsupported JSON output version or command")
+    objects = document["pools" if tool == "zpool" else "datasets"]
+    if not isinstance(objects, dict):
+        raise ValueError("expected a named object map")
+    for name, item in objects.items():
+        if not name or not isinstance(item, dict) or item.get("name") != name:
+            raise ValueError("object map key/name mismatch")
+        allowed = ("POOL",) if tool == "zpool" else ("FILESYSTEM", "SNAPSHOT", "VOLUME")
+        if item.get("type") not in allowed:
+            raise ValueError("invalid object type")
+    def value(name, prop):
+        raw = objects[name]["properties"][prop]["value"]
+        if not isinstance(raw, str) or not raw or "\n" in raw or "\r" in raw:
+            raise ValueError("missing, empty or malformed property " + prop)
+        if prop == "guid" and (not re.fullmatch(r"[1-9][0-9]*", raw)
+                              or int(raw) > 18446744073709551615):
+            raise ValueError("invalid decimal GUID")
+        return raw
+    if mode == "online":
+        for name, item in objects.items():
+            health = value(name, "health")
+            if not isinstance(item.get("state"), str) or not item["state"]:
+                raise ValueError("missing pool state")
+            if health == "ONLINE" and item["state"] == "ONLINE":
+                print(name)
+    elif mode == "absent":
+        if args[0] in objects:
+            raise ValueError("test namespace already exists: " + args[0])
+    elif mode == "value":
+        if set(objects) != {args[0]}:
+            raise ValueError("expected exactly the requested object")
+        if tool == "zfs":
+            expected = "SNAPSHOT" if "@" in args[0] else "FILESYSTEM"
+            if objects[args[0]]["type"] != expected:
+                raise ValueError("unexpected requested dataset type")
+        print(value(*args))
+    else:
+        raise ValueError("unknown JSON reader mode")
+except (ValueError, KeyError, TypeError, IndexError) as error:
+    sys.exit("invalid OpenZFS JSON: " + str(error))
+' "$@"
+}
+property_value() {
+    local tool="$1" name="$2" property="$3" output
+    output="$("$tool" get -j -p "$property" "$name")" || return
+    json_read "$tool" get value "$name" "$property" <<<"$output"
+}
 sudo -n true
+pool_json="$(zpool list -j -p -o name,health)"
+online_pools="$(json_read zpool list online <<<"$pool_json")"
 pool=""
-while IFS=$'\t' read -r name health; do
-    if [[ "$health" == ONLINE ]] && [[ "$(zpool get -H -o value user:isdev "$name")" == yes ]]; then
+while IFS= read -r name; do
+    [[ -n "$name" ]] || continue
+    label="$(property_value zpool "$name" user:isdev)"
+    if [[ "$label" == yes ]]; then
         pool="$name"
         break
     fi
-done < <(zpool list -H -o name,health)
+done <<<"$online_pools"
 [[ -n "$pool" ]] || { echo "no ONLINE user:isdev=yes pool; provide a development pool" >&2; exit 1; }
-[[ "$(zpool get -H -o value user:isdev "$pool")" == yes ]]
+label="$(property_value zpool "$pool" user:isdev)"
+[[ "$label" == yes ]] || { echo "selected pool is no longer user:isdev=yes: $pool" >&2; exit 1; }
 id="smoke_$(date +%s)_${RANDOM}_${RANDOM}"
 namespace="$pool/$id"
-if zfs list -H "$namespace" >/dev/null 2>&1; then
-    echo "test namespace already exists: $namespace" >&2
-    exit 1
-fi
+namespace_json="$(zfs list -j -p -r -o name "$pool")"
+json_read zfs list absent "$namespace" <<<"$namespace_json"
 runtime="$(mktemp -d /tmp/snapshot-to-s3-e2e.XXXXXXXX)"
 created=false
 cleanup() {
@@ -97,11 +168,14 @@ sudo -n zfs snapshot "$namespace/source@s3"
 cli backup "zfs:$namespace/source@s3" "$prefix" --gpg-key-id "$fingerprint"
 cli restore "$prefix" "zfs:$namespace/source@s3" --target-dataset "$id/recovered" --gpg-key-id "$fingerprint"
 for snapshot in s1 s2 s3; do
-    [[ "$(zfs get -Hp -o value guid "$namespace/source@$snapshot")" == "$(zfs get -Hp -o value guid "$namespace/recovered@$snapshot")" ]]
+    source_guid="$(property_value zfs "$namespace/source@$snapshot" guid)"
+    recovered_guid="$(property_value zfs "$namespace/recovered@$snapshot" guid)"
+    [[ "$source_guid" == "$recovered_guid" ]]
 done
 mkdir "$runtime/recovered"
 sudo -n zfs set atime=off canmount=on mountpoint="$runtime/recovered" "$namespace/recovered"
-if [[ "$(zfs get -H -o value mounted "$namespace/recovered")" != yes ]]; then
+mounted="$(property_value zfs "$namespace/recovered" mounted)"
+if [[ "$mounted" != yes ]]; then
     sudo -n zfs mount "$namespace/recovered"
 fi
 [[ "$(findmnt -n -o FSTYPE -T "$runtime/recovered")" == zfs ]]
@@ -111,12 +185,15 @@ done
 cli restore "$prefix" "zfs:$namespace/source@s1" --target-dataset "$id/continued"
 mkdir "$runtime/continued"
 sudo -n zfs set atime=off canmount=on mountpoint="$runtime/continued" "$namespace/continued"
-if [[ "$(zfs get -H -o value mounted "$namespace/continued")" != yes ]]; then
+mounted="$(property_value zfs "$namespace/continued" mounted)"
+if [[ "$mounted" != yes ]]; then
     sudo -n zfs mount "$namespace/continued"
 fi
 [[ "$(findmnt -n -o FSTYPE -T "$runtime/continued")" == zfs ]]
 cli restore "$prefix" "stdout:$namespace/source@s1" | sudo -n zfs receive -u "$namespace/exported"
-[[ "$(zfs get -Hp -o value guid "$namespace/exported@s1")" == "$(zfs get -Hp -o value guid "$namespace/source@s1")" ]]
+exported_guid="$(property_value zfs "$namespace/exported@s1" guid)"
+source_guid="$(property_value zfs "$namespace/source@s1" guid)"
+[[ "$exported_guid" == "$source_guid" ]]
 python3 tests/support/s3_probe.py --region us-east-1 --delete-test-object "$id/$namespace/source/s1/stream.encrypted"
 if cli restore "$prefix" "zfs:$namespace/source@s3" --target-dataset "$id/incomplete"; then
     echo "incomplete remote chain unexpectedly recovered an empty target" >&2
@@ -140,8 +217,12 @@ printf 'native raw encrypted source\n' | sudo -n tee "$runtime/native/data" >/de
 sudo -n zfs snapshot "$namespace/native@n1"
 cli backup "zfs:$namespace/native@n1" "$prefix" --gpg-key-id "$fingerprint"
 cli restore "$prefix" "zfs:$namespace/native@n1" --target-dataset "$id/native-recovered"
-[[ "$(zfs get -Hp -o value guid "$namespace/native@n1")" == "$(zfs get -Hp -o value guid "$namespace/native-recovered@n1")" ]]
-[[ "$(zfs get -H -o value encryption "$namespace/native-recovered")" == aes-256-gcm ]]
-[[ "$(zfs get -H -o value mounted "$namespace/native-recovered")" == no ]]
+native_guid="$(property_value zfs "$namespace/native@n1" guid)"
+recovered_guid="$(property_value zfs "$namespace/native-recovered@n1" guid)"
+[[ "$native_guid" == "$recovered_guid" ]]
+encryption="$(property_value zfs "$namespace/native-recovered" encryption)"
+mounted="$(property_value zfs "$namespace/native-recovered" mounted)"
+[[ "$encryption" == aes-256-gcm ]]
+[[ "$mounted" == no ]]
 echo "PASS: full + incrementals + GUID/data + existing base + no-op + dirty rejection + single stdout export + native raw encryption" >&2
 echo "remote test objects retained under $prefix; use the dedicated local service cleanup" >&2
