@@ -33,9 +33,9 @@
     "apparmor=unconfined",
     "label=disable"
   ],
-  // "features": {
-  //   "ghcr.io/devcontainers/features/github-cli:1": {}
-  // },
+  "features": {
+    "ghcr.io/devcontainers/features/github-cli:1": {}
+  },
   "postCreateCommand": {
     "version check": "rustc --version && cargo --version",
     "install zfs by host zfs version 2.4.4-1": "sudo DEBIAN_FRONTEND=noninteractive sh .devcontainer/install_zfs.sh"
