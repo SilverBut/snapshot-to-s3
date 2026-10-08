@@ -2,9 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [ main, master ]
   pull_request:
-    branches: [ main, master ]
 
 env:
   CARGO_TERM_COLOR: always
@@ -13,6 +11,52 @@ permissions:
   contents: read
 
 jobs:
+  e2e:
+    name: OpenZFS + SeaweedFS end-to-end
+    # Fork PR code must never execute on a persistent privileged runner. Do not
+    # switch this to pull_request_target or remove the same-repository gate.
+    if: >-
+      github.event_name == 'push' ||
+      (github.event_name == 'pull_request' &&
+       github.event.pull_request.head.repo.full_name == github.repository)
+    # Administrators provision this dedicated runner and its existing ONLINE
+    # user:isdev=yes pool out of band. CI never provisions or labels pools.
+    # Restrict its runner group to this repository and trusted contributors;
+    # run only one runner process per dedicated pool. Fork PRs use hosted jobs.
+    runs-on: [self-hosted, Linux, X64, zfs-e2e]
+    timeout-minutes: 45
+    defaults:
+      run:
+        working-directory: ci-workspaces/${{ github.run_id }}-${{ github.run_attempt }}
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # A failed harness may retain mounted diagnostic data. Never clean a
+          # previous checkout automatically or reuse another run's workspace.
+          path: ci-workspaces/${{ github.run_id }}-${{ github.run_attempt }}
+          clean: false
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run real storage and official Tink interoperability tests
+        run: bash tests/support/ci_e2e.sh
+
+      - name: Upload end-to-end diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ci-workspaces/${{ github.run_id }}-${{ github.run_attempt }}/.ci-e2e/logs/
+            ci-workspaces/${{ github.run_id }}-${{ github.run_attempt }}/.ci-e2e/s3/logs/
+            ci-workspaces/${{ github.run_id }}-${{ github.run_attempt }}/.ci-e2e/s3/disk-budget-*.txt
+          include-hidden-files: true
+          if-no-files-found: warn
+          retention-days: 7
+
   test:
     name: Test
     runs-on: ubuntu-latest
