@@ -141,6 +141,49 @@ async fn decrypts_ciphertext_generated_by_official_tink_python_runtime() {
 }
 
 #[tokio::test]
+#[ignore = "requires the official tink package installed in TINK_PYTHON"]
+async fn official_tink_runtime_bidirectional() {
+    use std::process::Stdio;
+    use tokio::io::AsyncWriteExt;
+
+    let python = std::env::var("TINK_PYTHON").expect("set TINK_PYTHON to the Tink venv Python");
+    let plaintext: Vec<u8> = (0..3 * 1024 * 1024 + 17)
+        .map(|index| (index % 251) as u8)
+        .collect();
+    let aad = b"tink cross-language vector";
+    let mut input = std::io::Cursor::new(&plaintext);
+    let mut ciphertext = Vec::new();
+    crypto::encrypt(&key(), aad, &mut input, &mut ciphertext)
+        .await
+        .unwrap();
+    let mut child = tokio::process::Command::new(python)
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/crypto_tink_interop.py"
+        ))
+        .arg("--round-trip")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("start official Tink runtime");
+    let mut stdin = child.stdin.take().unwrap();
+    let send = tokio::spawn(async move {
+        stdin.write_all(&ciphertext).await?;
+        stdin.shutdown().await
+    });
+    let output = child.wait_with_output().await.unwrap();
+    send.await.unwrap().unwrap();
+    assert!(
+        output.status.success(),
+        "official Tink runtime failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(decrypt_bytes(&output.stdout, aad).await.unwrap(), plaintext);
+}
+
+#[tokio::test]
 async fn authenticates_aad_segments_and_final_segment() {
     let plaintext = vec![0x31; FIRST_SEGMENT_PLAINTEXT + SEGMENT_PLAINTEXT + 5];
     let ciphertext = encrypt_bytes(&plaintext).await;
