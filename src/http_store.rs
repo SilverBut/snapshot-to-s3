@@ -15,7 +15,7 @@ use reqwest::{
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::BTreeMap,
     env,
     future::Future,
     io::{self, Read},
@@ -1031,7 +1031,8 @@ impl ObjectStore for HttpStore {
             .await
             .context("complete multipart upload")?;
         let status = response.status();
-        let bytes = read_limited(response, MAX_XML_BYTES)
+        let bytes = self
+            .read_body(response)
             .await
             .context("read CompleteMultipartUpload response")?;
         if !status.is_success() {
@@ -1147,49 +1148,51 @@ impl GetIdentity {
 /// Only time spent polling the network counts: caller/decryptor backpressure is not a stall.
 struct ThroughputGuard {
     window: Duration,
+    bucket_width: Duration,
     minimum: u64,
     elapsed: Duration,
     bytes: u64,
-    samples: VecDeque<(Duration, u64)>,
+    samples: [(u128, u64); 64],
 }
 
 impl ThroughputGuard {
     fn new(policy: &HttpPolicy) -> Self {
         Self {
             window: policy.throughput_window,
+            bucket_width: Duration::from_nanos(
+                policy.throughput_window.as_nanos().div_ceil(64) as u64
+            ),
             minimum: policy.minimum_bytes_per_window,
             elapsed: Duration::ZERO,
             bytes: 0,
-            samples: VecDeque::from([(Duration::ZERO, 0)]),
+            samples: [(u128::MAX, 0); 64],
         }
     }
 
     fn add(&mut self, bytes: u64) {
         self.bytes = self.bytes.saturating_add(bytes);
-        if self
-            .samples
-            .back()
-            .is_some_and(|sample| sample.0 == self.elapsed)
-        {
-            self.samples.back_mut().unwrap().1 = self.bytes;
-        } else {
-            self.samples.push_back((self.elapsed, self.bytes));
+        let bucket = self.elapsed.as_nanos() / self.bucket_width.as_nanos();
+        let sample = &mut self.samples[(bucket % 64) as usize];
+        if sample.0 != bucket {
+            *sample = (bucket, 0);
         }
-        self.prune();
-    }
-
-    fn prune(&mut self) {
-        let cutoff = self.elapsed.saturating_sub(self.window);
-        while self.samples.len() > 1 && self.samples[1].0 <= cutoff {
-            self.samples.pop_front();
-        }
+        sample.1 = sample.1.saturating_add(bytes);
     }
 
     fn check(&mut self) -> Result<()> {
-        self.prune();
-        if self.elapsed >= self.window
-            && self.bytes.saturating_sub(self.samples[0].1) < self.minimum
-        {
+        // Exclude the partially expired bucket, never crediting bytes older than the window.
+        let oldest = self
+            .elapsed
+            .saturating_sub(self.window)
+            .as_nanos()
+            .div_ceil(self.bucket_width.as_nanos());
+        let newest = self.elapsed.as_nanos() / self.bucket_width.as_nanos();
+        let recent = self
+            .samples
+            .iter()
+            .filter(|sample| sample.0 >= oldest && sample.0 <= newest)
+            .fold(0u64, |sum, sample| sum.saturating_add(sample.1));
+        if self.elapsed >= self.window && recent < self.minimum {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 format!(
@@ -1540,6 +1543,46 @@ mod tests {
 #[cfg(test)]
 mod throughput_tests {
     use super::*;
+
+    #[test]
+    fn fixed_history_is_bounded_under_many_distinct_chunks() {
+        let mut guard = ThroughputGuard::new(&HttpPolicy::default());
+        for _ in 0..1_000_000 {
+            guard.elapsed += Duration::from_micros(100);
+            guard.add(1);
+        }
+        assert_eq!(guard.samples.len(), 64);
+        assert!(
+            guard.check().is_ok(),
+            "healthy recent progress must remain visible"
+        );
+        guard.elapsed += guard.window;
+        assert!(
+            guard.check().is_err(),
+            "expired bursts must not remain credited"
+        );
+    }
+
+    #[test]
+    fn cutoff_bucket_is_conservative_without_discarding_new_progress() {
+        let mut guard = ThroughputGuard::new(&HttpPolicy {
+            throughput_window: Duration::from_millis(640),
+            minimum_bytes_per_window: 8,
+            ..HttpPolicy::default()
+        });
+        guard.elapsed = Duration::from_millis(1);
+        guard.add(1024);
+        guard.elapsed = Duration::from_millis(645);
+        assert!(
+            guard.check().is_err(),
+            "a bucket containing expired bytes is excluded"
+        );
+        guard.add(8);
+        assert!(
+            guard.check().is_ok(),
+            "new bytes in the current bucket count"
+        );
+    }
 
     #[tokio::test(start_paused = true)]
     async fn healthy_receive_and_upload_exceed_120_seconds() {

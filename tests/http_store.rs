@@ -467,6 +467,71 @@ async fn stalled_post_completion_remains_unknown_and_is_not_retried() -> Result<
     Ok(())
 }
 
+#[tokio::test]
+async fn post_completion_response_body_stall_and_dribble_remain_unknown() -> Result<()> {
+    let _env = EnvGuard::new();
+    for dribble in [false, true] {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut length = 0;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).await.unwrap();
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some(value) = line.strip_prefix("content-length: ") {
+                    length = value.trim().parse::<usize>().unwrap();
+                }
+            }
+            let mut body = vec![0; length];
+            reader.read_exact(&mut body).await.unwrap();
+            reader
+                .get_mut()
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\n<")
+                .await
+                .unwrap();
+            if dribble {
+                for _ in 0..8 {
+                    tokio::time::sleep(Duration::from_millis(30)).await;
+                    if reader.get_mut().write_all(b"a").await.is_err() {
+                        break;
+                    }
+                }
+            } else {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+            assert!(
+                tokio::time::timeout(Duration::from_millis(30), listener.accept())
+                    .await
+                    .is_err(),
+                "uncertain completion response must not be retried"
+            );
+        });
+        let store =
+            HttpStore::new_with_policy(config(format!("http://{address}")), fast_policy()).await?;
+        let error = store
+            .complete_upload(
+                "stream",
+                "upload",
+                &[Part {
+                    number: 1,
+                    etag: "\"part\"".into(),
+                }],
+            )
+            .await
+            .expect_err("completion response must be throughput guarded");
+        assert!(format!("{error:#}").contains("throughput below"));
+        assert!(is_retryable(&error));
+        assert!(!is_definite_rejection(&error));
+        server.await?;
+    }
+    Ok(())
+}
+
 fn verify_wire_signature(request: &str, secret: &str) {
     let (head, body) = request.split_once("\r\n\r\n").expect("HTTP headers");
     let mut lines = head.lines();
