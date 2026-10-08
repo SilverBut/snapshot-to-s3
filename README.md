@@ -162,6 +162,16 @@ service's maximum may require a larger explicit buffer and limits aligned to tha
 
 ## Configuration
 
+### HTTP transfers and retries
+
+Object GET, POST and upload PUT requests have no total-duration cap. Transfers are checked for low throughput
+over a rolling window (by default, fewer than 1,024 bytes in 30 seconds of active network polling).
+GET retries resume from the downloaded ciphertext offset using Range and a pinned ETag; changed objects fail
+instead of mixing versions. HEAD, list and DELETE retain bounded control-request timeouts.
+
+See [HTTP transfer liveness and recovery](docs/storage.md#http-transfer-liveness-and-recovery) for the retry
+budget, backpressure handling and environment overrides.
+
 ### S3 Credentials
 
 The binary does **not** use the AWS Rust SDK provider chain. It implements the currently supported credential sources:
