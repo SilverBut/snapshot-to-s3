@@ -77,8 +77,9 @@ for component in ("zfs", "zfs-kmod"):
 if sys.version_info < (3, 11):
     sys.exit("Python >= 3.11 is required by the S3 probe")
 PY
-# These read-only probes fail before downloads if JSON support is unavailable.
-# The existing E2E harness discovers and re-verifies the eligible pool itself.
+# Fail before downloads if JSON support or an eligible pool is unavailable.
+# The existing E2E harness independently discovers and re-verifies the pool
+# immediately before any dataset mutations.
 zpool list -j -p -o name,health > "$root/logs/zpool-list.json"
 zpool get -j -p user:isdev > "$root/logs/zpool-labels.json"
 zpool status -P > "$root/logs/zpool-status.txt"
@@ -86,9 +87,30 @@ python3 - "$root/logs/zpool-list.json" "$root/logs/zpool-labels.json" <<'PY'
 import json
 import sys
 
-for path in sys.argv[1:]:
-    with open(path) as source:
-        json.load(source)
+try:
+    documents = []
+    for path in sys.argv[1:]:
+        with open(path) as source:
+            pools = json.load(source)["pools"]
+        if not isinstance(pools, dict):
+            raise ValueError("expected a named pool map")
+        for name, pool in pools.items():
+            if pool.get("name") != name or pool.get("type") != "POOL":
+                raise ValueError("pool identity/type mismatch")
+        documents.append(pools)
+    online, labels = documents
+    eligible = [
+        name for name, pool in online.items()
+        if pool["state"] == "ONLINE"
+        and pool["properties"]["health"]["value"] == "ONLINE"
+        and name in labels
+        and labels[name]["properties"]["user:isdev"]["value"] == "yes"
+    ]
+except (KeyError, TypeError, ValueError) as error:
+    sys.exit(f"invalid OpenZFS JSON: {error}")
+if not eligible:
+    sys.exit("no ONLINE user:isdev=yes pool; provision a development pool outside CI")
+print("eligible existing development pools: " + ", ".join(eligible))
 PY
 
 # SHA256 is the upstream release API digest for the exact 4.48 amd64 asset:
