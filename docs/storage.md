@@ -109,9 +109,10 @@ backpressure (for example, decryption or ZFS receive) is excluded from the measu
 as bounded 64-KiB body chunks are accepted by the HTTP transport, not as proof of durable service receipt.
 Waiting for response headers or a response body is also guarded. HEAD, list and DELETE control requests additionally
 have a 120-second request timeout.
-The history uses 64 fixed-size time buckets, independent of chunk rate. The partially expired boundary bucket
-is conservatively excluded, so bytes older than the measurement window are never credited; boundary precision
-is one sixty-fourth of the window.
+The history uses 65 fixed-size time buckets, independent of chunk rate, retaining the current and partially
+overlapping oldest buckets. The boundary bucket is included as an upper bound on recent progress, so bucketing
+never falsely rejects a transfer meeting the throughput threshold. Boundary expiration can lag by less than
+one bucket (one sixty-fourth of the window, rounded up to a nanosecond).
 
 GET transparently retries transient connection, HTTP 408/429/5xx, premature EOF, response-read and throughput
 failures. The default budget is three retries for the entire reader, including initial request attempts, with
