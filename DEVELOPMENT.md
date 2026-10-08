@@ -125,8 +125,9 @@ cargo clippy --locked --all-targets --all-features -- -D warnings
 ```
 
 Every push and same-repository pull request also schedules the real ZFS/S3 acceptance job in
-[CI](.github/workflows/ci.yml). The job checks pinned SeaweedFS 4.48, live HTTP capabilities, multi-step recovery
-and bidirectional official Tink 1.16.1 interoperability using [ci_e2e.sh](tests/support/ci_e2e.sh).
+[CI](.github/workflows/ci.yml). The job checks pinned SeaweedFS 4.48, live HTTP capabilities, multi-step recovery,
+a real GET lasting more than 120 seconds, and bidirectional official Tink 1.16.1 interoperability using
+[ci_e2e.sh](tests/support/ci_e2e.sh).
 
 Administrators must provide a dedicated runner labeled `self-hosted`, `Linux`, `X64`, `zfs-e2e`, with an existing
 `ONLINE` pool whose pool property is exactly `user:isdev=yes`. It needs OpenZFS userspace and kernel module 2.3+,
