@@ -27,7 +27,7 @@ hmac = "0.12"
 hex = "0.4"
 zeroize = "1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json"] }
-quick-xml = { version = "0.38", features = ["serialize"] }
+quick-xml = { version = "0.41", features = ["serialize"] }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 futures-util = "0.3"
 tokio-util = { version = "0.7", features = ["io", "rt"] }
