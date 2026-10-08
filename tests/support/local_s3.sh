@@ -49,7 +49,10 @@ EOF
 
 if [[ "${1:-}" == "-h" || "${1:-}" == "--help" || "$#" -ne 1 ]]; then
   usage
-  exit $([[ "$#" -eq 1 ]] && echo 0 || echo 2)
+  if [[ "$#" -eq 1 ]]; then
+    exit 0
+  fi
+  exit 2
 fi
 
 RUNTIME_DIR="$1"
@@ -272,6 +275,7 @@ EOF
 
 weed_pid=""
 monitor_pid=""
+# shellcheck disable=SC2317 # Invoked by the EXIT, INT and TERM traps.
 cleanup() {
   local rc=$?
   if [[ -n "$monitor_pid" ]] && kill -0 "$monitor_pid" 2>/dev/null; then

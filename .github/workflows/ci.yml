@@ -3,164 +3,136 @@ name: CI
 on:
   push:
   pull_request:
-
-env:
-  CARGO_TERM_COLOR: always
+  workflow_dispatch:
+  merge_group:
+    types: [checks_requested]
 
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+defaults:
+  run:
+    shell: bash
+
 jobs:
-  e2e:
-    name: OpenZFS + SeaweedFS end-to-end
-    # Fork PR code must never execute on a persistent privileged runner. Do not
-    # switch this to pull_request_target or remove the same-repository gate.
-    if: >-
-      github.event_name == 'push' ||
-      (github.event_name == 'pull_request' &&
-       github.event.pull_request.head.repo.full_name == github.repository)
-    # Administrators provision this dedicated runner and its existing ONLINE
-    # user:isdev=yes pool out of band. CI never provisions or labels pools.
-    # Restrict its runner group to this repository and trusted contributors;
-    # run only one runner process per dedicated pool. Use a short runner work
-    # root (for example /w) so GnuPG UNIX socket paths fit below 108 bytes.
-    # Fork PRs use hosted jobs.
-    runs-on: [self-hosted, Linux, X64, zfs-e2e]
-    timeout-minutes: 45
-    defaults:
-      run:
-        working-directory: e/${{ github.run_id }}-${{ github.run_attempt }}
-        shell: bash
+  test:
+    name: Unit and integration tests
+    runs-on: ubuntu-26.04
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
         with:
-          # A failed harness may retain mounted diagnostic data. Never clean a
-          # previous checkout automatically or reuse another run's workspace.
-          path: e/${{ github.run_id }}-${{ github.run_attempt }}
-          clean: false
           persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: rust-${{ runner.os }}-${{ runner.arch }}-test-${{ hashFiles('Cargo.lock') }}
+      - run: cargo test --locked
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+  quality:
+    name: Formatting and lint
+    runs-on: ubuntu-26.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: rust-${{ runner.os }}-${{ runner.arch }}-lint-${{ hashFiles('Cargo.lock') }}
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --locked --all-targets --all-features -- -D warnings
+      - name: Validate CI scripts and failure gate
+        run: |
+          shellcheck tests/support/ci_e2e.sh tests/support/local_s3.sh tests/support/zfs_s3_e2e.sh
+          python3 -m unittest discover -s tests/support -p 'test_ci_*.py' -v
 
-      - name: Run real storage and official Tink interoperability tests
+  release:
+    name: Release build
+    runs-on: ubuntu-26.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: rust-${{ runner.os }}-${{ runner.arch }}-release-${{ hashFiles('Cargo.lock') }}
+      - run: cargo build --release --locked
+
+  audit:
+    name: Dependency audit
+    uses: ./.github/workflows/security.yml
+
+  e2e:
+    name: ZFS and S3 end-to-end
+    runs-on: ubuntu-26.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: rust-${{ runner.os }}-${{ runner.arch }}-e2e-${{ hashFiles('Cargo.lock') }}
+      - name: Install hosted ZFS and test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends zfsutils-linux python3-venv gnupg
+          sudo modprobe zfs
+      - name: Prepare disposable pool and run every infrastructure-backed test
         run: bash tests/support/ci_e2e.sh
-
-      - name: Upload end-to-end diagnostics
+      - name: Upload diagnostics without keys or credentials
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: e2e-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
-            e/${{ github.run_id }}-${{ github.run_attempt }}/.ci-e2e/logs/
-            e/${{ github.run_id }}-${{ github.run_attempt }}/.ci-e2e/s3/logs/
-            e/${{ github.run_id }}-${{ github.run_attempt }}/.ci-e2e/s3/disk-budget-*.txt
-          include-hidden-files: true
+            ${{ runner.temp }}/sts-${{ github.run_id }}-${{ github.run_attempt }}/logs/
+            ${{ runner.temp }}/sts-${{ github.run_id }}-${{ github.run_attempt }}/s3/logs/
+            ${{ runner.temp }}/sts-${{ github.run_id }}-${{ github.run_attempt }}/s3/disk-budget-*.txt
           if-no-files-found: warn
           retention-days: 7
 
-  test:
-    name: Test
-    runs-on: ubuntu-latest
+  gate:
+    name: CI Gate
+    if: always()
+    needs: [test, quality, release, audit, e2e]
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
-      
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        
-      - name: Cache cargo registry
-        uses: actions/cache@v4
         with:
-          path: ~/.cargo/registry
-          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
-          
-      - name: Cache cargo index
-        uses: actions/cache@v4
-        with:
-          path: ~/.cargo/git
-          key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
-          
-      - name: Cache cargo build
-        uses: actions/cache@v4
-        with:
-          path: target
-          key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
-          
-      - name: Run tests
-        run: cargo test --locked --verbose
-
-  fmt:
-    name: Format
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt
-          
-      - name: Check formatting
-        run: cargo fmt --all -- --check
-
-  clippy:
-    name: Clippy
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-          
-      - name: Cache cargo registry
-        uses: actions/cache@v4
-        with:
-          path: ~/.cargo/registry
-          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
-          
-      - name: Cache cargo index
-        uses: actions/cache@v4
-        with:
-          path: ~/.cargo/git
-          key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
-          
-      - name: Cache cargo build
-        uses: actions/cache@v4
-        with:
-          path: target
-          key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
-          
-      - name: Run clippy
-        run: cargo clippy --locked --all-targets --all-features -- -D warnings
-
-  release-build:
-    name: Release Build
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache cargo registry
-        uses: actions/cache@v4
-        with:
-          path: ~/.cargo/registry
-          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Cache cargo index
-        uses: actions/cache@v4
-        with:
-          path: ~/.cargo/git
-          key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Cache cargo build
-        uses: actions/cache@v4
-        with:
-          path: target
-          key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Build release
-        run: cargo build --release --locked
+          persist-credentials: false
+      - name: Require every job to succeed
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        run: python3 tests/support/ci_gate.py

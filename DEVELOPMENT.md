@@ -5,7 +5,7 @@
 Ensure the host has OpenZFS installed and an administrator has provided a development pool. The container uses the
 host's ZFS kernel module through `/dev/zfs`; visible pools are not isolated from the host.
 
-Development tests and agents must only use existing pools. Do not create or recreate pools, prepare backing devices
+Local agent tests must only use existing pools. Do not create or recreate pools, prepare backing devices
 or files, import, export or destroy pools, or change pool labels to make them eligible. If no suitable pool exists,
 stop and ask the administrator to provide one.
 
@@ -48,9 +48,9 @@ backup and restore requirements; preparing this environment does not establish t
 
 Infrastructure-backed tests are opt-in and should not be silently treated as passing when skipped.
 
-The end-to-end CI job requires a dedicated self-hosted Linux runner with an existing `ONLINE` pool whose
-pool property is `user:isdev=yes`. CI does not provision, import, export or destroy pools; all test datasets
-remain inside the newly created unique namespace.
+Local end-to-end runs consume an existing `ONLINE` development pool whose pool property is `user:isdev=yes`.
+Remote CI runs on a fresh standard GitHub-hosted Ubuntu VM and provisions its own temporary file-backed pool.
+The hosted bootstrap refuses local and self-hosted execution and refuses VMs with existing pools.
 
 The optional official Tink runtime interoperability test checks encryption and decryption in both directions
 against Python Tink 1.16.1 with a 3 MiB payload. With Tink installed in a project-local virtual environment, run:
@@ -109,10 +109,10 @@ For local infrastructure and test artifacts, keep total incremental usage within
 
 Prefer generated streams and bounded fixtures over large persistent objects when validating multipart/error paths.
 
-## Commit workflow during rebuild
-
-Use small, frequent, locally verified commits coordinated by the parent integration owner. Do not rely on automatic
-push/release actions for in-progress rebuild branches.
+The disposable hosted E2E fixture uses a **2 GiB sparse backing file**, a **4 GiB free-space reserve** and a
+**4 GiB incremental service/artifact budget**. Actual fixture data is small; a sparse file is not evidence of
+available storage. CI checks measured free space and monitors growth. The hosted wrapper sets
+`E2E_MIN_FREE_BYTES` and the existing local S3 budget overrides explicitly; local defaults remain unchanged.
 
 ## Local checks and remote acceptance
 
@@ -122,20 +122,60 @@ Before committing, run the offline tests and checks:
 cargo test --locked
 cargo fmt --all -- --check
 cargo clippy --locked --all-targets --all-features -- -D warnings
+python3 -m unittest discover -s tests/support -p 'test_ci_*.py' -v
 ```
 
-Every push and same-repository pull request also schedules the real ZFS/S3 acceptance job in
-[CI](.github/workflows/ci.yml). The job checks pinned SeaweedFS 4.48, live HTTP capabilities, multi-step recovery,
-a real GET lasting more than 120 seconds, and bidirectional official Tink 1.16.1 interoperability using
-[ci_e2e.sh](tests/support/ci_e2e.sh).
+Do not run [ci_e2e.sh](tests/support/ci_e2e.sh) on the shared development host, even by forging runner environment
+variables. Its infrastructure bootstrap is exclusively for fresh GitHub-hosted VMs. Use
+[zfs_s3_e2e.sh](tests/support/zfs_s3_e2e.sh) for local tests with the existing labeled pools instead.
 
-Administrators must provide a dedicated runner labeled `self-hosted`, `Linux`, `X64`, `zfs-e2e`, with an existing
-`ONLINE` pool whose pool property is exactly `user:isdev=yes`. It needs OpenZFS userspace and kernel module 2.3+,
-Python 3.11+ with venv, GnuPG, Rust, passwordless sudo and at least 20 GiB free disk space. Use a short runner work
-root (for example `/w`) so isolated GnuPG socket paths fit Linux's limit. Only one runner process should use each
-dedicated development pool.
+### Hosted workflow
 
-Restrict the privileged runner group to this repository and trusted contributors. Fork pull requests run hosted
-offline checks only; their code must not run on the persistent privileged runner. Each acceptance run uses an
-isolated checkout and dataset namespace, stops its own local service, and uploads diagnostic logs. Failed dataset
-cleanup retains the namespace and runtime for operator inspection rather than deleting a mounted directory.
+[CI](.github/workflows/ci.yml) runs on pushes, pull requests, manual dispatch and merge groups. It uses fixed
+`ubuntu-26.04` standard hosted VMs, not a self-hosted runner, a larger runner or a privileged job container.
+Separate jobs run:
+
+* all default Rust unit and integration tests;
+* formatting, strict clippy, ShellCheck, and CI gate/hosted-guard tests;
+* the release build;
+* the reusable [RustSec audit](.github/workflows/security.yml), also run weekly;
+* every opt-in test and the real ZFS/S3 E2E harness.
+
+The E2E job installs JSON-capable OpenZFS tools and loads the kernel module before invoking
+[ci_e2e.sh](tests/support/ci_e2e.sh). The script requires matching usable userspace/module versions (2.3+),
+creates a uniquely named temporary pool with `user:isdev=yes`, and starts checksum-verified SeaweedFS 4.48
+with throwaway credentials. It explicitly runs official Tink 1.16.1 bidirectional interoperability, live HTTP
+capability tests, the real GET regression lasting more than 120 seconds, and full/multi-step raw ZFS recovery.
+GnuPG homes and mountpoints use short dedicated paths under the runner's temporary directory.
+
+An exit trap stops owned services, verifies the created pool's identity/GUID, destroys only that CI pool and
+removes its backing file after successful pool shutdown. It refuses to delete mounted runtime trees. Cleanup
+failures fail the job; diagnostics are uploaded even on failure. Artifacts exclude S3 credentials, GPG homes,
+native ZFS keys and large data/backing files.
+
+PR jobs have read-only repository permissions, no repository secrets and no persisted checkout credentials.
+Fork PRs use the same disposable infrastructure, subject to GitHub's approval requirements for first-time
+contributors. Do not replace `pull_request` with `pull_request_target` to execute untrusted PR code.
+
+GitHub's licensed Dependency Review feature is not required. RustSec audits the actual lockfile in CI, without
+advisory ignore lists; vulnerable dependencies fail the gate.
+
+### Main-branch gate and remote verification
+
+`CI Gate` requires every test, quality, release, audit and E2E job to succeed. Missing, skipped, cancelled or
+failed prerequisite jobs cannot produce a successful gate. Main-branch protection requires a PR, this check
+from the GitHub Actions app, and an up-to-date branch. No independent human approval is required; administrators
+retain the explicitly allowed emergency bypass. Normal force pushes and branch deletion are prohibited.
+
+Commit on a topic branch, push, and verify the exact revision remotely:
+
+```bash
+gh run list --branch YOUR_BRANCH
+gh run watch RUN_ID --exit-status --compact
+gh run view RUN_ID --log-failed
+gh pr checks PR_NUMBER
+```
+
+Passing local tests or merely linting the workflow is not remote acceptance. All opt-in and real ZFS tests
+must actually run. Verify both the run results and the server-side protection settings; workflow YAML alone
+does not configure a repository's required checks.
