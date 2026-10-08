@@ -275,7 +275,7 @@ EOF
 
 weed_pid=""
 monitor_pid=""
-# shellcheck disable=SC2317 # Invoked by the EXIT, INT and TERM traps.
+# shellcheck disable=SC2317,SC2329 # Invoked by the EXIT, INT and TERM traps.
 cleanup() {
   local rc=$?
   if [[ -n "$monitor_pid" ]] && kill -0 "$monitor_pid" 2>/dev/null; then

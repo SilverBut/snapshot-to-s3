@@ -103,7 +103,7 @@ PY
             echo "mounts remain in test runtime; refusing directory cleanup" >&2
             status=1
         else
-            for path in "$root/s3/data" "$root/zfs" "$root/g" "$root/download" \
+            for path in "$root/s3/data" "$root/zfs" "$root/zfs-build" "$root/g" "$root/download" \
                         "$root/bin" "$root/venv" "$root/scratch"; do
                 if [[ -d "$path" ]]; then
                     rm -r -- "$path"
@@ -156,6 +156,39 @@ free="$(df -B1 --output=avail "$root" | tail -n 1 | tr -d ' ')"
     echo "hosted job needs at least 4 GiB free for its bounded test fixture" >&2
     exit 1
 }
+curl --fail --location --retry 3 \
+    https://github.com/openzfs/zfs/releases/download/zfs-2.4.4/zfs-2.4.4.tar.gz \
+    --output "$root/download/zfs-2.4.4.tar.gz"
+printf '%s  %s\n' \
+    2a3c70d55a37cc71618a95a60e81ad66530201eb118d37741dc92efcf848c8b1 \
+    "$root/download/zfs-2.4.4.tar.gz" | sha256sum --check
+mkdir "$root/zfs-build"
+tar -xzf "$root/download/zfs-2.4.4.tar.gz" --strip-components=1 -C "$root/zfs-build"
+(
+    cd "$root/zfs-build"
+    ./configure --prefix=/usr/local --disable-pyzfs --with-linux="/lib/modules/$(uname -r)/build"
+    make -j2
+    sudo -n make install
+) 2>&1 | tee "$root/logs/zfs-build.log"
+sudo -n ldconfig
+sudo -n modprobe -r zfs spl
+sudo -n insmod "$root/zfs-build/module/spl.ko"
+sudo -n insmod "$root/zfs-build/module/zfs.ko"
+export PATH="/usr/local/sbin:/usr/local/bin:$PATH"
+hash -r
+zfs version | tee "$root/logs/zfs-version.txt"
+sudo -n zfs version | tee "$root/logs/zfs-root-version.txt"
+python3 - "$root/logs/zfs-version.txt" "$root/logs/zfs-root-version.txt" <<'PY'
+import re
+import sys
+
+for path in sys.argv[1:]:
+    with open(path) as source:
+        text = source.read()
+    for component in ("zfs", "zfs-kmod"):
+        if not re.search(rf"^{component}-2\.4\.4(?:\s|$|-)", text, re.MULTILINE):
+            sys.exit(f"expected matching OpenZFS 2.4.4 tools/module: {text}")
+PY
 truncate -s 2G "$backing"
 backing_identity="$(stat -c '%d:%i' "$backing")"
 sudo -n zpool create -o cachefile=none -o user:isdev=yes \
