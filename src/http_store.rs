@@ -1152,7 +1152,7 @@ struct ThroughputGuard {
     minimum: u64,
     elapsed: Duration,
     bytes: u64,
-    samples: [(u128, u64); 64],
+    samples: [(u128, u64); 65],
 }
 
 impl ThroughputGuard {
@@ -1165,14 +1165,14 @@ impl ThroughputGuard {
             minimum: policy.minimum_bytes_per_window,
             elapsed: Duration::ZERO,
             bytes: 0,
-            samples: [(u128::MAX, 0); 64],
+            samples: [(u128::MAX, 0); 65],
         }
     }
 
     fn add(&mut self, bytes: u64) {
         self.bytes = self.bytes.saturating_add(bytes);
         let bucket = self.elapsed.as_nanos() / self.bucket_width.as_nanos();
-        let sample = &mut self.samples[(bucket % 64) as usize];
+        let sample = &mut self.samples[(bucket % 65) as usize];
         if sample.0 != bucket {
             *sample = (bucket, 0);
         }
@@ -1180,12 +1180,9 @@ impl ThroughputGuard {
     }
 
     fn check(&mut self) -> Result<()> {
-        // Exclude the partially expired bucket, never crediting bytes older than the window.
-        let oldest = self
-            .elapsed
-            .saturating_sub(self.window)
-            .as_nanos()
-            .div_ceil(self.bucket_width.as_nanos());
+        // Include the boundary bucket: this upper bound cannot falsely reject healthy progress.
+        let oldest =
+            self.elapsed.saturating_sub(self.window).as_nanos() / self.bucket_width.as_nanos();
         let newest = self.elapsed.as_nanos() / self.bucket_width.as_nanos();
         let recent = self
             .samples
@@ -1551,12 +1548,12 @@ mod throughput_tests {
             guard.elapsed += Duration::from_micros(100);
             guard.add(1);
         }
-        assert_eq!(guard.samples.len(), 64);
+        assert_eq!(guard.samples.len(), 65);
         assert!(
             guard.check().is_ok(),
             "healthy recent progress must remain visible"
         );
-        guard.elapsed += guard.window;
+        guard.elapsed += guard.window + guard.bucket_width;
         assert!(
             guard.check().is_err(),
             "expired bursts must not remain credited"
@@ -1564,18 +1561,29 @@ mod throughput_tests {
     }
 
     #[test]
-    fn cutoff_bucket_is_conservative_without_discarding_new_progress() {
+    fn cutoff_bucket_preserves_healthy_progress_then_expires() {
         let mut guard = ThroughputGuard::new(&HttpPolicy {
             throughput_window: Duration::from_millis(640),
             minimum_bytes_per_window: 8,
             ..HttpPolicy::default()
         });
-        guard.elapsed = Duration::from_millis(1);
-        guard.add(1024);
-        guard.elapsed = Duration::from_millis(645);
+        guard.elapsed = Duration::from_millis(5);
+        guard.add(8);
+        guard.elapsed = Duration::from_millis(641);
+        guard.add(1);
+        assert!(
+            guard.check().is_ok(),
+            "all nine bytes are still inside the actual window"
+        );
+        guard.elapsed = Duration::from_millis(649);
+        assert!(
+            guard.check().is_ok(),
+            "the boundary upper bound may briefly retain old bytes"
+        );
+        guard.elapsed = Duration::from_millis(650);
         assert!(
             guard.check().is_err(),
-            "a bucket containing expired bytes is excluded"
+            "old progress expires within one boundary bucket"
         );
         guard.add(8);
         assert!(
