@@ -1,4 +1,5 @@
 use anyhow::Result;
+use serde_json::{json, Value};
 use snapshot_to_s3::model::{Reader, SnapshotName};
 use snapshot_to_s3::zfs::SystemZfs;
 use snapshot_to_s3::zfs_api::Zfs;
@@ -24,14 +25,37 @@ fn fixture_dir(name: &str) -> Result<PathBuf> {
 set -euo pipefail
 mode="__MODE__"
 pid_file="__PID_FILE__"
+base="__BASE__"
 cmd="$1"
 shift || true
+printf '%s %s\n' "$cmd" "$*" >> "$base/commands"
+
+reject_args() {
+  echo "unexpected arguments for $cmd: $*" >&2
+  exit 99
+}
+
+override() {
+  if [[ -f "$base/$1.json" ]]; then
+    cat "$base/$1.json"
+    exit 0
+  fi
+}
+
+get_json() {
+  printf '{"output_version":{"command":"zfs get","vers_major":0,"vers_minor":1},"datasets":{"%s":{"name":"%s","type":"%s","pool":"pool","createtxg":"1","properties":{%s}}}}\n' "$last" "$last" "$kind" "$1"
+}
 
 case "$cmd" in
   get)
-    joined=" $* "
+    [[ "$#" == 4 && "$1" == "-j" && "$2" == "-p" ]] || reject_args "$@"
+    property="$3"
     last="${@: -1}"
-    if [[ "$joined" == *" value type "* ]]; then
+    kind="FILESYSTEM"
+    [[ "$last" != *"@"* ]] || kind="SNAPSHOT"
+    [[ "$last" != "pool/vol" ]] || kind="VOLUME"
+    if [[ "$property" == "type" ]]; then
+      override get-type
       if [[ "$mode" == "huge-stdout" ]]; then
         i=0
         while [[ $i -lt 9000 ]]; do
@@ -41,41 +65,46 @@ case "$cmd" in
         printf '\n'
         exit 0
       fi
+      if [[ "$mode" == "type-op-error" ]]; then
+        echo "permission denied" >&2
+        exit 1
+      fi
       if [[ "$last" == "pool/fs" || "$last" == "pool/new" ]]; then
-        printf 'filesystem\n'
+        get_json '"type":{"value":"filesystem","source":{"type":"NONE","data":"-"}}'
       elif [[ "$last" == "pool/vol" ]]; then
-        printf 'volume\n'
+        get_json '"type":{"value":"volume","source":{"type":"NONE","data":"-"}}'
       else
         echo "dataset does not exist" >&2
         exit 1
       fi
       exit 0
     fi
-    if [[ "$joined" == *" value guid "* ]]; then
+    if [[ "$property" == "guid" ]]; then
+      override get-guid
       if [[ "$last" == "pool/fs" || "$last" == "pool/new" ]]; then
-        printf '22\n'
+        get_json '"guid":{"value":"22","source":{"type":"NONE","data":"-"}}'
         exit 0
       fi
       echo "dataset does not exist" >&2
       exit 1
     fi
 
-    if [[ "$joined" == *" property,value "* ]]; then
+    if [[ "$property" == "guid,createtxg" ]]; then
+      override get-snapshot
       if [[ "$last" == "pool/fs@s1" || "$last" == "pool/fs@s2" ]]; then
-        printf 'guid\t11\n'
-        printf 'createtxg\t101\n'
+        get_json '"guid":{"value":"11","source":{"type":"NONE","data":"-"}},"createtxg":{"value":"101","source":{"type":"NONE","data":"-"}}'
         exit 0
       fi
       if [[ "$last" == "pool/fs/child@sx" ]]; then
-        printf 'guid\t33\n'
-        printf 'createtxg\t99\n'
+        get_json '"guid":{"value":"33","source":{"type":"NONE","data":"-"}},"createtxg":{"value":"99","source":{"type":"NONE","data":"-"}}'
         exit 0
       fi
       echo "snapshot does not exist" >&2
       exit 1
     fi
 
-    if [[ "$joined" == *" written@"* ]]; then
+    if [[ "$property" == "written@s1" ]]; then
+      override get-written
       case "$mode" in
         candidate-invalid)
           echo "not an earlier snapshot from the same fs" >&2
@@ -86,26 +115,32 @@ case "$cmd" in
           exit 1
           ;;
         *)
-          printf '4096\n'
+          get_json '"written@s1":{"value":"4096","source":{"type":"NONE","data":"-"}}'
           ;;
       esac
       exit 0
     fi
+    reject_args "$@"
     ;;
 
   list)
+    [[ "$#" == 11 && "$1" == "-j" && "$2" == "-p" && "$3" == "-t" && "$4" == "snapshot" && "$5" == "-o" && "$6" == "name" && "$7" == "-d" && "$8" == "1" && "$9" == "-s" && "${10}" == "creation" && "${11}" == "pool/fs" ]] || reject_args "$@"
+    override list
     if [[ "$mode" == "list-child-leak" ]]; then
-      printf 'pool/fs@s1\n'
-      printf 'pool/fs/child@sx\n'
+      second="pool/fs/child@sx"
     else
-      printf 'pool/fs@s1\n'
-      printf 'pool/fs@s2\n'
+      second="pool/fs@s2"
     fi
+    printf '{"output_version":{"command":"zfs list","vers_major":0,"vers_minor":1},"datasets":{"pool/fs@s1":{"name":"pool/fs@s1","type":"SNAPSHOT","pool":"pool","createtxg":"1","properties":{}},"%s":{"name":"%s","type":"SNAPSHOT","pool":"pool","createtxg":"1","properties":{}}}}\n' "$second" "$second"
     ;;
 
   send)
+    for arg in "$@"; do
+      [[ "$arg" != "-j" && "$arg" != "--json" ]] || reject_args "$@"
+    done
     joined=" $* "
     if [[ "$joined" == *" -nP "* ]]; then
+      [[ "$*" == "-nP -w pool/fs@s2" || "$*" == "-nP -w -i pool/fs@s1 pool/fs@s2" ]] || reject_args "$@"
       if [[ "$mode" == "candidate-invalid" ]]; then
         echo "incremental source invalid" >&2
         exit 1
@@ -113,6 +148,7 @@ case "$cmd" in
       printf 'size\t8192\n'
       exit 0
     fi
+    [[ "$*" == "-w pool/fs@s2" || "$*" == "-w -i pool/fs@s1 pool/fs@s2" ]] || reject_args "$@"
 
     case "$mode" in
       send-fail-stderr)
@@ -138,12 +174,14 @@ case "$cmd" in
     ;;
 
   diff)
+    [[ "$*" == "-H pool/fs@s2 pool/fs" ]] || reject_args "$@"
     if [[ "$mode" == "dirty" ]]; then
       printf 'M\tpool/fs/file\n'
     fi
     ;;
 
   receive)
+    [[ "$*" == "-u pool/new" ]] || reject_args "$@"
     case "$mode" in
       receive-exit-fail)
         cat >/dev/null
@@ -173,19 +211,30 @@ esac
         &zfs,
         zfs_script
             .replace("__MODE__", name)
+            .replace("__BASE__", base.to_string_lossy().as_ref())
             .replace("__PID_FILE__", pid_file.to_string_lossy().as_ref()),
     )?;
     fs::write(
         &zpool,
         r#"#!/usr/bin/env bash
 set -euo pipefail
-if [[ "$1" == "list" && "$5" == "pool" ]]; then
-  printf 'pool\n'
+base="__BASE__"
+printf 'zpool %s\n' "$*" >> "$base/commands"
+if [[ "$#" != 5 || "$1" != "list" || "$2" != "-j" || "$3" != "-o" || "$4" != "name" ]]; then
+  echo "unexpected zpool arguments: $*" >&2
+  exit 99
+fi
+if [[ -f "$base/pool.json" ]]; then
+  cat "$base/pool.json"
+  exit 0
+fi
+if [[ "$5" == "pool" ]]; then
+  printf '{"output_version":{"command":"zpool list","vers_major":0,"vers_minor":1},"pools":{"pool":{"name":"pool","type":"POOL","state":"ONLINE","pool_guid":"22","properties":{}}}}\n'
   exit 0
 fi
 echo "no such pool" >&2
 exit 1
-"#,
+"#.replace("__BASE__", base.to_string_lossy().as_ref()),
     )?;
 
     use std::os::unix::fs::PermissionsExt;
@@ -198,6 +247,101 @@ exit 1
 fn configure_bins(base: &Path) {
     std::env::set_var("SNAPSHOT_TO_S3_ZFS_BIN", base.join("bin/zfs"));
     std::env::set_var("SNAPSHOT_TO_S3_ZPOOL_BIN", base.join("bin/zpool"));
+}
+
+fn property(value: &str) -> Value {
+    json!({"value": value, "source": {"type": "NONE", "data": "-"}})
+}
+
+fn dataset_json(command: &str, name: &str, kind: &str, properties: Value) -> Value {
+    json!({
+        "output_version": {"command": command, "vers_major": 0, "vers_minor": 1},
+        "datasets": {
+            name: {
+                "name": name, "type": kind, "pool": "pool", "createtxg": "1",
+                "properties": properties
+            }
+        }
+    })
+}
+
+fn write_json(base: &Path, command: &str, value: &Value) {
+    fs::write(
+        base.join(format!("{command}.json")),
+        serde_json::to_vec(value).unwrap(),
+    )
+    .unwrap();
+}
+
+fn invalid_documents(valid: &Value, collection: &str, name: &str) -> Vec<(&'static str, Value)> {
+    let mut cases = Vec::new();
+    let name = name.replace('~', "~0").replace('/', "~1");
+    for (label, pointer, replacement) in [
+        (
+            "wrong command",
+            "/output_version/command".to_owned(),
+            json!("zfs send"),
+        ),
+        (
+            "unsupported major",
+            "/output_version/vers_major".to_owned(),
+            json!(1),
+        ),
+        (
+            "invalid minor",
+            "/output_version/vers_minor".to_owned(),
+            json!("1"),
+        ),
+        ("collection not object", format!("/{collection}"), json!([])),
+        (
+            "missing requested object",
+            format!("/{collection}"),
+            json!({}),
+        ),
+        (
+            "name mismatch",
+            format!("/{collection}/{name}/name"),
+            json!("pool/other"),
+        ),
+        (
+            "type mismatch",
+            format!("/{collection}/{name}/type"),
+            json!("VOLUME"),
+        ),
+        (
+            "properties not object",
+            format!("/{collection}/{name}/properties"),
+            Value::Null,
+        ),
+    ] {
+        let mut value = valid.clone();
+        *value.pointer_mut(&pointer).unwrap() = replacement;
+        cases.push((label, value));
+    }
+    for (label, pointer, key) in [
+        ("missing version", "".to_owned(), "output_version"),
+        ("missing command", "/output_version".to_owned(), "command"),
+        ("missing major", "/output_version".to_owned(), "vers_major"),
+        ("missing minor", "/output_version".to_owned(), "vers_minor"),
+        ("missing collection", "".to_owned(), collection),
+        ("missing name", format!("/{collection}/{name}"), "name"),
+        ("missing type", format!("/{collection}/{name}"), "type"),
+        (
+            "missing properties",
+            format!("/{collection}/{name}"),
+            "properties",
+        ),
+    ] {
+        let mut value = valid.clone();
+        value
+            .pointer_mut(&pointer)
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .remove(key);
+        cases.push((label, value));
+    }
+    cases
 }
 
 async fn env_lock() -> MutexGuard<'static, ()> {
@@ -395,4 +539,322 @@ async fn bounded_stdout_capture_rejects_large_command_output() {
     let z = SystemZfs::new();
     let err = z.target("pool/fs").await.unwrap_err().to_string();
     assert!(err.contains("command stdout exceeded"));
+}
+
+#[tokio::test]
+async fn json_preserves_maximum_guid_and_numeric_properties() {
+    let _lock = env_lock().await;
+    let base = fixture_dir("json-max-guid").unwrap();
+    configure_bins(&base);
+    let maximum = u64::MAX.to_string();
+    write_json(
+        &base,
+        "get-guid",
+        &dataset_json(
+            "zfs get",
+            "pool/fs",
+            "FILESYSTEM",
+            json!({"guid": property(&maximum)}),
+        ),
+    );
+    write_json(
+        &base,
+        "get-snapshot",
+        &dataset_json(
+            "zfs get",
+            "pool/fs@s2",
+            "SNAPSHOT",
+            json!({"guid": property(&maximum), "createtxg": property(&maximum)}),
+        ),
+    );
+    let z = SystemZfs::new();
+    let current = SnapshotName::parse("zfs:pool/fs@s2").unwrap();
+    let info = z.snapshot(&current).await.unwrap();
+    assert_eq!(info.guid, maximum);
+    assert_eq!(info.volume_guid, maximum);
+    assert_eq!(info.createtxg, u64::MAX);
+
+    write_json(
+        &base,
+        "get-written",
+        &dataset_json(
+            "zfs get",
+            "pool/fs@s2",
+            "SNAPSHOT",
+            json!({"written@s1": property(&maximum)}),
+        ),
+    );
+    fs::remove_file(base.join("get-snapshot.json")).unwrap();
+    let previous = SnapshotName::parse("zfs:pool/fs@s1").unwrap();
+    assert_eq!(
+        z.written(&previous, &current).await.unwrap(),
+        Some(u64::MAX)
+    );
+}
+
+#[tokio::test]
+async fn json_snapshot_rejects_invalid_documents_and_required_properties() {
+    let _lock = env_lock().await;
+    let base = fixture_dir("json-invalid-snapshot").unwrap();
+    configure_bins(&base);
+    let valid = dataset_json(
+        "zfs get",
+        "pool/fs@s2",
+        "SNAPSHOT",
+        json!({"guid": property("11"), "createtxg": property("101")}),
+    );
+    let z = SystemZfs::new();
+    let current = SnapshotName::parse("zfs:pool/fs@s2").unwrap();
+    for (label, value) in invalid_documents(&valid, "datasets", "pool/fs@s2") {
+        write_json(&base, "get-snapshot", &value);
+        assert!(z.snapshot(&current).await.is_err(), "{label} was accepted");
+    }
+    for key in ["guid", "createtxg"] {
+        let mut value = valid.clone();
+        value["datasets"]["pool/fs@s2"]["properties"]
+            .as_object_mut()
+            .unwrap()
+            .remove(key);
+        write_json(&base, "get-snapshot", &value);
+        assert!(
+            z.snapshot(&current).await.is_err(),
+            "missing {key} was accepted"
+        );
+        for invalid in [
+            json!({}),
+            json!({"value": null}),
+            json!({"value": 11}),
+            property(""),
+            property("-1"),
+            property("18446744073709551616"),
+            property("1.0"),
+            property("1K"),
+        ] {
+            let mut value = valid.clone();
+            value["datasets"]["pool/fs@s2"]["properties"][key] = invalid.clone();
+            write_json(&base, "get-snapshot", &value);
+            assert!(
+                z.snapshot(&current).await.is_err(),
+                "{key}: {invalid} was accepted"
+            );
+        }
+    }
+    let mut zero_guid = valid.clone();
+    zero_guid["datasets"]["pool/fs@s2"]["properties"]["guid"] = property("0");
+    write_json(&base, "get-snapshot", &zero_guid);
+    assert!(z.snapshot(&current).await.is_err());
+    fs::write(base.join("get-snapshot.json"), "{not json").unwrap();
+    assert!(z.snapshot(&current).await.is_err());
+}
+
+#[tokio::test]
+async fn json_dataset_type_rejects_invalid_success_instead_of_treating_it_as_absent() {
+    let _lock = env_lock().await;
+    let base = fixture_dir("json-invalid-type").unwrap();
+    configure_bins(&base);
+    let valid = dataset_json(
+        "zfs get",
+        "pool/fs",
+        "FILESYSTEM",
+        json!({"type": property("filesystem")}),
+    );
+    let z = SystemZfs::new();
+    for (label, value) in invalid_documents(&valid, "datasets", "pool/fs") {
+        write_json(&base, "get-type", &value);
+        assert!(z.target("pool/fs").await.is_err(), "{label} was accepted");
+    }
+    for invalid in [
+        json!({}),
+        json!({"type": {}}),
+        json!({"type": {"value": null}}),
+    ] {
+        let mut value = valid.clone();
+        value["datasets"]["pool/fs"]["properties"] = invalid;
+        write_json(&base, "get-type", &value);
+        assert!(z.target("pool/fs").await.is_err());
+    }
+    fs::write(base.join("get-type.json"), "filesystem\n").unwrap();
+    assert!(z.target("pool/fs").await.is_err());
+    let commands = fs::read_to_string(base.join("commands")).unwrap();
+    assert!(
+        commands.lines().all(|line| {
+            line == "zpool list -j -o name pool" || line == "get -j -p type pool/fs"
+        }),
+        "invalid JSON triggered an unexpected fallback: {commands}"
+    );
+}
+
+#[tokio::test]
+async fn json_filesystem_guid_requires_a_valid_decimal_string() {
+    let _lock = env_lock().await;
+    let base = fixture_dir("json-invalid-guid").unwrap();
+    configure_bins(&base);
+    let current = SnapshotName::parse("zfs:pool/fs@s2").unwrap();
+    let z = SystemZfs::new();
+    for invalid in [
+        json!({}),
+        json!({"guid": {}}),
+        json!({"guid": {"value": 22}}),
+        json!({"guid": property("0")}),
+        json!({"guid": property("18446744073709551616")}),
+    ] {
+        write_json(
+            &base,
+            "get-guid",
+            &dataset_json("zfs get", "pool/fs", "FILESYSTEM", invalid),
+        );
+        assert!(z.snapshot(&current).await.is_err());
+    }
+}
+
+#[tokio::test]
+async fn json_written_requires_a_valid_property_value() {
+    let _lock = env_lock().await;
+    let base = fixture_dir("json-invalid-written").unwrap();
+    configure_bins(&base);
+    let previous = SnapshotName::parse("zfs:pool/fs@s1").unwrap();
+    let current = SnapshotName::parse("zfs:pool/fs@s2").unwrap();
+    let z = SystemZfs::new();
+    for invalid in [
+        json!({}),
+        json!({"written@s1": {}}),
+        json!({"written@s1": {"value": 4096}}),
+        json!({"written@s1": property("-")}),
+        json!({"written@s1": property("-1")}),
+        json!({"written@s1": property("18446744073709551616")}),
+    ] {
+        write_json(
+            &base,
+            "get-written",
+            &dataset_json("zfs get", "pool/fs@s2", "SNAPSHOT", invalid),
+        );
+        assert!(z.written(&previous, &current).await.is_err());
+    }
+    write_json(
+        &base,
+        "get-written",
+        &dataset_json(
+            "zfs get",
+            "pool/fs@s2",
+            "SNAPSHOT",
+            json!({"written@s1": property("0")}),
+        ),
+    );
+    assert_eq!(z.written(&previous, &current).await.unwrap(), Some(0));
+}
+
+#[tokio::test]
+async fn json_snapshot_list_validates_identity_and_accepts_empty_listing() {
+    let _lock = env_lock().await;
+    let base = fixture_dir("json-invalid-list").unwrap();
+    configure_bins(&base);
+    let z = SystemZfs::new();
+    let valid = dataset_json("zfs list", "pool/fs@s1", "SNAPSHOT", json!({}));
+    for (label, value) in invalid_documents(&valid, "datasets", "pool/fs@s1") {
+        if label == "missing requested object" {
+            continue;
+        }
+        write_json(&base, "list", &value);
+        assert!(
+            z.snapshots("pool/fs").await.is_err(),
+            "{label} was accepted"
+        );
+    }
+    write_json(&base, "list", &valid);
+    let snapshots = z.snapshots("pool/fs").await.unwrap();
+    assert_eq!(snapshots.len(), 1);
+    assert_eq!(snapshots[0].guid, "11");
+    assert_eq!(snapshots[0].createtxg, 101);
+    write_json(
+        &base,
+        "list",
+        &json!({"output_version": {"command": "zfs list", "vers_major": 0, "vers_minor": 1}, "datasets": {}}),
+    );
+    assert!(z.snapshots("pool/fs").await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn json_pool_list_validates_envelope_and_identity() {
+    let _lock = env_lock().await;
+    let base = fixture_dir("json-invalid-pool").unwrap();
+    configure_bins(&base);
+    let z = SystemZfs::new();
+    let valid = json!({
+        "output_version": {"command": "zpool list", "vers_major": 0, "vers_minor": 1},
+        "pools": {"pool": {"name": "pool", "type": "POOL", "state": "ONLINE",
+                          "pool_guid": "22", "properties": {}}}
+    });
+    for (label, value) in invalid_documents(&valid, "pools", "pool") {
+        if matches!(label, "properties not object" | "missing properties") {
+            continue;
+        }
+        write_json(&base, "pool", &value);
+        assert!(z.target("pool/fs").await.is_err(), "{label} was accepted");
+    }
+    fs::write(base.join("pool.json"), "pool\n").unwrap();
+    assert!(z.target("pool/fs").await.is_err());
+}
+
+#[tokio::test]
+async fn absent_dataset_requires_nonzero_missing_error_and_permission_errors_propagate() {
+    let _lock = env_lock().await;
+    let base = fixture_dir("type-op-error").unwrap();
+    configure_bins(&base);
+    let err = SystemZfs::new()
+        .target("pool/fs")
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("permission denied"));
+
+    let base = fixture_dir("json-absent-dataset").unwrap();
+    configure_bins(&base);
+    let target = SystemZfs::new().target("pool/missing").await.unwrap();
+    assert!(!target.exists);
+    assert!(target.snapshots.is_empty());
+    let commands = fs::read_to_string(base.join("commands")).unwrap();
+    assert_eq!(
+        commands,
+        "zpool list -j -o name pool\nget -j -p type pool/missing\n"
+    );
+}
+
+#[tokio::test]
+async fn json_metadata_keeps_diff_estimates_and_streams_in_native_formats() {
+    let _lock = env_lock().await;
+    let base = fixture_dir("json-native-streams").unwrap();
+    configure_bins(&base);
+    let previous = SnapshotName::parse("zfs:pool/fs@s1").unwrap();
+    let current = SnapshotName::parse("zfs:pool/fs@s2").unwrap();
+    let z = SystemZfs::new();
+    z.check_clean(&current).await.unwrap();
+    assert_eq!(z.written(&previous, &current).await.unwrap(), Some(4096));
+    assert_eq!(z.estimate(&current, None).await.unwrap(), Some(8192));
+    assert_eq!(
+        z.estimate(&current, Some(&previous)).await.unwrap(),
+        Some(8192)
+    );
+    for base in [None, Some(&previous)] {
+        let mut stream = z.send(&current, base).await.unwrap();
+        let mut bytes = Vec::new();
+        stream.reader.read_to_end(&mut bytes).await.unwrap();
+        stream.completion.await.unwrap().unwrap();
+        assert_eq!(bytes, b"stream-data\n");
+    }
+    let mut input: Reader = Box::new(&b"binary\0stream\xff"[..]);
+    z.receive("pool/new", &mut input).await.unwrap();
+    let commands = fs::read_to_string(base.join("commands")).unwrap();
+    for command in [
+        "diff -H pool/fs@s2 pool/fs",
+        "send -nP -w pool/fs@s2",
+        "send -nP -w -i pool/fs@s1 pool/fs@s2",
+        "send -w pool/fs@s2",
+        "send -w -i pool/fs@s1 pool/fs@s2",
+        "receive -u pool/new",
+    ] {
+        assert!(
+            commands.lines().any(|line| line == command),
+            "missing command: {command}"
+        );
+    }
 }

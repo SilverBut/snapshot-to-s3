@@ -6,6 +6,7 @@ use crate::process::{
 use crate::zfs_api::{SendStream, SnapshotInfo, TargetInfo, Zfs};
 use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
+use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::pin::Pin;
@@ -35,6 +36,7 @@ impl SystemZfs {
     async fn run_capture(&self, program: &OsString, args: &[String]) -> Result<CommandOutput> {
         let mut child = Command::new(program)
             .args(args)
+            .env("LC_ALL", "C")
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true)
@@ -77,13 +79,22 @@ impl SystemZfs {
 
         let args = vec![
             "list".into(),
-            "-H".into(),
+            "-j".into(),
             "-o".into(),
             "name".into(),
             pool.into(),
         ];
         let output = self.run_capture(&self.zpool_bin, &args).await?;
         if output.status.success() {
+            let document: PoolDocument =
+                serde_json::from_str(&output.stdout).context("invalid JSON from zpool list")?;
+            document.output_version.validate("zpool list")?;
+            let entry = document.pools.get(pool).with_context(|| {
+                format!("zpool list JSON is missing the requested pool: {pool}")
+            })?;
+            if entry.name != pool || entry.kind != "POOL" {
+                bail!("zpool list JSON contains an invalid pool identity: {pool}");
+            }
             return Ok(());
         }
 
@@ -96,16 +107,19 @@ impl SystemZfs {
     async fn dataset_type(&self, dataset: &str) -> Result<Option<String>> {
         let args = vec![
             "get".into(),
-            "-H".into(),
+            "-j".into(),
             "-p".into(),
-            "-o".into(),
-            "value".into(),
             "type".into(),
             dataset.into(),
         ];
         let output = self.run_capture(&self.zfs_bin, &args).await?;
         if output.status.success() {
-            return Ok(Some(output.stdout.trim().to_string()));
+            let entry = dataset_from_json(&output.stdout, "zfs get", dataset)?;
+            let kind = entry.property("type")?;
+            if !entry.kind.eq_ignore_ascii_case(kind) {
+                bail!("zfs get JSON has inconsistent dataset types for {dataset}");
+            }
+            return Ok(Some(kind.to_string()));
         }
 
         if looks_missing(&output.stderr) {
@@ -131,10 +145,8 @@ impl SystemZfs {
     ) -> Result<Option<BTreeMap<String, String>>> {
         let args = vec![
             "get".into(),
-            "-H".into(),
+            "-j".into(),
             "-p".into(),
-            "-o".into(),
-            "property,value".into(),
             "guid,createtxg".into(),
             name.full_name(),
         ];
@@ -150,26 +162,24 @@ impl SystemZfs {
             );
         }
 
-        let mut values = BTreeMap::new();
-        for line in output.stdout.lines() {
-            if line.trim().is_empty() {
-                continue;
-            }
-            let (property, value) = line
-                .split_once('\t')
-                .ok_or_else(|| anyhow!("invalid zfs get line: {line}"))?;
-            values.insert(property.to_string(), value.to_string());
+        let entry = dataset_from_json(&output.stdout, "zfs get", &name.full_name())?;
+        if entry.kind != "SNAPSHOT" {
+            bail!("zfs get JSON is not a snapshot: {}", name.full_name());
         }
-        Ok(Some(values))
+        Ok(Some(
+            entry
+                .properties
+                .into_iter()
+                .map(|(property, value)| (property, value.value))
+                .collect(),
+        ))
     }
 
     async fn filesystem_guid(&self, dataset: &str) -> Result<String> {
         let args = vec![
             "get".into(),
-            "-H".into(),
+            "-j".into(),
             "-p".into(),
-            "-o".into(),
-            "value".into(),
             "guid".into(),
             dataset.into(),
         ];
@@ -180,7 +190,11 @@ impl SystemZfs {
                 output.stderr.trim()
             );
         }
-        let guid = output.stdout.trim().to_string();
+        let entry = dataset_from_json(&output.stdout, "zfs get", dataset)?;
+        if entry.kind != "FILESYSTEM" {
+            bail!("zfs get JSON is not a filesystem: {dataset}");
+        }
+        let guid = entry.property("guid")?.to_string();
         validate_guid(&guid)?;
         Ok(guid)
     }
@@ -257,6 +271,91 @@ struct CommandOutput {
     stderr: String,
 }
 
+#[derive(Deserialize)]
+struct OutputVersion {
+    command: String,
+    vers_major: u32,
+    vers_minor: u32,
+}
+
+impl OutputVersion {
+    fn validate(&self, command: &str) -> Result<()> {
+        if self.command != command {
+            bail!(
+                "unexpected JSON command identity: expected {command}, got {}",
+                self.command
+            );
+        }
+        if self.vers_major != 0 {
+            bail!(
+                "unsupported {command} JSON output version: {}.{}",
+                self.vers_major,
+                self.vers_minor
+            );
+        }
+        Ok(())
+    }
+}
+
+#[derive(Deserialize)]
+struct JsonProperty {
+    value: String,
+}
+
+#[derive(Deserialize)]
+struct JsonDataset {
+    name: String,
+    #[serde(rename = "type")]
+    kind: String,
+    properties: BTreeMap<String, JsonProperty>,
+}
+
+impl JsonDataset {
+    fn property(&self, name: &str) -> Result<&str> {
+        self.properties
+            .get(name)
+            .map(|property| property.value.as_str())
+            .with_context(|| format!("zfs JSON is missing property {name} for {}", self.name))
+    }
+}
+
+#[derive(Deserialize)]
+struct DatasetDocument {
+    output_version: OutputVersion,
+    datasets: BTreeMap<String, JsonDataset>,
+}
+
+fn datasets_from_json(output: &str, command: &str) -> Result<BTreeMap<String, JsonDataset>> {
+    let document: DatasetDocument =
+        serde_json::from_str(output).with_context(|| format!("invalid JSON from {command}"))?;
+    document.output_version.validate(command)?;
+    for (name, dataset) in &document.datasets {
+        if name != &dataset.name {
+            bail!("{command} JSON dataset name disagrees with its map key: {name}");
+        }
+    }
+    Ok(document.datasets)
+}
+
+fn dataset_from_json(output: &str, command: &str, name: &str) -> Result<JsonDataset> {
+    datasets_from_json(output, command)?
+        .remove(name)
+        .with_context(|| format!("{command} JSON is missing the requested dataset: {name}"))
+}
+
+#[derive(Deserialize)]
+struct JsonPool {
+    name: String,
+    #[serde(rename = "type")]
+    kind: String,
+}
+
+#[derive(Deserialize)]
+struct PoolDocument {
+    output_version: OutputVersion,
+    pools: BTreeMap<String, JsonPool>,
+}
+
 fn looks_missing(stderr: &str) -> bool {
     let lower = stderr.to_ascii_lowercase();
     lower.contains("does not exist")
@@ -313,7 +412,8 @@ impl Zfs for SystemZfs {
 
         let args = vec![
             "list".into(),
-            "-H".into(),
+            "-j".into(),
+            "-p".into(),
             "-t".into(),
             "snapshot".into(),
             "-o".into(),
@@ -333,12 +433,11 @@ impl Zfs for SystemZfs {
         }
 
         let mut items = Vec::new();
-        for line in output.stdout.lines() {
-            let full = line.trim();
-            if full.is_empty() {
-                continue;
+        for entry in datasets_from_json(&output.stdout, "zfs list")?.into_values() {
+            if entry.kind != "SNAPSHOT" {
+                bail!("zfs list JSON contains a non-snapshot: {}", entry.name);
             }
-            let parsed = SnapshotName::parse(&format!("zfs:{full}"))?;
+            let parsed = SnapshotName::parse(&format!("zfs:{}", entry.name))?;
             if parsed.dataset != dataset {
                 continue;
             }
@@ -356,10 +455,8 @@ impl Zfs for SystemZfs {
 
         let args = vec![
             "get".into(),
-            "-H".into(),
+            "-j".into(),
             "-p".into(),
-            "-o".into(),
-            "value".into(),
             format!("written@{}", base.snapshot),
             current.full_name(),
         ];
@@ -371,11 +468,15 @@ impl Zfs for SystemZfs {
             bail!("failed reading written size: {}", output.stderr.trim());
         }
 
-        output
-            .stdout
-            .trim()
+        let entry = dataset_from_json(&output.stdout, "zfs get", &current.full_name())?;
+        if entry.kind != "SNAPSHOT" {
+            bail!("zfs get JSON is not a snapshot: {}", current.full_name());
+        }
+        let property = format!("written@{}", base.snapshot);
+        let value = entry.property(&property)?;
+        value
             .parse::<u64>()
-            .with_context(|| format!("invalid written value: {}", output.stdout.trim()))
+            .with_context(|| format!("invalid {property} value for {}", current.full_name()))
             .map(Some)
     }
 
@@ -412,6 +513,7 @@ impl Zfs for SystemZfs {
 
         let mut child = Command::new(&self.zfs_bin)
             .args(&args)
+            .env("LC_ALL", "C")
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true)
@@ -485,6 +587,7 @@ impl Zfs for SystemZfs {
 
         let mut child = Command::new(&self.zfs_bin)
             .arg("receive")
+            .env("LC_ALL", "C")
             .arg("-u")
             .arg(dataset)
             .stdin(std::process::Stdio::piped())
