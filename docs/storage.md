@@ -99,6 +99,43 @@ Buffers, concurrent uploads and retained retry parts must have explicit bounds. 
 bytes. Keep the final ETag for each part in the completion list; an ETag is not an authenticated content checksum.
 Report an error before exceeding part-count, part-size or object-size limits, and do not commit an incomplete stream.
 
+## HTTP transfer liveness and recovery
+
+Object GET, POST and transfer PUT requests have no whole-transfer duration limit. The HTTP client has a
+10-second connection timeout. A rolling throughput guard fails an actively polled transfer when fewer than
+1,024 bytes progress in the preceding 30 seconds, including continuously dribbling connections, not only idle
+connections. The first window is a startup allowance; earlier bursts do not buy unlimited time. GET consumer
+backpressure (for example, decryption or ZFS receive) is excluded from the measurement. Upload progress is measured
+as bounded 64-KiB body chunks are accepted by the HTTP transport, not as proof of durable service receipt.
+Waiting for response headers or a response body is also guarded. HEAD, list and DELETE control requests additionally
+have a 120-second request timeout.
+
+GET transparently retries transient connection, HTTP 408/429/5xx, premature EOF, response-read and throughput
+failures. The default budget is three retries for the entire reader, including initial request attempts, with
+200-ms exponential backoff (exponent capped at eight, each delay capped at 60 seconds). Retry requests resume at the exact consumed ciphertext
+offset using a signed Range and If-Match. Buffered ciphertext is drained before resuming. The first response must
+provide Content-Length and a strong ETag, which is pinned even when the caller did not provide If-Match. Every
+response is validated before exposing bytes: status, ETag, identity content encoding, exact Content-Range,
+Content-Length and total object size must agree. Caller byte-range endpoints are retained; invalid or changed
+identity is a terminal error, not a reason to restart from zero.
+
+Mutations are not automatically retried by the HTTP store. A PUT/POST network or throughput failure does not
+prove rejection: completion may have committed and must still follow the unknown-outcome protocol above.
+The multipart uploader may retry only its retained, identical part ciphertext according to its existing policy.
+
+The CLI accepts these optional unsigned-integer environment overrides:
+
+| Variable | Default | Meaning |
+| --- | ---: | --- |
+| `SNAPSHOT_TO_S3_HTTP_WINDOW_SECS` | 30 | Rolling measurement window, seconds (1–86,400) |
+| `SNAPSHOT_TO_S3_HTTP_MIN_BYTES` | 1024 | Minimum progress per window (positive) |
+| `SNAPSHOT_TO_S3_HTTP_CONTROL_TIMEOUT_SECS` | 120 | Control-request timeout, seconds (1–86,400) |
+| `SNAPSHOT_TO_S3_HTTP_GET_RETRIES` | 3 | Total GET retries (0–100) |
+| `SNAPSHOT_TO_S3_HTTP_BACKOFF_MILLIS` | 200 | Initial retry delay, milliseconds (0–60,000) |
+
+Library users can instead pass `HttpPolicy` to `HttpStore::new_with_policy`, including subsecond windows for
+focused tests. Invalid policy values fail before any object-store request.
+
 ## Examples
 
 For example, with this given dataset:
