@@ -141,11 +141,12 @@ Separate jobs run:
 * the reusable [RustSec audit](.github/workflows/security.yml), also run weekly;
 * every opt-in test and the real ZFS/S3 E2E harness.
 
-The E2E job installs the distribution's JSON-capable tools to verify the VM has no existing pools, then
-[ci_e2e.sh](tests/support/ci_e2e.sh) builds checksum-verified OpenZFS 2.4.4 against the running kernel headers.
-It installs matching tools and loads the built modules, checking both unprivileged and sudo command resolution.
-The distribution's 2.4.1 lacks the user-defined pool property needed by the shared test harness.
-The script creates a uniquely named temporary pool with `user:isdev=yes` and starts checksum-verified SeaweedFS 4.48
+The E2E job installs the distribution's JSON-capable OpenZFS tools and loads its matching kernel module.
+[ci_e2e.sh](tests/support/ci_e2e.sh) verifies usable versions (2.3+) and refuses VMs with existing pools.
+A successful empty `zpool list -j` response is recognized as the distribution's no-pool case; nonempty output
+must be valid JSON. The script creates a uniquely named temporary pool, records its GUID, and sets
+`user:isdev=yes` on that owned pool with `zpool set` (the creation `-o` interface rejects user properties).
+It verifies both GUID and label before starting checksum-verified SeaweedFS 4.48
 with throwaway credentials. It explicitly runs official Tink 1.16.1 bidirectional interoperability, live HTTP
 capability tests, the real GET regression lasting more than 120 seconds, and full/multi-step raw ZFS recovery.
 GnuPG homes and mountpoints use short dedicated paths under the runner's temporary directory.
