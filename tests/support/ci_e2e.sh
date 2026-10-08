@@ -141,6 +141,8 @@ python3 -m venv "$root/venv"
 TINK_PYTHON="$root/venv/bin/python" \
     cargo test --locked --test crypto_stream official_tink_runtime_bidirectional -- --ignored \
     2>&1 | tee "$root/logs/tink-bidirectional.log"
+cargo test --locked --test http_store healthy_get_exceeds_former_120_second_transfer_cap -- --ignored \
+    2>&1 | tee "$root/logs/http-long-get.log"
 cargo build --locked 2>&1 | tee "$root/logs/build.log"
 
 export DOWNLOAD_DIR="$root/download"
