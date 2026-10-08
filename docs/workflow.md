@@ -2,6 +2,19 @@
 
 Be aware that the plain text encryption key shall never leave on disk. Always use memory or pipe.
 
+## ZFS command interfaces
+
+All programmatic `zfs`/`zpool` `get` and `list` reads use `-j -p`: versioned JSON with raw numeric strings,
+not human tables or legacy tab-delimited property output. Require JSON-capable OpenZFS (usually 2.3+), validate
+the named-object schema and exact object identities, and report unsupported output, malformed/missing values,
+permission failures and other command errors explicitly. Never silently fall back to a display parser.
+GUIDs remain exact decimal strings; do not request `--json-int` or convert them through floating point.
+See [the JSON command contract](design.md#zfs-json-command-contract).
+
+`zfs diff -H` produces machine-readable change records and `zfs send -nP` produces raw machine-readable
+size estimates. These are intentional exceptions: neither subcommand supports `-j` in OpenZFS 2.4.4.
+Actual send/receive uses binary streams; mutation commands are checked by exit status, not parsed as JSON.
+
 ## Backup
 
 ### Prepare
@@ -31,9 +44,9 @@ Normally, to minimize backup size, the parent snapshot is automatically choose b
 1. Get a list of local snapshots. Only consider snapshots earlier than the current one and valid as incremental
 bases. For each local snapshot, filter out if the remote committed stream is missing or its ID doesn't match.
 2. Get candidates by two methods:
-  1. Least 4 candidates by read `written` property (like command `zfs get written@old_snapshot new_snapshot`) to see 
+  1. Least 4 candidates by read `written` property (like command `zfs get -j -p written@old_snapshot new_snapshot`) to see
   which snapshot have less size differences.
-  2. Least 4 candidates by read `createtxg` property (like command `zfs get createtxg old_snapshot`) to see which 
+  2. Least 4 candidates by read `createtxg` property (like command `zfs get -j -p createtxg old_snapshot`) to see which
   snapshot is near to current one.
 3. Deduplicate the two groups, using fewer candidates when fewer are available. Now we have at most 8 candidates.
 For each candidate, use `zfs send -nP -w -i old_snapshot current_snapshot` with the same send flags as the actual

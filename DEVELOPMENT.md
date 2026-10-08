@@ -22,8 +22,13 @@ sudo -n true
 Select only an ONLINE pool whose **pool property** `user:isdev` is exactly `yes`, and verify the selected pool:
 
 ```bash
-zpool get -H -o value user:isdev "$pool"
+zpool get -j -p user:isdev "$pool"
 ```
+
+Inspect the selected pool's JSON `properties["user:isdev"].value`: it must be the string `yes`.
+Automated discovery uses `zpool list -j -p -o name,health`, requires `ONLINE` state/health, then reads and
+rechecks the **pool** property with `zpool get -j -p`. No pool may be created or relabeled to pass this check.
+The commands above for general inspection are interactive diagnostics, not formats to parse in scripts.
 
 The label permits isolated development testing, not unrestricted destruction. Follow [AGENTS.md](AGENTS.md):
 
@@ -56,6 +61,17 @@ Current `zfs_s3_e2e.sh` coverage includes:
 * isolated safe namespace usage on a discovered `ONLINE` `user:isdev=yes` pool
 * backup/restore with a dedicated **public-only** GPG home for encryption selection
 * native encrypted ZFS dataset raw backup/recovery checks in that same namespace
+
+The script requires `python3` (standard-library JSON parsing, also used by the capability probes) and OpenZFS
+`zfs`/`zpool` `get`/`list` support for `-j`, usually available in 2.3+. It reads the versioned named-object JSON
+schema, checks map keys against each object's `name`, and rejects malformed, empty, null or missing property
+values. Use `-j -p`, without `--json-int`, to retain exact decimal GUID strings. Unsupported JSON output or
+failed commands, including permission failures while checking namespace absence, are fatal rather than evidence
+of a missing dataset or an unlabeled pool. There is no table-output fallback.
+
+The unique test namespace is checked against a successful recursive JSON dataset listing before creation.
+Modification commands do not need JSON output, and binary `zfs receive` input is unchanged. `zfs diff -H`
+and `zfs send -nP` are separate machine formats (neither accepts `-j` in OpenZFS 2.4.4).
 
 Once `local_s3.sh` is running and `local_s3.env` is loaded, use the current commands:
 
