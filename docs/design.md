@@ -52,17 +52,17 @@ Programmatic `zfs get`, `zfs list`, `zpool get` and `zpool list` require OpenZFS
 OpenZFS 2.3+). Read with `-j -p`, without `--json-int`; do not silently fall back to human-readable tables
 or legacy `-H` property parsing when a version lacks JSON support.
 
-The OpenZFS 2.4.4 schema has `output_version` containing the exact command name, `vers_major: 0` and
-`vers_minor: 1`; major version 0 is required and minor versions are unsigned 32-bit integers. ZFS results
-contain a `datasets` map; zpool results contain a `pools` map. Each map key
+Decode JSON directly into serde structs containing the fields the operation uses; ignore unrelated fields,
+including `output_version` and property source metadata. No custom duplicate-key validator or envelope
+version gate is needed. ZFS results contain a `datasets` map; zpool results contain a `pools` map. Each map key
 must equal its object's `name`. Dataset types are `FILESYSTEM`, `SNAPSHOT` or `VOLUME` (the application
 rejects volumes); pool type is `POOL`. Properties live under `properties[PROPERTY].value` as raw strings,
-with source metadata under `source`. Pool discovery checks `ONLINE` state/health and the exact pool property
+which are decoded as strings, not numbers. Pool discovery checks `ONLINE` state/health and the exact pool property
 `user:isdev=yes` before isolated development testing; this is not a dataset property.
 
-Validate command/version, object identity and required property values. Missing, null, empty, wrongly typed
-or malformed values, unsupported output versions, duplicate object keys, and command/permission failures
-are explicit errors. A failed existence query is not proof that a dataset is absent. Snapshot GUIDs are
+Validate object identity, filesystem/snapshot types and required property values. Missing, null, wrongly typed
+or malformed required data and command/permission failures are explicit errors. Unused properties need not
+be present in listings. A failed existence query is not proof that a dataset is absent. Snapshot GUIDs are
 validated as positive decimal strings within the unsigned 64-bit range, without floating-point conversion;
 large GUIDs must retain every digit.
 

@@ -21,8 +21,8 @@ Ensure you have:
 * GPG CLI
 * OpenZFS `zfs` and `zpool` CLIs with `get`/`list` JSON output (`-j`, usually OpenZFS 2.3+)
 
-Programmatic discovery and property reads require the strict OpenZFS JSON interface, using `-j -p` for raw
-numeric strings. Unsupported JSON versions, malformed/missing values, and command or permission failures are
+Programmatic discovery and property reads use the OpenZFS JSON interface with `-j -p` for raw
+numeric strings and ordinary typed serde decoding. Malformed JSON, missing required data, and command or permission failures are
 explicit errors; there is no fallback to human-readable tables or legacy `-H` property parsing. Snapshot GUIDs
 are validated as exact decimal strings, including values above JavaScript's safe-integer range; `--json-int` is
 not used. See [the JSON command contract](docs/design.md#zfs-json-command-contract).

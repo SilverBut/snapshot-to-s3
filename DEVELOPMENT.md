@@ -48,6 +48,17 @@ backup and restore requirements; preparing this environment does not establish t
 
 Infrastructure-backed tests are opt-in and should not be silently treated as passing when skipped.
 
+The end-to-end CI job requires a dedicated self-hosted Linux runner with an existing `ONLINE` pool whose
+pool property is `user:isdev=yes`. CI does not provision, import, export or destroy pools; all test datasets
+remain inside the newly created unique namespace.
+
+The optional official Tink runtime interoperability test checks encryption and decryption in both directions
+against Python Tink 1.16.1 with a 3 MiB payload. With Tink installed in a project-local virtual environment, run:
+
+```bash
+TINK_PYTHON=venv/bin/python cargo test --locked --test crypto_stream official_tink_runtime_bidirectional -- --ignored
+```
+
 Current support scripts:
 
 * `tests/support/local_s3.sh` — local S3 service bootstrap/helper (actively evolving)
@@ -63,13 +74,18 @@ Current `zfs_s3_e2e.sh` coverage includes:
 * native encrypted ZFS dataset raw backup/recovery checks in that same namespace
 
 The script requires `python3` (standard-library JSON parsing, also used by the capability probes) and OpenZFS
-`zfs`/`zpool` `get`/`list` support for `-j`, usually available in 2.3+. It reads the versioned named-object JSON
-schema, checks map keys against each object's `name`, and rejects malformed, empty, null or missing property
-values. Use `-j -p`, without `--json-int`, to retain exact decimal GUID strings. Unsupported JSON output or
+`zfs`/`zpool` `get`/`list` support for `-j`, usually available in 2.3+. It uses ordinary standard-library JSON
+decoding, checks map keys against each object's `name`, and validates the pool state, dataset types and
+required property values. Unrelated fields and envelope versions are ignored; there is no custom duplicate-key
+validator. Use `-j -p`, without `--json-int`, to retain exact decimal GUID strings. Invalid required data or
 failed commands, including permission failures while checking namespace absence, are fatal rather than evidence
 of a missing dataset or an unlabeled pool. There is no table-output fallback.
 
 The unique test namespace is checked against a successful recursive JSON dataset listing before creation.
+Runtime files and explicit mountpoints default to a unique directory under `target/test-artifacts`.
+Set `E2E_RUNTIME_DIR` to select a different dedicated project directory; it must not already exist.
+Failed runs retain that directory for diagnostics. Successful cleanup removes it only after destroying the
+test namespace and checking that no test mounts remain.
 Modification commands do not need JSON output, and binary `zfs receive` input is unchanged. `zfs diff -H`
 and `zfs send -nP` are separate machine formats (neither accepts `-j` in OpenZFS 2.4.4).
 

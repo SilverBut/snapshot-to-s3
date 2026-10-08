@@ -80,6 +80,7 @@ impl SystemZfs {
         let args = vec![
             "list".into(),
             "-j".into(),
+            "-p".into(),
             "-o".into(),
             "name".into(),
             pool.into(),
@@ -88,7 +89,6 @@ impl SystemZfs {
         if output.status.success() {
             let document: PoolDocument =
                 serde_json::from_str(&output.stdout).context("invalid JSON from zpool list")?;
-            document.output_version.validate("zpool list")?;
             let entry = document.pools.get(pool).with_context(|| {
                 format!("zpool list JSON is missing the requested pool: {pool}")
             })?;
@@ -272,32 +272,6 @@ struct CommandOutput {
 }
 
 #[derive(Deserialize)]
-struct OutputVersion {
-    command: String,
-    vers_major: u32,
-    vers_minor: u32,
-}
-
-impl OutputVersion {
-    fn validate(&self, command: &str) -> Result<()> {
-        if self.command != command {
-            bail!(
-                "unexpected JSON command identity: expected {command}, got {}",
-                self.command
-            );
-        }
-        if self.vers_major != 0 {
-            bail!(
-                "unsupported {command} JSON output version: {}.{}",
-                self.vers_major,
-                self.vers_minor
-            );
-        }
-        Ok(())
-    }
-}
-
-#[derive(Deserialize)]
 struct JsonProperty {
     value: String,
 }
@@ -307,6 +281,7 @@ struct JsonDataset {
     name: String,
     #[serde(rename = "type")]
     kind: String,
+    #[serde(default)]
     properties: BTreeMap<String, JsonProperty>,
 }
 
@@ -321,14 +296,12 @@ impl JsonDataset {
 
 #[derive(Deserialize)]
 struct DatasetDocument {
-    output_version: OutputVersion,
     datasets: BTreeMap<String, JsonDataset>,
 }
 
 fn datasets_from_json(output: &str, command: &str) -> Result<BTreeMap<String, JsonDataset>> {
     let document: DatasetDocument =
         serde_json::from_str(output).with_context(|| format!("invalid JSON from {command}"))?;
-    document.output_version.validate(command)?;
     for (name, dataset) in &document.datasets {
         if name != &dataset.name {
             bail!("{command} JSON dataset name disagrees with its map key: {name}");
@@ -352,7 +325,6 @@ struct JsonPool {
 
 #[derive(Deserialize)]
 struct PoolDocument {
-    output_version: OutputVersion,
     pools: BTreeMap<String, JsonPool>,
 }
 

@@ -12,23 +12,9 @@ json_read() {
     python3 -c '
 import json, re, sys
 
-def unique_object(pairs):
-    result = {}
-    for key, value in pairs:
-        if key in result:
-            raise ValueError("duplicate JSON key: " + key)
-        result[key] = value
-    return result
-
 try:
-    tool, command, mode, *args = sys.argv[1:]
-    document = json.load(sys.stdin, object_pairs_hook=unique_object)
-    version = document["output_version"]
-    if (version["command"] != tool + " " + command
-            or type(version["vers_major"]) is not int or version["vers_major"] != 0
-            or type(version["vers_minor"]) is not int
-            or not 0 <= version["vers_minor"] <= 4294967295):
-        raise ValueError("unsupported JSON output version or command")
+    tool, _command, mode, *args = sys.argv[1:]
+    document = json.load(sys.stdin)
     objects = document["pools" if tool == "zpool" else "datasets"]
     if not isinstance(objects, dict):
         raise ValueError("expected a named object map")
@@ -57,8 +43,6 @@ try:
         if args[0] in objects:
             raise ValueError("test namespace already exists: " + args[0])
     elif mode == "value":
-        if set(objects) != {args[0]}:
-            raise ValueError("expected exactly the requested object")
         if tool == "zfs":
             expected = "SNAPSHOT" if "@" in args[0] else "FILESYSTEM"
             if objects[args[0]]["type"] != expected:
@@ -94,7 +78,9 @@ id="smoke_$(date +%s)_${RANDOM}_${RANDOM}"
 namespace="$pool/$id"
 namespace_json="$(zfs list -j -p -r -o name "$pool")"
 json_read zfs list absent "$namespace" <<<"$namespace_json"
-runtime="$(mktemp -d /tmp/snapshot-to-s3-e2e.XXXXXXXX)"
+runtime="$(realpath -m "${E2E_RUNTIME_DIR:-target/test-artifacts/zfs_s3_e2e_$id}")"
+mkdir -p -- "$(dirname "$runtime")"
+mkdir -m 700 -- "$runtime"
 created=false
 cleanup() {
     local status=$?
@@ -136,7 +122,7 @@ fingerprint="$(gpg --batch --with-colons --list-keys | awk -F: '$1=="fpr" {print
 mkdir -m 700 "$runtime/gpg-public"
 gpg --batch --export "$fingerprint" | gpg --batch --homedir "$runtime/gpg-public" --import
 printf '%s:6:\n' "$fingerprint" | gpg --batch --homedir "$runtime/gpg-public" --import-ownertrust
-free="$(df -B1 --output=avail /tmp | tail -1 | tr -d ' ')"
+free="$(df -B1 --output=avail "$runtime" | tail -1 | tr -d ' ')"
 [[ "$free" -ge 21474836480 ]] || { echo "requires at least 20GiB free" >&2; exit 1; }
 sudo -n zfs create -o mountpoint=none -o canmount=off -o atime=off "$namespace"
 created=true

@@ -220,7 +220,7 @@ esac
 set -euo pipefail
 base="__BASE__"
 printf 'zpool %s\n' "$*" >> "$base/commands"
-if [[ "$#" != 5 || "$1" != "list" || "$2" != "-j" || "$3" != "-o" || "$4" != "name" ]]; then
+if [[ "$#" != 6 || "$1" != "list" || "$2" != "-j" || "$3" != "-p" || "$4" != "-o" || "$5" != "name" ]]; then
   echo "unexpected zpool arguments: $*" >&2
   exit 99
 fi
@@ -228,7 +228,7 @@ if [[ -f "$base/pool.json" ]]; then
   cat "$base/pool.json"
   exit 0
 fi
-if [[ "$5" == "pool" ]]; then
+if [[ "$6" == "pool" ]]; then
   printf '{"output_version":{"command":"zpool list","vers_major":0,"vers_minor":1},"pools":{"pool":{"name":"pool","type":"POOL","state":"ONLINE","pool_guid":"22","properties":{}}}}\n'
   exit 0
 fi
@@ -277,21 +277,6 @@ fn invalid_documents(valid: &Value, collection: &str, name: &str) -> Vec<(&'stat
     let mut cases = Vec::new();
     let name = name.replace('~', "~0").replace('/', "~1");
     for (label, pointer, replacement) in [
-        (
-            "wrong command",
-            "/output_version/command".to_owned(),
-            json!("zfs send"),
-        ),
-        (
-            "unsupported major",
-            "/output_version/vers_major".to_owned(),
-            json!(1),
-        ),
-        (
-            "invalid minor",
-            "/output_version/vers_minor".to_owned(),
-            json!("1"),
-        ),
         ("collection not object", format!("/{collection}"), json!([])),
         (
             "missing requested object",
@@ -319,18 +304,9 @@ fn invalid_documents(valid: &Value, collection: &str, name: &str) -> Vec<(&'stat
         cases.push((label, value));
     }
     for (label, pointer, key) in [
-        ("missing version", "".to_owned(), "output_version"),
-        ("missing command", "/output_version".to_owned(), "command"),
-        ("missing major", "/output_version".to_owned(), "vers_major"),
-        ("missing minor", "/output_version".to_owned(), "vers_minor"),
         ("missing collection", "".to_owned(), collection),
         ("missing name", format!("/{collection}/{name}"), "name"),
         ("missing type", format!("/{collection}/{name}"), "type"),
-        (
-            "missing properties",
-            format!("/{collection}/{name}"),
-            "properties",
-        ),
     ] {
         let mut value = valid.clone();
         value
@@ -678,7 +654,7 @@ async fn json_dataset_type_rejects_invalid_success_instead_of_treating_it_as_abs
     let commands = fs::read_to_string(base.join("commands")).unwrap();
     assert!(
         commands.lines().all(|line| {
-            line == "zpool list -j -o name pool" || line == "get -j -p type pool/fs"
+            line == "zpool list -j -p -o name pool" || line == "get -j -p type pool/fs"
         }),
         "invalid JSON triggered an unexpected fallback: {commands}"
     );
@@ -774,7 +750,49 @@ async fn json_snapshot_list_validates_identity_and_accepts_empty_listing() {
 }
 
 #[tokio::test]
-async fn json_pool_list_validates_envelope_and_identity() {
+async fn json_decoding_ignores_unused_envelope_fields() {
+    let _lock = env_lock().await;
+    let base = fixture_dir("json-unused-fields").unwrap();
+    configure_bins(&base);
+    let z = SystemZfs::new();
+    let current = SnapshotName::parse("zfs:pool/fs@s2").unwrap();
+    for version in [
+        None,
+        Some(Value::Null),
+        Some(json!({"command": "anything", "vers_major": 99, "vers_minor": "future"})),
+    ] {
+        let mut snapshot = dataset_json(
+            "zfs get",
+            "pool/fs@s2",
+            "SNAPSHOT",
+            json!({"guid": property("18446744073709551615"), "createtxg": property("101")}),
+        );
+        let mut pool = json!({"pools": {"pool": {"name": "pool", "type": "POOL"}}});
+        snapshot.as_object_mut().unwrap().remove("output_version");
+        if let Some(version) = version {
+            snapshot["output_version"] = version.clone();
+            pool["output_version"] = version;
+        }
+        snapshot["unrelated"] = json!({"future": true});
+        pool["unrelated"] = json!({"future": true});
+        write_json(&base, "get-snapshot", &snapshot);
+        write_json(&base, "pool", &pool);
+        assert_eq!(
+            z.snapshot(&current).await.unwrap().guid,
+            "18446744073709551615"
+        );
+        assert!(!z.target("pool/missing").await.unwrap().exists);
+    }
+    write_json(
+        &base,
+        "list",
+        &json!({"datasets": {"pool/fs@s2": {"name": "pool/fs@s2", "type": "SNAPSHOT"}}}),
+    );
+    assert_eq!(z.snapshots("pool/fs").await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn json_pool_list_validates_identity() {
     let _lock = env_lock().await;
     let base = fixture_dir("json-invalid-pool").unwrap();
     configure_bins(&base);
@@ -815,7 +833,7 @@ async fn absent_dataset_requires_nonzero_missing_error_and_permission_errors_pro
     let commands = fs::read_to_string(base.join("commands")).unwrap();
     assert_eq!(
         commands,
-        "zpool list -j -o name pool\nget -j -p type pool/missing\n"
+        "zpool list -j -p -o name pool\nget -j -p type pool/missing\n"
     );
 }
 
