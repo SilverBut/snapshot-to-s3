@@ -81,13 +81,16 @@ json_read zfs list absent "$namespace" <<<"$namespace_json"
 runtime="$(realpath -m "${E2E_RUNTIME_DIR:-target/test-artifacts/zfs_s3_e2e_$id}")"
 mkdir -p -- "$(dirname "$runtime")"
 mkdir -m 700 -- "$runtime"
+gpg_runtime=""
+gpg_home=""
+gpg_public_home=""
 created=false
 cleanup() {
     local status=$?
     trap - EXIT
     if "$created"; then
         if ! sudo -n zfs destroy -r "$namespace"; then
-            echo "cleanup failed: namespace $namespace and runtime $runtime retained" >&2
+            echo "cleanup failed: namespace $namespace, runtime $runtime and GPG runtime $gpg_runtime retained" >&2
             exit 1
         fi
     fi
@@ -95,10 +98,11 @@ cleanup() {
         echo "test mount remains; retaining $runtime" >&2
         exit 1
     fi
-    for keyhome in "$runtime/gpg" "$runtime/gpg-public"; do
+    for keyhome in "$gpg_home" "$gpg_public_home"; do
         if [[ -d "$keyhome" ]]; then
             agent_pid="$(gpg-connect-agent --no-autostart --homedir "$keyhome" 'GETINFO pid' /bye 2>/dev/null | awk '$1=="D" && $2 ~ /^[0-9]+$/ {print $2}')" || {
                 echo "could not discover test GPG agent for $keyhome" >&2
+                status=1
                 continue
             }
             if [[ "$agent_pid" =~ ^[0-9]+$ ]]; then
@@ -108,20 +112,33 @@ cleanup() {
     done
     if [[ "$status" -eq 0 ]]; then
         rm -r -- "$runtime"
+        if [[ -n "$gpg_runtime" ]]; then
+            rm -rf -- "$gpg_runtime"
+        fi
     else
-        echo "test failed; diagnostic runtime retained: $runtime" >&2
+        echo "test failed; diagnostic runtime retained: $runtime; GPG runtime: $gpg_runtime" >&2
     fi
     exit "$status"
 }
 trap cleanup EXIT
-export GNUPGHOME="$runtime/gpg"
-mkdir -m 700 "$GNUPGHOME"
+gpg_runtime="$(realpath -m "${E2E_GPG_DIR:-.gpg_${RANDOM}_${RANDOM}}")"
+socket_path="$gpg_runtime/gpg-public/S.gpg-agent.browser"
+[[ "$(LC_ALL=C printf %s "$socket_path" | wc -c)" -lt 108 ]] || {
+    echo "GPG socket path is too long; set E2E_GPG_DIR to a short dedicated directory" >&2
+    exit 1
+}
+mkdir -p -- "$(dirname "$gpg_runtime")"
+mkdir -m 700 -- "$gpg_runtime"
+gpg_home="$gpg_runtime/gpg"
+gpg_public_home="$gpg_runtime/gpg-public"
+mkdir -m 700 "$gpg_home"
+export GNUPGHOME="$gpg_home"
 gpg --batch --pinentry-mode loopback --passphrase "" --quick-generate-key "snapshot-to-s3 isolated test" default default never
 fingerprint="$(gpg --batch --with-colons --list-keys | awk -F: '$1=="fpr" {print $10; exit}')"
 [[ -n "$fingerprint" ]]
-mkdir -m 700 "$runtime/gpg-public"
-gpg --batch --export "$fingerprint" | gpg --batch --homedir "$runtime/gpg-public" --import
-printf '%s:6:\n' "$fingerprint" | gpg --batch --homedir "$runtime/gpg-public" --import-ownertrust
+mkdir -m 700 "$gpg_public_home"
+gpg --batch --export "$fingerprint" | gpg --batch --homedir "$gpg_public_home" --import
+printf '%s:6:\n' "$fingerprint" | gpg --batch --homedir "$gpg_public_home" --import-ownertrust
 free="$(df -B1 --output=avail "$runtime" | tail -1 | tr -d ' ')"
 [[ "$free" -ge 21474836480 ]] || { echo "requires at least 20GiB free" >&2; exit 1; }
 sudo -n zfs create -o mountpoint=none -o canmount=off -o atime=off "$namespace"
@@ -135,7 +152,7 @@ prefix="s3://$TEST_S3_BUCKET/$id"
 cli() {
     local GNUPGHOME="$GNUPGHOME"
     if [[ "$1" == backup ]]; then
-        GNUPGHOME="$runtime/gpg-public"
+        GNUPGHOME="$gpg_public_home"
     fi
     export GNUPGHOME
     sudo -n --preserve-env=GNUPGHOME,AWS_ACCESS_KEY_ID,AWS_SECRET_ACCESS_KEY,AWS_SESSION_TOKEN \
@@ -146,7 +163,8 @@ if cli backup "zfs:$namespace/source@s1" "$prefix" --gpg-key-id "$fingerprint"; 
     echo "duplicate backup unexpectedly succeeded" >&2
     exit 1
 fi
-printf 'second snapshot\n' | sudo -n tee "$runtime/source/second" >/dev/null
+# Make s2 a materially cheaper incremental base for s3 than s1.
+sudo -n dd if=/dev/urandom of="$runtime/source/second" bs=1M count=2 status=none
 sudo -n zfs snapshot "$namespace/source@s2"
 cli backup "zfs:$namespace/source@s2" "$prefix" --gpg-key-id "$fingerprint"
 printf 'third snapshot\n' | sudo -n tee "$runtime/source/third" >/dev/null

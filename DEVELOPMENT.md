@@ -83,9 +83,13 @@ of a missing dataset or an unlabeled pool. There is no table-output fallback.
 
 The unique test namespace is checked against a successful recursive JSON dataset listing before creation.
 Runtime files and explicit mountpoints default to a unique directory under `target/test-artifacts`.
-Set `E2E_RUNTIME_DIR` to select a different dedicated project directory; it must not already exist.
+Set `E2E_RUNTIME_DIR` to select a different dedicated diagnostics directory; it must not already exist.
 Failed runs retain that directory for diagnostics. Successful cleanup removes it only after destroying the
 test namespace and checking that no test mounts remain.
+Private and public-only GnuPG homes use a separate short `.gpg_<unique-id>` directory in the project root.
+For deep CI checkouts, set `E2E_GPG_DIR` to a short dedicated directory that does not already exist.
+The script checks the socket path length before launching GnuPG. Successful cleanup removes those homes
+after stopping their agents; failed runs report and retain both runtime directories for diagnostics.
 Modification commands do not need JSON output, and binary `zfs receive` input is unchanged. `zfs diff -H`
 and `zfs send -nP` are separate machine formats (neither accepts `-j` in OpenZFS 2.4.4).
 
