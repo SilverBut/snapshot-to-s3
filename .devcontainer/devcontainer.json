@@ -1,11 +1,11 @@
 {
   "name": "snapshot-to-s3 Development Container",
-  "image": "mcr.microsoft.com/devcontainers/rust:1-bookworm",
-  
+  "image": "mcr.microsoft.com/devcontainers/rust:2-1-trixie",
   "runArgs": [
-    "--platform=linux/amd64"
+    // "--platform=linux/amd64",
+    // "--userns=keep-id",
+    "--device=/dev/zfs"
   ],
-  
   "customizations": {
     "vscode": {
       "extensions": [
@@ -16,7 +16,6 @@
         "streetsidesoftware.code-spell-checker"
       ],
       "settings": {
-        "rust-analyzer.checkOnSave.command": "clippy",
         "editor.formatOnSave": true,
         "[rust]": {
           "editor.defaultFormatter": "rust-lang.rust-analyzer"
@@ -24,12 +23,23 @@
       }
     }
   },
-  
-  // "features": {
-  //   "ghcr.io/devcontainers/features/github-cli:1": {}
-  // },
-  
-  "postCreateCommand": "rustc --version && cargo --version",
-  
-  "remoteUser": "vscode"
+  // "mounts": [
+  //   "source=/dev/zfs,target=/dev/zfs,type=device"
+  // ],
+  "capAdd": [
+    "SYS_ADMIN"
+  ],
+  "securityOpt": [
+    "apparmor=unconfined",
+    "label=disable"
+  ],
+  "features": {
+    "ghcr.io/devcontainers/features/github-cli:1": {}
+  },
+  "postCreateCommand": {
+    "version check": "rustc --version && cargo --version",
+    "install zfs by host zfs version 2.4.4-1": "sudo DEBIAN_FRONTEND=noninteractive sh .devcontainer/install_zfs.sh"
+  },
+  // "remoteUser": "vscode",
+  // "workspaceMount": "type=bind,source=${localWorkspaceFolder}/,target=/workspaces/snapshot-to-s3,idmap=uids=501-1000-1;gids=20-1000-1"
 }

@@ -1,15 +1,9 @@
 name: Security Audit
 
 on:
-  push:
-    branches: [ main, master ]
-    paths:
-      - '**/Cargo.toml'
-      - '**/Cargo.lock'
-  pull_request:
-    branches: [ main, master ]
+  workflow_call:
+  workflow_dispatch:
   schedule:
-    # Run weekly on Monday at 00:00 UTC
     - cron: '0 0 * * 1'
 
 permissions:
@@ -17,26 +11,20 @@ permissions:
 
 jobs:
   audit:
-    name: Security Audit
-    runs-on: ubuntu-latest
+    name: RustSec audit
+    runs-on: ubuntu-26.04
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
-      
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        
-      - name: Install cargo-audit
-        run: cargo install cargo-audit
-        
-      - name: Run cargo audit
-        run: cargo audit
-
-  dependency-review:
-    name: Dependency Review
-    runs-on: ubuntu-latest
-    if: github.event_name == 'pull_request'
-    steps:
-      - uses: actions/checkout@v4
-      
-      - name: Dependency Review
-        uses: actions/dependency-review-action@v4
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
+        id: audit-cache
+        with:
+          path: ~/.cargo/bin/cargo-audit
+          key: cargo-audit-${{ runner.os }}-${{ runner.arch }}-0.22.2
+      - name: Install pinned audit tool
+        if: steps.audit-cache.outputs.cache-hit != 'true'
+        run: cargo install cargo-audit --version 0.22.2 --locked
+      - run: cargo audit
