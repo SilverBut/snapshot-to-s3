@@ -142,7 +142,12 @@ import json
 import sys
 
 with open(sys.argv[1]) as source:
-    pools = json.load(source)["pools"]
+    raw = source.read()
+if raw == "":
+    print("successful zpool list returned no imported pool records")
+    pools = {}
+else:
+    pools = json.loads(raw)["pools"]
 if pools != {}:
     sys.exit("refusing CI pool provisioning on a VM with existing pools")
 PY
