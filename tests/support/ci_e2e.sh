@@ -3,6 +3,7 @@
 # existing ONLINE user:isdev=yes pool, passwordless sudo, Python >= 3.11 with
 # venv, Rust, curl, sha256sum, tar, findmnt and GnuPG. Provision these outside
 # CI; never create, import, export, destroy or relabel a pool here.
+# Use a short runner work root: GnuPG socket paths must fit below 108 bytes.
 set -euo pipefail
 umask 077
 
@@ -13,6 +14,7 @@ mkdir -p "$root/logs" "$root/download" "$root/bin" "$root/scratch"
 export TMPDIR="$root/scratch"
 export PIP_CACHE_DIR="$root/scratch/pip-cache"
 export AWS_EC2_METADATA_DISABLED=true
+export E2E_GPG_DIR="${E2E_GPG_DIR:-$PWD/.gpg-ci}"
 unset AWS_SESSION_TOKEN AWS_PROFILE AWS_DEFAULT_PROFILE
 service_pid=""
 weed_pid=""
@@ -66,6 +68,7 @@ sudo -n true
 zfs version | tee "$root/logs/zfs-version.txt"
 python3 - "$root/logs/zfs-version.txt" <<'PY'
 import re
+import os
 import sys
 from pathlib import Path
 
@@ -76,6 +79,10 @@ for component in ("zfs", "zfs-kmod"):
         sys.exit(f"{component} must be OpenZFS >= 2.3: {text}")
 if sys.version_info < (3, 11):
     sys.exit("Python >= 3.11 is required by the S3 probe")
+socket = Path(os.environ["E2E_GPG_DIR"]).resolve() / "gpg-public/S.gpg-agent.browser"
+if len(os.fsencode(socket)) >= 108:
+    sys.exit("GnuPG socket path exceeds Linux's limit; provision a shorter runner "
+             "work root or a unique short E2E_GPG_DIR: " + str(socket))
 PY
 # Fail before downloads if JSON support or an eligible pool is unavailable.
 # The existing E2E harness independently discovers and re-verifies the pool
