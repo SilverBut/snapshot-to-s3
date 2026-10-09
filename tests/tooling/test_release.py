@@ -278,7 +278,14 @@ class ReleaseTests(unittest.TestCase):
                     ),
                     patch.object(publish_release, "require_green"),
                     patch.object(publish_release, "verify_tag", return_value=True),
-                    patch.object(publish_release, "release_records", return_value=[]),
+                    patch.object(
+                        publish_release,
+                        "release_records",
+                        side_effect=[
+                            [],
+                            [{"id": 123, "tag_name": "v0.1.0", "draft": True}],
+                        ],
+                    ),
                     patch.object(
                         publish_release,
                         "run",
