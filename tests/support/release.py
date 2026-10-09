@@ -237,13 +237,13 @@ def prepare(root, bump, channel, dry_run):
     source_sha = run(["git", "rev-parse", "HEAD"], root, capture=True).strip()
     records = release_records(repo, root)
     if any(r["draft"] and r["tag_name"].startswith("v") for r in records):
-        raise ValueError("an unfinished draft release exists; retry it before bumping")
+        raise ValueError("an unfinished draft release exists; run Release in publish mode before bumping")
     versions = published_versions(records)
     _, current = package(root)
     if (root / PLAN_PATH).exists():
         accepted = json.loads((root / PLAN_PATH).read_text())
         if accepted["version"] == current and current not in versions:
-            raise ValueError("main contains an unfinished release; use Retry Release")
+            raise ValueError("main contains an unfinished release; run Release in publish mode")
     if versions and current != max(versions, key=version_key):
         raise ValueError("main version differs from the last published release")
     target = next_version(current, versions, bump, channel)
@@ -298,14 +298,14 @@ def prepare(root, bump, channel, dry_run):
             f"Prepare **v{target}** from `{source_sha}`.\n\n"
             "Edit this PR's CHANGELOG version section and remove the review marker. "
             "CI validates the version, notes and all infrastructure tests. "
-            "After CI succeeds this draft is marked ready automatically. "
-            "Merge with a merge commit to authorize publication.\n\n"
+            "After CI passes, merge with a merge commit, then run Actions → Release "
+            "in publish mode. Nothing is published automatically.\n\n"
             f"### Candidate commits (not approved release notes)\n\n{commits}"
         )
         with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8") as file:
             file.write(body)
             file.flush()
-            run(["gh", "pr", "create", "--draft", "--base", main, "--head", branch,
+            run(["gh", "pr", "create", "--base", main, "--head", branch,
                  "--label", "release", "--title", f"Release v{target}",
                  "--body-file", file.name], root)
     else:
@@ -326,8 +326,8 @@ def prepare(root, bump, channel, dry_run):
             file.write(
                 f"## Prepared release v{target}\n\n"
                 f"Source: `{source_sha}`\n\nBranch: `{branch}`\n\n"
-                "Edit the CHANGELOG version section in the draft PR, remove the review marker, "
-                "then wait for CI and merge with a merge commit.\n"
+                "Edit the CHANGELOG version section in the PR, remove the review marker, "
+                "wait for CI, merge with a merge commit, then run Release in publish mode.\n"
             )
 
 
