@@ -43,6 +43,9 @@ cargo test --locked --test live_http -- --ignored
 TINK_PYTHON=venv/bin/python cargo test --locked --test crypto_stream official_tink_runtime_bidirectional -- --ignored
 ```
 
+Each scenario is a file in `tests/e2e/cases/`. `run.sh --list` names them, `--case NAME` runs one
+case plus the cases it builds on, and `E2E_TRACE=1` logs every command.
+
 `E2E_RUNTIME_DIR` (runtime files and mountpoints, default under `target/test-artifacts`) and
 `E2E_GPG_DIR` (short GnuPG home path) must not exist beforehand. Failed runs keep them for diagnosis.
 [`s3_probe.py`](tests/tooling/s3_probe.py) checks an endpoint's lock, multipart and range behavior.

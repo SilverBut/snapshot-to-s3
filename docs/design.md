@@ -33,7 +33,7 @@ backup or a matching local snapshot.
 | `zfs/` | `Zfs` trait and its `zfs`/`zpool` command implementation |
 | `process.rs`, `rate.rs` | Bounded child-process I/O; ciphertext rate limiting |
 
-`backup` and `restore` depend only on the `ObjectStore` and `Zfs` traits. Unit tests use in-memory fakes
+`backup` and `restore` depend only on the `ObjectStore` and `Zfs` traits. Unit and workflow tests use in-memory fakes
 (`src/testing.rs`). The binary uses `HttpStore` and `SystemZfs`.
 
 ### Data path and resource bounds
@@ -74,17 +74,17 @@ Mutating commands are checked by exit status. Test harnesses can point `SNAPSHOT
 
 | Scenario | Tests |
 | --- | --- |
-| Full and incremental recovery, data and GUIDs | `tests/e2e/run.sh`; `src/workflow_tests.rs` |
-| Multi-object streams | `src/workflow_tests.rs::multi_object_stream_round_trip`; `store::multipart` and `store::chain` tests; E2E with `--max-object-size` |
+| Full and incremental recovery, data and GUIDs | `tests/e2e/run.sh`; `tests/workflow.rs` |
+| Multi-object streams | `tests/workflow.rs::multi_object_stream_round_trip`; `store::multipart` and `store::chain` tests; E2E with `--max-object-size` |
 | Incomplete remote chain | E2E (deleted `s1`); `restore::prepare::local_declared_base_needs_no_remote_parent` |
 | Changed target or failing `zfs diff` stops before downloads | `restore::prepare::{dirty_target_stops_before_any_verification_download, diff_command_failure_stops_before_verification}`; E2E |
-| No matching local base; wrong parent, metadata mismatch or cycle | `restore::prepare` tests; `workflow_tests` tampering scenario |
-| Corruption or truncation after a valid prefix | `tests/crypto_stream.rs`; `workflow_tests::corrupt_stream_tail_stops_export` |
-| Send, encryption, part, log or continuation failure | `workflow_tests` failure scenarios; `store::multipart` tests |
+| No matching local base; wrong parent, metadata mismatch or cycle | `restore::prepare` tests; `tests/workflow.rs` tampering scenario |
+| Corruption or truncation after a valid prefix | `tests/crypto_stream.rs`; `tests/workflow.rs::corrupt_stream_tail_stops_export` |
+| Send, encryption, part, log or continuation failure | `tests/workflow.rs` failure scenarios; `store::multipart` tests |
 | Concurrent writers, existing content | `store::lock` tests; `tests/live_http.rs` (opt-in, real S3) |
-| Unknown completion, lost completion response | `workflow_tests`; `store::multipart::completion_response_loss_requires_matching_object` |
-| Receive failure mid-chain | `workflow_tests::incremental_chain_stops_at_receive_failure_and_tampering` |
-| Bounded memory, retries, service limits | `store::multipart::generated_large_stream_has_fixed_buffer_budget`; `tests/http_store.rs`; `tests/rate_limit.rs` |
+| Unknown completion, lost completion response | `tests/workflow.rs`; `store::multipart::completion_response_loss_requires_matching_object` |
+| Receive failure mid-chain | `tests/workflow.rs::incremental_chain_stops_at_receive_failure_and_tampering` |
+| Bounded memory, retries, service limits | `store::multipart::generated_large_stream_has_fixed_buffer_budget`; `tests/http_store/`; `tests/rate_limit.rs` |
 | Tink interoperability | `tests/crypto_stream.rs` (official runtime check is opt-in) |
 
 These tests use SeaweedFS and OpenZFS. Other providers (AWS S3, MinIO, B2, …) are untested until someone
