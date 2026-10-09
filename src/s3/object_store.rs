@@ -1,7 +1,7 @@
 //! [`ObjectStore`] operations over the S3 REST API.
 
-use super::error::{xml_root_name, HttpStatusFailure};
-use super::{is_definite_rejection, is_retryable, put_header, HttpStore};
+use super::error::{is_file_already_exists, xml_root_name, HttpStatusFailure};
+use super::{is_definite_rejection, is_retryable, HttpStore, LockDetectionMode};
 use crate::model::{MetadataMap, Reader};
 use crate::store::{ObjectHead, ObjectStore, Part};
 use anyhow::{bail, Context, Result};
@@ -102,8 +102,7 @@ impl ObjectStore for HttpStore {
     }
 
     async fn put_if_absent(&self, key: &str, data: Bytes) -> Result<bool> {
-        let mut headers = HeaderMap::new();
-        put_header(&mut headers, "if-none-match", "*")?;
+        let headers = self.conditional_put_headers()?;
         let response = self
             .send_signed(Method::PUT, key, &[], headers, data)
             .await
@@ -114,8 +113,17 @@ impl ObjectStore for HttpStore {
         ) {
             return Ok(false);
         }
-        self.require_success("conditional PUT object", response)
-            .await?;
+        if !response.status().is_success() {
+            let error = self
+                .response_error("conditional PUT object", response)
+                .await;
+            if self.lock_detection_mode == LockDetectionMode::XCosForbidOverwrite
+                && is_file_already_exists(&error)
+            {
+                return Ok(false);
+            }
+            return Err(error);
+        }
         Ok(true)
     }
 

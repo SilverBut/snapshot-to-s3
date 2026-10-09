@@ -31,6 +31,17 @@ use std::sync::Arc;
 use std::time::Duration;
 use throughput::ThroughputGuard;
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum LockDetectionMode {
+    #[default]
+    #[value(name = "if-none-match")]
+    IfNoneMatch,
+    #[value(name = "x-cos-forbid-overwrite")]
+    XCosForbidOverwrite,
+    #[value(name = "dangerously-skip")]
+    DangerouslySkip,
+}
+
 /// Largest XML or error response body that is read into memory.
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 /// Request bodies are streamed in chunks of this size to measure progress.
@@ -56,6 +67,7 @@ pub struct HttpStore {
     metadata_header_prefix: String,
     endpoint: Url,
     policy: HttpPolicy,
+    lock_detection_mode: LockDetectionMode,
 }
 
 impl HttpStore {
@@ -87,7 +99,34 @@ impl HttpStore {
             metadata_header_prefix,
             endpoint,
             policy,
+            lock_detection_mode: LockDetectionMode::default(),
         })
+    }
+
+    pub fn with_lock_detection_mode(mut self, mode: LockDetectionMode) -> Self {
+        self.lock_detection_mode = mode;
+        self
+    }
+
+    fn conditional_put_headers(&self) -> Result<HeaderMap> {
+        let mut headers = HeaderMap::new();
+        let (name, value) = match self.lock_detection_mode {
+            LockDetectionMode::IfNoneMatch => ("if-none-match", "*"),
+            LockDetectionMode::XCosForbidOverwrite => ("x-cos-forbid-overwrite", "true"),
+            LockDetectionMode::DangerouslySkip => {
+                bail!("conditional PUT is disabled by dangerously-skip mode")
+            }
+        };
+        put_header(&mut headers, name, value)?;
+        Ok(headers)
+    }
+
+    fn lock_condition_description(&self) -> &'static str {
+        match self.lock_detection_mode {
+            LockDetectionMode::IfNoneMatch => "If-None-Match: *",
+            LockDetectionMode::XCosForbidOverwrite => "x-cos-forbid-overwrite: true",
+            LockDetectionMode::DangerouslySkip => "dangerously-skip",
+        }
     }
 
     fn object_url(&self, key: &str, query: &[(String, String)]) -> Result<Url> {

@@ -1,22 +1,36 @@
 //! Endpoint capability probe run before every backup.
 
-use super::{put_header, HttpStore};
+use super::HttpStore;
 use crate::model::MetadataMap;
 use crate::store::ObjectStore;
 use anyhow::{anyhow, Result};
 use bytes::Bytes;
 use rand::RngCore;
-use reqwest::header::HeaderMap;
-use reqwest::{Method, StatusCode};
 
 /// Probe objects live in `<prefix>/.snapshot-to-s3-probes/<random>/.lock`.
 pub const PROBE_NAMESPACE: &str = ".snapshot-to-s3-probes";
 
 impl HttpStore {
-    /// Verifies beneath `prefix` that the endpoint enforces `If-None-Match: *`
-    /// atomically and returns user metadata under the configured header
-    /// prefix. Backups must not run against an endpoint that fails either.
+    /// Verifies beneath `prefix` that the endpoint enforces the configured
+    /// conditional-create mode and returns metadata under the configured
+    /// header prefix. Backups must not run against an endpoint that fails either.
     pub async fn probe_capabilities(&self, prefix: &str) -> Result<()> {
+        self.probe_capabilities_with_lock_detection(prefix, true)
+            .await
+    }
+
+    /// Verifies user metadata support without probing conditional create.
+    /// This is intended only for backups explicitly configured to skip locks.
+    pub async fn probe_metadata_capability(&self, prefix: &str) -> Result<()> {
+        self.probe_capabilities_with_lock_detection(prefix, false)
+            .await
+    }
+
+    async fn probe_capabilities_with_lock_detection(
+        &self,
+        prefix: &str,
+        detect_locks: bool,
+    ) -> Result<()> {
         let mut random = [0u8; 24];
         rand::thread_rng().fill_bytes(&mut random);
         let marker = hex::encode(random);
@@ -26,34 +40,35 @@ impl HttpStore {
         } else {
             format!("{prefix}/{PROBE_NAMESPACE}/{marker}/.lock")
         };
-        let conditional = self.probe_conditional_put(&key).await;
-        with_cleanup(conditional, self.delete(&key).await, "conditional-put")?;
+        if detect_locks {
+            let conditional = self.probe_conditional_put(&key).await;
+            with_cleanup(conditional, self.delete(&key).await, "conditional-put")?;
+        }
         let metadata = self.probe_metadata(&key, marker).await;
         with_cleanup(metadata, self.delete(&key).await, "metadata")
     }
 
     async fn probe_conditional_put(&self, key: &str) -> Result<()> {
-        let mut headers = HeaderMap::new();
-        put_header(&mut headers, "if-none-match", "*")?;
         let operation = "conditional-put capability probe (initial put)";
-        let response = self
-            .send_signed(Method::PUT, key, &[], headers.clone(), Bytes::new())
+        let created = self
+            .put_if_absent(key, Bytes::new())
             .await
             .map_err(|error| error.context(operation))?;
-        if !response.status().is_success() {
-            return Err(self.response_error(operation, response).await);
+        if !created {
+            return Err(anyhow!("capability probe object already exists"));
         }
         let operation = "conditional-put capability probe (duplicate put)";
-        let response = self
-            .send_signed(Method::PUT, key, &[], headers, Bytes::new())
+        let created = self
+            .put_if_absent(key, Bytes::new())
             .await
             .map_err(|error| error.context(operation))?;
-        match response.status() {
-            StatusCode::CONFLICT | StatusCode::PRECONDITION_FAILED => Ok(()),
-            status if status.is_success() => Err(anyhow!(
-                "S3 endpoint ignored If-None-Match: *; atomic locking is unavailable"
-            )),
-            _ => Err(self.response_error(operation, response).await),
+        if created {
+            Err(anyhow!(
+                "S3 endpoint ignored {}; atomic locking is unavailable",
+                self.lock_condition_description()
+            ))
+        } else {
+            Ok(())
         }
     }
 

@@ -127,6 +127,16 @@ pub fn is_definite_rejection(error: &anyhow::Error) -> bool {
     })
 }
 
+pub(super) fn is_file_already_exists(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<HttpStatusFailure>()
+            .is_some_and(|failure| {
+                failure.definite_rejection && failure.code.as_deref() == Some("FileAlreadyExists")
+            })
+    })
+}
+
 fn is_definite_rejection_status(status: StatusCode) -> bool {
     status.is_client_error() && status != StatusCode::REQUEST_TIMEOUT
 }
