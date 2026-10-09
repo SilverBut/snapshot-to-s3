@@ -332,6 +332,28 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn missing_credentials_fail_when_the_store_is_created() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("absent");
+        let _env = crate::testing::ScopedEnv::new(&[
+            ("AWS_ACCESS_KEY_ID", None),
+            ("AWS_SECRET_ACCESS_KEY", None),
+            ("AWS_SHARED_CREDENTIALS_FILE", path.to_str()),
+        ]);
+        let error = HttpStore::new_with_policy(
+            config(Some("http://127.0.0.1:1"), "us-east-1"),
+            HttpPolicy::default(),
+        )
+        .await
+        .err()
+        .unwrap();
+        assert_eq!(
+            error.to_string(),
+            "no AWS credentials found; set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY or configure a shared credentials file"
+        );
+    }
+
     #[test]
     fn endpoint_defaults_and_rejects_each_unsupported_component() {
         assert_eq!(
