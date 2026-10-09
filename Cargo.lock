@@ -1331,6 +1331,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "snapshot-to-s3",
  "tempfile",
  "tokio",
  "tokio-util",

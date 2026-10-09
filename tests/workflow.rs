@@ -3,12 +3,12 @@
 //! The scenarios share one GPG home because `GNUPGHOME` is process-wide;
 //! they run in sequence inside a single test.
 
-use crate::backup::{backup, BackupOptions};
-use crate::crypto;
-use crate::model::{S3Location, SnapshotName};
-use crate::restore::{restore, RestoreOptions};
-use crate::store::{ObjectStore, UploadLimits};
-use crate::testing::{FakeZfs, MemoryStore};
+use snapshot_to_s3::backup::{backup, BackupOptions};
+use snapshot_to_s3::crypto;
+use snapshot_to_s3::model::{S3Location, SnapshotName};
+use snapshot_to_s3::restore::{restore, RestoreOptions};
+use snapshot_to_s3::store::{ObjectStore, UploadLimits};
+use snapshot_to_s3::testing::{FakeZfs, MemoryStore};
 use bytes::Bytes;
 use std::process::Command;
 use std::sync::Arc;
