@@ -4,11 +4,13 @@ use std::{
     pin::Pin,
     task::{Context, Poll},
 };
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::io::{AsyncRead, ReadBuf};
 
 const FIRST_SEGMENT_PLAINTEXT: usize = 1_048_576 - 24 - 16;
 const SEGMENT_PLAINTEXT: usize = 1_048_576 - 16;
 
+/// Serves `bytes` in `chunk_size` pieces and returns `Pending` before every read,
+/// so the cipher must cope with short reads and wake-ups that cross segment boundaries.
 struct ChunkReader {
     bytes: Vec<u8>,
     offset: usize,
@@ -52,46 +54,24 @@ impl AsyncRead for ChunkReader {
     }
 }
 
-#[derive(Default)]
-struct VecWriter(Vec<u8>);
-
-impl AsyncWrite for VecWriter {
-    fn poll_write(
-        mut self: Pin<&mut Self>,
-        _: &mut Context<'_>,
-        input: &[u8],
-    ) -> Poll<std::io::Result<usize>> {
-        self.0.extend_from_slice(input);
-        Poll::Ready(Ok(input.len()))
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Poll::Ready(Ok(()))
-    }
-
-    fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Poll::Ready(Ok(()))
-    }
-}
-
 fn key() -> [u8; 32] {
     std::array::from_fn(|index| index as u8)
 }
 
 async fn encrypt_bytes(plaintext: &[u8]) -> Vec<u8> {
     let mut reader = ChunkReader::new(plaintext.to_vec(), 7919);
-    let mut writer = VecWriter::default();
+    let mut writer = Vec::new();
     crypto::encrypt(&key(), b"metadata-hash", &mut reader, &mut writer)
         .await
         .unwrap();
-    writer.0
+    writer
 }
 
 async fn decrypt_bytes(ciphertext: &[u8], aad: &[u8]) -> anyhow::Result<Vec<u8>> {
     let mut reader = ChunkReader::new(ciphertext.to_vec(), 3701);
-    let mut writer = VecWriter::default();
+    let mut writer = Vec::new();
     crypto::decrypt(&key(), aad, &mut reader, &mut writer).await?;
-    Ok(writer.0)
+    Ok(writer)
 }
 
 #[tokio::test]
