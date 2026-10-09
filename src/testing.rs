@@ -1,9 +1,15 @@
+//! In-memory fakes of the object store and ZFS used by the workflow tests.
+//!
+//! Both record what they were asked to do (`events`) and expose plain fields
+//! for fault injection, so tests can fail any step and inspect the outcome.
+
 use crate::model::{MetadataMap, Reader, SnapshotName};
 use crate::store::{ObjectHead, ObjectStore, Part};
 use crate::zfs::{SendStream, SnapshotInfo, TargetInfo, Zfs};
 use anyhow::{bail, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
+use sha2::Digest;
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 use tokio::io::AsyncReadExt;
@@ -11,12 +17,18 @@ use tokio_util::sync::CancellationToken;
 
 type TestUpload = (String, MetadataMap, BTreeMap<u32, Bytes>);
 
+/// An object store held in memory. Every call is logged to `events` as
+/// `"<OP> <key>"` (e.g. `PUT a/b`, `PART a/b 2`).
 #[derive(Default)]
 pub struct MemoryStore {
     pub objects: Mutex<BTreeMap<String, (Bytes, MetadataMap)>>,
     pub events: Mutex<Vec<String>>,
+    /// Fail every call whose event starts with this prefix.
     pub failure: Mutex<Option<String>>,
+    /// Commit multipart completions but then report an error, as if the
+    /// response was lost.
     pub completion_lost: Mutex<bool>,
+    /// Store parts as empty buffers to keep large-stream tests cheap.
     pub discard_parts: bool,
     uploads: Mutex<BTreeMap<String, TestUpload>>,
 }
@@ -168,22 +180,34 @@ impl ObjectStore for MemoryStore {
     }
 }
 
-use sha2::Digest;
-
+/// A scripted ZFS: serves `snapshots`/`target`, records calls in `events`
+/// and keeps every received stream in `receive_data`.
 pub struct FakeZfs {
     pub snapshots: Vec<SnapshotInfo>,
     pub target: TargetInfo,
+    /// `check_clean` reports that the target changed since its snapshot.
     pub dirty: bool,
+    /// `check_clean` fails as if `zfs diff` itself failed.
     pub diff_failure: bool,
     pub events: Mutex<Vec<String>>,
+    /// Fail the receive with this zero-based index.
     pub receive_failure: Option<usize>,
+    /// The send process reports failure when it completes.
     pub send_failure: bool,
     pub receive_data: Mutex<Vec<Vec<u8>>>,
     pub send_bytes: Vec<u8>,
+    /// Reading the send stream fails immediately.
     pub send_read_failure: bool,
 }
 
+impl Default for FakeZfs {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl FakeZfs {
+    /// One source snapshot `pool/data@s1` and an absent restore target.
     pub fn new() -> Self {
         Self {
             snapshots: vec![SnapshotInfo {
