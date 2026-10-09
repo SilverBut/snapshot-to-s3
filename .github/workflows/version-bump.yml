@@ -38,14 +38,41 @@ jobs:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           fetch-depth: 0
+      - name: Find previous stable release
+        id: release-base
+        run: |
+          base_ref="$(git tag --list 'v*' \
+            | grep -E '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$' \
+            | sort -V | tail -n 1 || true)"
+          if [[ -z "$base_ref" ]]; then
+            base_ref="$(git rev-list --max-parents=0 HEAD | sort | head -n 1)"
+          fi
+          echo "ref=$base_ref" >> "$GITHUB_OUTPUT"
+      - name: Generate release-note draft
+        id: notes
+        uses: github/copilot-release-notes@29ba181a86b88f3acee62a03369033edfa982ab9 # v1.0.3
+        with:
+          base-ref: ${{ steps.release-base.outputs.ref }}
+          head-ref: ${{ github.sha }}
+          instructions: .github/release-notes-instructions.md
+          pr-strategy: github-api
+        env:
+          COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ github.token }}
+      - name: Save generated draft
+        env:
+          RELEASE_NOTES: ${{ steps.notes.outputs.release-notes }}
+        run: printf '%s\n' "$RELEASE_NOTES" > "$RUNNER_TEMP/copilot-release-notes.md"
       - name: Prepare release proposal or show preview
         env:
           GH_TOKEN: ${{ github.token }}
           BUMP: ${{ inputs.bump }}
           CHANNEL: ${{ inputs.channel }}
           DRY_RUN: ${{ inputs.dry_run }}
+          GENERATED_NOTES_FILE: ${{ runner.temp }}/copilot-release-notes.md
         run: |
           args=(prepare --bump "$BUMP" --channel "$CHANNEL")
+          args+=(--generated-notes-file "$GENERATED_NOTES_FILE")
           if [[ "$DRY_RUN" == true ]]; then
             args+=(--dry-run)
           fi
