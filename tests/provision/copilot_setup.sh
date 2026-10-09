@@ -4,6 +4,8 @@ umask 077
 
 # shellcheck source=tests/provision/lib/hosted.sh
 source "$(dirname "$0")/lib/hosted.sh"
+# shellcheck source=tests/provision/lib/seaweedfs.sh
+source "$(dirname "$0")/lib/seaweedfs.sh"
 cd "$(dirname "$0")/../.."
 
 if [[ "${1:-}" == --verify ]]; then
@@ -22,23 +24,13 @@ if pool["state"] != "ONLINE":
     sys.exit("prepared development pool is not ONLINE")
 PY
     verify="$(mktemp -d "$COPILOT_DEV_RUNTIME/verify.XXXXXXXX")"
-    service_pid=""
     # shellcheck disable=SC2317,SC2329 # Invoked by verification's exit/signal traps.
     cleanup_verify() {
         local status=$?
         trap - EXIT INT TERM
-        if [[ -n "$service_pid" ]]; then
-            if kill -0 "$service_pid" 2>/dev/null; then
-                kill -TERM "$service_pid" || status=1
-                wait "$service_pid" || true
-            else
-                echo "verification service exited unexpectedly" >&2
-                wait "$service_pid" || true
-                status=1
-            fi
-        fi
-        if [[ -f "$verify/s3/weed.pid" || -f "$verify/s3/disk-budget-failure.txt" ]]; then
-            echo "verification service cleanup/budget failed; retaining diagnostics" >&2
+        local_s3_stop "$verify/s3" || status=1
+        if ! local_s3_budget_ok "$verify/s3"; then
+            echo "verification service budget failed; retaining diagnostics" >&2
             status=1
         fi
         if ! verify_pool_ownership "$COPILOT_DEV_RUNTIME" "$COPILOT_ZFS_POOL" "$COPILOT_ZFS_POOL_GUID"; then
@@ -55,25 +47,7 @@ PY
     "$TINK_PYTHON" tests/tooling/tink_interop.py
     TINK_PYTHON="$TINK_PYTHON" cargo test --locked --test crypto_stream official_tink_runtime_bidirectional -- --ignored
     cargo build --locked
-    bash tests/e2e/local_s3.sh "$verify/s3" > "$verify/s3.log" 2>&1 &
-    service_pid=$!
-    ready=false
-    for ((attempt = 0; attempt < 120; attempt++)); do
-        if ! kill -0 "$service_pid" 2>/dev/null; then
-            cat "$verify/s3.log" >&2
-            echo "verification service exited before readiness" >&2
-            exit 1
-        fi
-        if grep -q '^ready endpoint=' "$verify/s3.log"; then
-            ready=true
-            break
-        fi
-        sleep 1
-    done
-    "$ready" || { echo "verification service readiness timed out" >&2; exit 1; }
-    # shellcheck disable=SC1091
-    source "$verify/s3/local_s3.env"
-    export TEST_S3_ENDPOINT="$LOCAL_S3_ENDPOINT" TEST_S3_BUCKET="$LOCAL_S3_BUCKET"
+    local_s3_start "$verify/s3" "$verify/s3.log"
     export E2E_RUNTIME_DIR="$verify/zfs" E2E_GPG_DIR="$verify/g"
     python3 tests/tooling/s3_probe.py --region us-east-1
     cargo test --locked --test live_http -- --ignored
