@@ -4,8 +4,6 @@
 
 ## [0.1.0]
 
-<!-- RELEASE_NOTES_NEED_REVIEW -->
-
 ### Added
 
 - Add a Rust CLI foundation with `upload` and `download` subcommands, plus CI, security scanning and tag-triggered static musl release builds with SHA256SUMS. (#1)
