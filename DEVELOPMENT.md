@@ -44,6 +44,45 @@ The label permits isolated development testing, not unrestricted destruction. Fo
 The acceptance scenarios in [docs/design.md](docs/design.md#acceptance-scenarios) define later validation of the
 backup and restore requirements; preparing this environment does not establish that those behaviors are implemented.
 
+## Cloud Copilot handoff
+
+[copilot-setup-steps.yml](.github/workflows/copilot-setup-steps.yml) contains the single reserved
+`copilot-setup-steps` job required by GitHub. It uses standard Ubuntu 26.04 x64 with read-only checkout
+permissions, installs matching ZFS tools/module, Rust with clippy/rustfmt/rust-src, GnuPG, Python/venv,
+ShellCheck and static build tools, and fetches locked Cargo dependencies.
+
+Before the agent starts, [copilot_setup.sh](tests/support/copilot_setup.sh) downloads checksum-verified
+SeaweedFS 4.48, installs official Tink 1.16.1, creates its own **4 GiB sparse-file** development pool on
+an otherwise pool-free hosted VM, records its GUID and sets/verifies `user:isdev=yes`. It precompiles
+the tests and publishes `target/copilot-dev/env.sh` plus a ready marker only after successful setup.
+The pool and backing file are deliberately retained for the agent; the ephemeral VM owns their final lifetime.
+This bootstrap refuses local/self-hosted execution. Agents only consume the existing labeled pool.
+
+Load the handoff before working:
+
+```bash
+source target/copilot-dev/env.sh
+zpool get -j -p user:isdev "$COPILOT_ZFS_POOL"
+bash tests/support/copilot_setup.sh --verify
+```
+
+Verification starts a dedicated local S3 service, runs Tink/live HTTP/full and incremental ZFS recovery,
+stops that service and verifies the same development pool is still available afterward. Each ZFS run
+uses the harness's unique child namespace and short temporary GPG paths. It does not destroy the pool.
+SeaweedFS is preinstalled, not left as an orphan background daemon across setup boundaries. For a custom
+long-running local S3 session, use `WEED_BIN` and the existing `local_s3.sh` helper in an attached session.
+The handoff includes the 4-GiB ephemeral test-space reserve; shared-host local defaults remain 20 GiB.
+
+If setup fails, GitHub may still start the agent with a partial environment. A missing handoff/ready marker
+or a failed GUID/label check is an explicit setup failure; never import, recreate or relabel a pool to hide it.
+Do not rely solely on job-level environment variables (which Copilot does not customize): the ignored handoff
+file makes tool paths available even when the agent's shell does not inherit setup-step exports.
+
+The normal CI gate also calls this setup with handoff E2E verification enabled, so configuration/dependency
+regressions cannot be merged with a successful core CI but a broken cloud development environment. In an
+actual Copilot session, the expensive optional verification is not enabled by default. The setup file must
+be merged into the default branch for Copilot to use it.
+
 ## Local S3 and capability probes (opt-in)
 
 Infrastructure-backed tests are opt-in and should not be silently treated as passing when skipped.
@@ -137,6 +176,7 @@ Separate jobs run:
 
 * all default Rust unit and integration tests;
 * formatting, strict clippy, ShellCheck, and CI gate/hosted-guard tests;
+* cloud Copilot setup and retained-pool handoff E2E verification;
 * the release build;
 * the reusable [RustSec audit](.github/workflows/security.yml), also run weekly;
 * every opt-in test and the real ZFS/S3 E2E harness.
@@ -165,7 +205,7 @@ advisory ignore lists; vulnerable dependencies fail the gate.
 
 ### Main-branch gate and remote verification
 
-`CI Gate` requires every test, quality, release, audit and E2E job to succeed. Missing, skipped, cancelled or
+`CI Gate` requires every test, quality, release, audit, E2E and cloud-setup job to succeed. Missing, skipped, cancelled or
 failed prerequisite jobs cannot produce a successful gate. Main-branch protection requires a PR, this check
 from the GitHub Actions app, and an up-to-date branch. No independent human approval is required; administrators
 retain the explicitly allowed emergency bypass. Normal force pushes and branch deletion are prohibited.

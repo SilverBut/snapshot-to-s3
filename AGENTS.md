@@ -47,3 +47,13 @@ sudo -n true
   diagnose them; never remove a mountpoint tree while its dataset remains
   mounted.
 
+### Cloud Copilot environment
+
+The cloud setup job prepares a labeled pool before the agent starts. If
+`target/copilot-dev/env.sh` exists, source it for the prepared tool paths and
+test budgets; `bash tests/support/copilot_setup.sh --verify` tests that
+existing pool without replacing it. Do not run the setup bootstrap or
+`ci_e2e.sh` from the agent: the latter owns and destroys its separate CI pool.
+If the handoff is missing or its pool/GUID check fails, report setup failure
+instead of creating, importing or relabeling a pool. See
+[the cloud handoff guide](DEVELOPMENT.md#cloud-copilot-handoff).

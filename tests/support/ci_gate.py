@@ -4,7 +4,7 @@ import os
 import sys
 
 
-REQUIRED_JOBS = frozenset(("test", "quality", "release", "audit", "e2e"))
+REQUIRED_JOBS = frozenset(("test", "quality", "release", "audit", "e2e", "copilot"))
 
 
 def failures(raw):
