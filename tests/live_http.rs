@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use bytes::Bytes;
-use snapshot_to_s3::http_store::{HttpConfig, HttpStore};
+use snapshot_to_s3::s3::{HttpConfig, HttpStore};
 use snapshot_to_s3::model::MetadataMap;
 use snapshot_to_s3::store::{ObjectStore, Part};
 use tokio::io::AsyncReadExt;
