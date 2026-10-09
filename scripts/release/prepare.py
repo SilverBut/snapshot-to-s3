@@ -143,9 +143,7 @@ def _commit_release_branch(
         run(["git", "merge", "--no-edit", plan["prepared_from"]], root)
     else:
         run(["git", "switch", "-c", branch], root)
-        (root / NOTES_PATH).write_text(
-            prepare_notes(read_notes(root), target, generated_notes)
-        )
+        (root / NOTES_PATH).write_text(prepare_notes(read_notes(root), target, generated_notes))
         update_versions(root, target)
     (root / PLAN_PATH).parent.mkdir(exist_ok=True)
     (root / PLAN_PATH).write_text(json.dumps(plan, indent=2) + "\n")
@@ -159,21 +157,14 @@ def _commit_release_branch(
 
 
 def _open_release_pr(root: Path, plan: dict, branch: str, main: str) -> None:
-    target, source_sha, previous = plan["version"], plan["prepared_from"], plan["previous_tag"]
-    start = f"{previous}..{source_sha}" if previous else source_sha
-    commits = run(
-        ["git", "log", start, "--no-merges", "--format=- %s (%h)", "-n", "100"],
-        root,
-        capture=True,
-    )
+    target, source_sha = plan["version"], plan["prepared_from"]
     body = (
         f"Prepare **v{target}** from `{source_sha}`.\n\n"
         "Review the generated draft in this PR's CHANGELOG version section and remove "
         "the review marker. "
         "CI validates the version, notes and all infrastructure tests. "
         "After CI passes, merge with a merge commit, then run Actions → Release "
-        "in publish mode. Nothing is published automatically.\n\n"
-        f"### Candidate commits (not approved release notes)\n\n{commits}"
+        "in publish mode. Nothing is published automatically.\n"
     )
     with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8") as file:
         file.write(body)
@@ -308,10 +299,10 @@ def main() -> int:
             check_plan(root)
         else:
             generated_notes = (
-                args.generated_notes_file.read_text()
-                if args.generated_notes_file
-                else None
+                args.generated_notes_file.read_text() if args.generated_notes_file else None
             )
+            if generated_notes is not None and not generated_notes.strip():
+                raise ValueError("generated release notes are empty")
             prepare(root, args.bump, args.channel, args.dry_run, generated_notes)
     except (ValueError, KeyError, OSError, subprocess.CalledProcessError) as error:
         print(f"Release preparation failed: {error}", file=sys.stderr)
