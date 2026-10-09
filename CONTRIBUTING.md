@@ -50,8 +50,9 @@ Versions are SemVer tags: `vX.Y.Z`, or `vX.Y.Z-alpha.N` / `-beta.N` / `-rc.N` / 
 2. Review and edit the draft on that branch, then remove `<!-- RELEASE_NOTES_NEED_REVIEW -->`.
    CI fails while the notes are unreviewed or the versions disagree.
 3. When CI passes, merge it with a **merge commit** and wait for CI on that merge commit in `main`.
-4. Run **Actions → Release** on `main` with mode **publish**. It builds a static x86_64 musl binary,
-   verifies it, and publishes it with `SHA256SUMS` (check with `sha256sum -c SHA256SUMS`).
+4. Run **Actions → Release** on `main` with mode **publish** (the default **build-only** does not
+   publish). It builds a static x86_64 musl binary, verifies it, and publishes it with `SHA256SUMS`
+   (check with `sha256sum -c SHA256SUMS`).
 
 Both workflows run only when started manually; no push, PR or CI completion starts a release.
 Both Prepare Release jobs also require the default branch, including dry runs. Copilot note generation
@@ -63,3 +64,8 @@ Preparing the same version again reuses its PR and keeps the notes. If an accept
 published, run **Actions → Release → publish** again instead of bumping. **Release → build-only** and
 **Prepare Release → dry_run** test the automation without creating tags or releases. Nothing is published
 to crates.io.
+
+Publication resumes an existing draft after a failed run, keeping the tag on the accepted release
+PR's frozen merge commit. Uploaded assets must pass the exact file-set, size and SHA-256 checks before
+the draft is published. Draft verification uses the release ID: GitHub's release-by-tag REST endpoint
+does not return unpublished drafts. Already published releases and their assets are never overwritten.
