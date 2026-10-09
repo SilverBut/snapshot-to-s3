@@ -16,6 +16,8 @@ use tokio_util::sync::CancellationToken;
 const MIB: u64 = 1024 * 1024;
 /// Attempts per part, including the first, for retryable failures.
 const PART_ATTEMPTS: u64 = 3;
+/// Delay before retry `n` is `n` times this.
+const PART_RETRY_BACKOFF: Duration = Duration::from_millis(100);
 
 /// Provider multipart limits and the local part-buffer budget.
 #[derive(Clone, Debug)]
@@ -232,7 +234,7 @@ async fn upload_part(
             Err(error) if attempt < PART_ATTEMPTS && store.is_retryable(&error) => {
                 tokio::select! {
                     _ = cancel.cancelled() => bail!("backup cancelled during part retry"),
-                    _ = tokio::time::sleep(Duration::from_millis(100 * attempt)) => (),
+                    _ = tokio::time::sleep(PART_RETRY_BACKOFF * attempt as u32) => (),
                 }
             }
             Err(error) => {
