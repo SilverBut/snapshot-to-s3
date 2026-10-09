@@ -8,19 +8,27 @@ opt-in tests that need ZFS, a local S3 service or the official Tink runtime, and
 Containers share the host's ZFS kernel module through `/dev/zfs`, so pools are not isolated from the host.
 Local tests use only an existing pool provided by an administrator:
 
-* Discover pools (`zpool list`, `zpool get user:isdev`, `zpool status -P`); never hard-code names.
-* Use only an `ONLINE` pool whose **pool** property `user:isdev` is exactly `yes`
-  (`zpool get -j -p user:isdev "$pool"`). If there is none, stop and ask for one.
-* Never create, import, export, destroy or relabel pools, and never prepare backing files or devices.
+* Discover pools; never hard-code names or backing paths:
 
-Within the pool, tests must:
+  ```bash
+  zfs version; zpool list; zpool get user:isdev; zpool status -P; sudo -n true
+  ```
+
+* Use only an `ONLINE` pool whose **pool** property (not a dataset property) `user:isdev` is exactly `yes`;
+  recheck the chosen pool with `zpool get -H -o value user:isdev "$pool"`. If there is none, stop and ask
+  for one.
+* Never create, import, export, destroy or relabel pools, never change pool properties to make a pool
+  eligible, and never prepare backing files or devices.
+
+The label allows development testing, not unrestricted destruction. Within the pool, tests must:
 
 * create a unique child namespace such as `$pool/smoke_<id>`, after checking that it does not exist,
   and change, write, roll back or destroy only inside it;
 * mount test filesystems at explicit temporary mountpoints with `canmount=on`, and check
   `findmnt -n -o FSTYPE -T "$mountpoint"` reports `zfs` before writing;
-* set `atime=off` on source and received filesystems so verification reads do not change receive targets,
-  and never hide changes with `zfs receive -F`;
+* set `atime=off` on source and received filesystems. Otherwise verification reads change the receive
+  target, and the next incremental receive fails with "destination ... has been modified". Never hide
+  such changes with `zfs receive -F`;
 * use `set -euo pipefail` and an exit trap for cleanup. Report cleanup failures, keep diagnostics, and
   never delete a mountpoint tree while its dataset is mounted.
 
@@ -70,9 +78,9 @@ bash tests/provision/copilot_setup.sh --verify
 ```
 
 `--verify` checks the pool's label and GUID, starts a temporary SeaweedFS, and runs the Tink, live HTTP,
-probe and ZFS E2E tests. It then stops the service and checks that the pool is still there. A missing
-handoff file or a failed pool check is a setup failure: report it; never import, recreate or relabel a
-pool. CI runs the same setup and verification, so a broken agent environment fails the gate.
+probe and ZFS E2E tests. It then stops the service and checks that the pool is still there. Agents never
+run the setup bootstrap itself (without `--verify`) or `ci_e2e.sh`. A missing handoff file or a failed
+pool check is a setup failure: report it; never import, recreate or relabel a pool. CI runs the same setup and verification, so a broken agent environment fails the gate.
 
 ## CI
 

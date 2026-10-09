@@ -40,6 +40,9 @@ Cases may only touch datasets inside the namespace that `run.sh` created.
 
 ## Conventions
 
+The full guide, including mutation testing and harness tips, is
+[docs/engineering.md](../docs/engineering.md).
+
 * Never weaken an existing assertion to make a change pass. If the behavior
   changes deliberately, change the expected value and explain why in the commit.
 * Bound every buffer and prefer generated streams to large fixtures.

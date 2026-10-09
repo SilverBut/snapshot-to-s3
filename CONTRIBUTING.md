@@ -33,8 +33,9 @@ See the [architecture](docs/design.md#architecture). In short:
 
 ## Pull requests
 
-Branch from `main` and keep commits focused. Update the docs that describe changed behavior or
-interfaces. In the PR, describe the problem, the change, the validation you ran (commands and results),
+Branch from `main` and keep commits focused. Never change tests and the code they cover in the same commit;
+see [engineering practices](docs/engineering.md#change-one-side-at-a-time). Update the docs that describe
+changed behavior or interfaces. In the PR, describe the problem, the change, the validation you ran (commands and results),
 and any remaining risks. `main` requires the `CI Gate` check and an up-to-date branch.
 
 ## Releases
