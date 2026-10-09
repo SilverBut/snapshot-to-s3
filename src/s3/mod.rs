@@ -165,10 +165,11 @@ impl HttpStore {
             request = request.timeout(self.policy.control_timeout);
         }
         let progress = Arc::new(AtomicU64::new(0));
-        if transfer_body && !body.is_empty() {
-            request = request
-                .header(reqwest::header::CONTENT_LENGTH, body.len())
-                .body(counted_body(body, progress.clone()));
+        if transfer_body {
+            request = request.header(reqwest::header::CONTENT_LENGTH, body.len());
+            if !body.is_empty() {
+                request = request.body(counted_body(body, progress.clone()));
+            }
         }
         if control {
             request.send().await.context("send signed S3 request")
