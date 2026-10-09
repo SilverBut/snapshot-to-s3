@@ -1,103 +1,132 @@
 name: Release
 
 on:
-  push:
-    tags:
-      - 'v*'
-
-env:
-  CARGO_TERM_COLOR: always
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Build without publishing, or retry the accepted release on main
+        type: choice
+        default: build-only
+        options: [build-only, retry]
+      build_ref:
+        description: Build-only reference (empty uses this workflow's commit)
+        type: string
+        default: ''
 
 permissions:
   contents: read
 
+concurrency:
+  group: release-${{ github.event_name }}-${{ github.event.workflow_run.head_sha || github.sha }}
+  cancel-in-progress: false
+
 jobs:
-  build:
-    name: Build Release Binary
-    runs-on: ubuntu-latest
+  select:
+    name: Select only an authorized frozen release
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.head_repository.full_name == github.repository)
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: write
+      checks: read
+    outputs:
+      action: ${{ steps.select.outputs.action }}
+      sha: ${{ steps.select.outputs.sha }}
+      version: ${{ steps.select.outputs.version }}
+      publish: ${{ steps.select.outputs.publish }}
+      tag: ${{ steps.select.outputs.tag }}
     steps:
-      - uses: actions/checkout@v4
-      
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && github.ref || github.event.repository.default_branch }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Validate event, proposal and exact commit CI
+        id: select
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.mode || 'auto' }}
+          BUILD_REF: ${{ inputs.build_ref }}
+        run: python3 tests/support/publish_release.py select --mode "$MODE" --build-ref "$BUILD_REF"
+
+  build:
+    name: Build and verify frozen musl archive
+    needs: select
+    if: needs.select.outputs.action == 'build'
+    runs-on: ubuntu-26.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ needs.select.outputs.sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-unknown-linux-musl
-          
-      - name: Install musl tools
-        run: sudo apt-get update && sudo apt-get install -y musl-tools
-        
-      - name: Cache cargo registry
-        uses: actions/cache@v4
+      - uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
         with:
-          path: ~/.cargo/registry
-          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
-          
-      - name: Cache cargo index
-        uses: actions/cache@v4
-        with:
-          path: ~/.cargo/git
-          key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
-          
-      - name: Cache cargo build
-        uses: actions/cache@v4
-        with:
-          path: target
-          key: ${{ runner.os }}-cargo-build-release-${{ hashFiles('**/Cargo.lock') }}
-      
-      - name: Build release binary
-        run: cargo build --release --locked --target x86_64-unknown-linux-musl
-        
-      - name: Create tarballs
-        run: |
-          cd target/x86_64-unknown-linux-musl/release
-          tar -czf snapshot-to-s3-linux-x86_64.tar.gz snapshot-to-s3
-          sha256sum snapshot-to-s3-linux-x86_64.tar.gz > SHA256SUMS
-          
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: snapshot-to-s3-linux-x86_64
           path: |
-            target/x86_64-unknown-linux-musl/release/snapshot-to-s3-linux-x86_64.tar.gz
-            target/x86_64-unknown-linux-musl/release/SHA256SUMS
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: rust-${{ runner.os }}-${{ runner.arch }}-musl-${{ hashFiles('Cargo.lock') }}
+      - name: Install static build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends musl-tools binutils
+      - name: Build, check CLI version/static linkage and package
+        env:
+          EXPECTED_VERSION: ${{ needs.select.outputs.version }}
+        run: |
+          cargo build --release --locked --target x86_64-unknown-linux-musl
+          binary=target/x86_64-unknown-linux-musl/release/snapshot-to-s3
+          [[ "$("$binary" --version)" == "snapshot-to-s3 $EXPECTED_VERSION" ]]
+          readelf -l "$binary" > "$RUNNER_TEMP/release-elf.txt"
+          if grep -q INTERP "$RUNNER_TEMP/release-elf.txt"; then
+            echo "release binary is not statically linked" >&2
+            exit 1
+          fi
+          mkdir dist
+          tar -czf dist/snapshot-to-s3-linux-x86_64.tar.gz -C "$(dirname "$binary")" snapshot-to-s3
+          (cd dist && sha256sum snapshot-to-s3-linux-x86_64.tar.gz > SHA256SUMS)
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: frozen-release-${{ needs.select.outputs.sha }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
 
-  release:
-    name: Create GitHub Release
-    needs: build
-    runs-on: ubuntu-latest
+  publish:
+    name: Upload verified assets to draft, then publish
+    needs: [select, build]
+    if: needs.select.outputs.publish == 'true'
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
     permissions:
       contents: write
+      checks: read
+    concurrency:
+      group: publish-${{ needs.select.outputs.tag }}
+      cancel-in-progress: false
     steps:
-      - uses: actions/checkout@v4
-      
-      - name: Download artifacts
-        uses: actions/download-artifact@v4
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
-          name: snapshot-to-s3-linux-x86_64
-          path: ./artifacts
-          
-      - name: Determine release type
-        id: release_type
-        run: |
-          TAG_NAME=${GITHUB_REF#refs/tags/}
-          echo "tag_name=$TAG_NAME" >> $GITHUB_OUTPUT
-          
-          # Check if tag matches pre-release pattern
-          # Pre-release: v*-alpha.*, v*-beta.*, v*-rc.*, v*-pre.*
-          if [[ "$TAG_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-(alpha|beta|rc|pre) ]]; then
-            echo "prerelease=true" >> $GITHUB_OUTPUT
-            echo "Release type: Pre-release"
-          else
-            echo "prerelease=false" >> $GITHUB_OUTPUT
-            echo "Release type: Stable release"
-          fi
-          
-      - name: Create Release
-        uses: softprops/action-gh-release@v2
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
-          name: Release ${{ steps.release_type.outputs.tag_name }}
-          prerelease: ${{ steps.release_type.outputs.prerelease }}
-          files: |
-            ./artifacts/snapshot-to-s3-linux-x86_64.tar.gz
-            ./artifacts/SHA256SUMS
-          generate_release_notes: true
+          name: frozen-release-${{ needs.select.outputs.sha }}
+          path: dist
+      - name: Recheck CI/tag/notes, verify uploaded digests and publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_SHA: ${{ needs.select.outputs.sha }}
+        run: python3 tests/support/publish_release.py publish --sha "$RELEASE_SHA" --assets dist
