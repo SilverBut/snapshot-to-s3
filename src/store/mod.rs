@@ -1,11 +1,13 @@
 //! Object storage interface and the storage-independent protocols built on
-//! it: the writer lock and bounded multipart upload.
+//! it: the writer lock, bounded multipart upload and chained reads.
 
+mod chain;
 mod lock;
 mod multipart;
 
+pub use chain::{read_chain, ObjectRange};
 pub use lock::HeldLock;
-pub use multipart::{confirm_commit, upload_parts, UploadLimits, UploadedParts};
+pub use multipart::{confirm_commit, upload_object, upload_parts, UploadLimits, UploadedParts};
 
 use crate::model::{MetadataMap, Reader};
 use anyhow::{bail, Result};

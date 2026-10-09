@@ -2,9 +2,10 @@
 //!
 //! Under the prefix lock the workflow writes the wrapped key, its checksum
 //! and the encrypted metadata, streams `zfs send` through encryption into a
-//! multipart upload, writes the encrypted log, then completes the upload
-//! and confirms the commit with `HEAD`. Failures clean up only what is
-//! known to be safe; see `docs/storage.md`.
+//! multipart upload of `stream.encrypted` (and continuation objects when the
+//! stream outgrows one object), writes the encrypted log, then completes
+//! `stream.encrypted` and confirms the commit with `HEAD`. Failures clean up
+//! only what is known to be safe; see `docs/storage.md`.
 
 mod pipeline;
 mod selection;
@@ -17,6 +18,7 @@ use crate::store::{confirm_commit, HeldLock, ObjectStore, UploadLimits, Uploaded
 use crate::zfs::{SnapshotInfo, Zfs};
 use anyhow::{bail, ensure, Context, Error, Result};
 use bytes::Bytes;
+use pipeline::UploadedStream;
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
@@ -39,6 +41,8 @@ pub struct BackupResult {
     pub stream_key: String,
     pub snapshot_guid: String,
     pub ciphertext_bytes: u64,
+    /// `stream.encrypted` plus its continuation objects.
+    pub stream_objects: u32,
 }
 
 pub async fn backup(
@@ -151,7 +155,7 @@ impl Job<'_> {
             .send(&options.source, base.map(|base| &base.name))
             .await?;
         let estimate = crypto::ciphertext_size(selected.estimate);
-        let parts = self
+        let stream = self
             .upload_stream(&upload_id, send, &key, aad, estimate)
             .await?;
 
@@ -159,7 +163,7 @@ impl Job<'_> {
             options,
             current,
             base.is_some(),
-            &parts,
+            &stream,
             &selected.diagnostics,
         );
         self.put(
@@ -167,11 +171,12 @@ impl Job<'_> {
             crypto::encrypt_small(&key, log.as_bytes()).await?,
         )
         .await?;
-        self.complete(upload_id, &index, &parts).await?;
+        self.complete(upload_id, &index, &stream.head).await?;
         Ok(BackupResult {
             stream_key: self.stream_key.clone(),
             snapshot_guid: current.guid.clone(),
-            ciphertext_bytes: parts.bytes,
+            ciphertext_bytes: stream.bytes,
+            stream_objects: stream.objects,
         })
     }
 
@@ -285,17 +290,18 @@ fn backup_log(
     options: &BackupOptions,
     current: &SnapshotInfo,
     incremental: bool,
-    parts: &UploadedParts,
+    stream: &UploadedStream,
     diagnostics: &[String],
 ) -> String {
     let mut log = format!(
-        "source={}\nsnapshot-guid={}\nmode={}\nciphertext-bytes={}\npeak-part-buffer={}\n\
-         producers-and-parts=succeeded\ncommit=pending\n",
+        "source={}\nsnapshot-guid={}\nmode={}\nciphertext-bytes={}\nstream-objects={}\n\
+         peak-part-buffer={}\nproducers-and-parts=succeeded\ncommit=pending\n",
         options.source,
         current.guid,
         if incremental { "incremental" } else { "full" },
-        parts.bytes,
-        parts.peak_buffer_bytes
+        stream.bytes,
+        stream.objects,
+        stream.peak_buffer_bytes
     );
     for diagnostic in diagnostics {
         if log.len() + diagnostic.len() + 1 > LOG_LIMIT - 64 {
