@@ -35,7 +35,12 @@ async fn dropping_send_reader_cancels_process_after_output_started() {
     assert!(read > 0);
 
     drop(stream.reader);
-    let err = stream.completion.await.unwrap().unwrap_err().to_string();
+    let err = tokio::time::timeout(std::time::Duration::from_secs(1), stream.completion)
+        .await
+        .expect("dropping the reader should promptly cancel zfs send")
+        .unwrap()
+        .unwrap_err()
+        .to_string();
     assert!(err.contains("cancelled") || err.contains("failed"));
 }
 

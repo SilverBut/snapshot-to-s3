@@ -313,3 +313,64 @@ fn backup_log(
     }
     log
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn log_inputs() -> (BackupOptions, SnapshotInfo, UploadedStream) {
+        (
+            BackupOptions {
+                source: SnapshotName::parse("pool/data@s1").unwrap(),
+                location: S3Location::parse("s3://bucket/backups").unwrap(),
+                gpg_key_id: "recipient".into(),
+                force_full: false,
+                rate_limit: None,
+                limits: UploadLimits::default(),
+                cancel: CancellationToken::new(),
+            },
+            SnapshotInfo {
+                name: SnapshotName::parse("pool/data@s1").unwrap(),
+                guid: "guid-current".into(),
+                volume_guid: "guid-volume".into(),
+                createtxg: 7,
+            },
+            UploadedStream {
+                head: UploadedParts {
+                    parts: Vec::new(),
+                    bytes: 123_456,
+                    peak_buffer_bytes: 65_536,
+                    ended: true,
+                },
+                objects: 3,
+                bytes: 123_456,
+                peak_buffer_bytes: 65_536,
+            },
+        )
+    }
+
+    #[test]
+    fn backup_log_text_and_diagnostic_limit_are_exact() {
+        let (options, current, stream) = log_inputs();
+        let base = "source=pool/data@s1\nsnapshot-guid=guid-current\nmode=incremental\n\
+                     ciphertext-bytes=123456\nstream-objects=3\npeak-part-buffer=65536\n\
+                     producers-and-parts=succeeded\ncommit=pending\n";
+        let plain = backup_log(&options, &current, true, &stream, &[]);
+        assert_eq!(plain, base);
+
+        let diagnostic_len = LOG_LIMIT - 64 - plain.len() - 1;
+        let diagnostic = "d".repeat(diagnostic_len);
+        let at_limit = backup_log(
+            &options,
+            &current,
+            true,
+            &stream,
+            std::slice::from_ref(&diagnostic),
+        );
+        assert_eq!(at_limit, format!("{plain}{diagnostic}\n"));
+
+        let too_long = format!("{diagnostic}x");
+        let truncated = backup_log(&options, &current, true, &stream, &[too_long]);
+        assert_eq!(truncated, format!("{plain}diagnostics-truncated=true\n"));
+    }
+}

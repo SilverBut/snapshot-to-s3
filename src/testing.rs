@@ -33,6 +33,12 @@ pub struct MemoryStore {
     pub discard_parts: bool,
     /// Report injected failures as retryable.
     pub retryable_failures: bool,
+    /// Report injected failures as definite service rejections.
+    pub definite_rejections: bool,
+    /// Commit one conditional put, then report a lost response.
+    pub conditional_commit_lost: Mutex<bool>,
+    /// Fail one conditional put before it reaches the in-memory object map.
+    pub conditional_put_failure_once: Mutex<bool>,
     uploads: Mutex<BTreeMap<String, TestUpload>>,
 }
 
@@ -104,11 +110,19 @@ impl ObjectStore for MemoryStore {
     }
     async fn put_if_absent(&self, key: &str, data: Bytes) -> Result<bool> {
         self.event(format!("LOCK {key}"))?;
+        if *self.conditional_put_failure_once.lock().unwrap() {
+            *self.conditional_put_failure_once.lock().unwrap() = false;
+            bail!("injected one-shot conditional-put failure");
+        }
         let mut objects = self.objects.lock().unwrap();
         if objects.contains_key(key) {
             return Ok(false);
         }
         objects.insert(key.into(), (data, MetadataMap::new()));
+        if *self.conditional_commit_lost.lock().unwrap() {
+            *self.conditional_commit_lost.lock().unwrap() = false;
+            bail!("response lost after conditional put");
+        }
         Ok(true)
     }
     async fn delete(&self, key: &str) -> Result<()> {
@@ -183,6 +197,9 @@ impl ObjectStore for MemoryStore {
     }
     fn is_retryable(&self, error: &anyhow::Error) -> bool {
         self.retryable_failures && error.to_string().starts_with("injected failure")
+    }
+    fn is_definite_rejection(&self, error: &anyhow::Error) -> bool {
+        self.definite_rejections && error.to_string().starts_with("injected failure")
     }
 }
 

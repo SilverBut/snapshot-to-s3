@@ -144,6 +144,8 @@ async fn backup_and_restore_workflows() {
     failed_small_object_put_leaves_no_stream(&fingerprint).await;
     upload_failures_abort_the_stream(&fingerprint).await;
     unknown_completion_retains_lock(&fingerprint).await;
+    upload_shutdown_unresolved_retains_lock(&fingerprint).await;
+    definite_completion_rejection_aborts_and_releases_lock(&fingerprint).await;
     lost_completion_response_still_commits(&fingerprint).await;
     lock_cleanup_failure_after_commit_is_reported(&fingerprint).await;
     incremental_chain_stops_at_receive_failure_and_tampering(&fingerprint).await;
@@ -204,9 +206,51 @@ async fn unknown_completion_retains_lock(fingerprint: &str) {
     .await
     .err()
     .unwrap();
-    assert!(format!("{error:#}").contains("unknown"));
+    let message = format!("{error:#}");
+    assert!(message.contains("unknown"));
+    assert!(message.contains("upload-id=Some(\"upload-backups/pool/data/s1/stream.encrypted\")"));
     assert!(has_object(&store, ".lock"));
     assert!(!has_event(&store, "ABORT "));
+}
+
+async fn upload_shutdown_unresolved_retains_lock(fingerprint: &str) {
+    let store = Arc::new(MemoryStore::default());
+    *store.failure.lock().unwrap() = Some("ABORT ".into());
+    let mut zfs = FakeZfs::new();
+    zfs.send_failure = true;
+    let error = backup(store.clone(), Arc::new(zfs), options(fingerprint))
+        .await
+        .err()
+        .unwrap();
+    let message = format!("{error:#}");
+    assert!(message.contains("upload shutdown unresolved, retaining lock"));
+    assert!(message.contains("upload-id=Some(\"upload-backups/pool/data/s1/stream.encrypted\")"));
+    assert!(has_object(&store, ".lock"));
+    assert!(has_event(&store, "ABORT "));
+}
+
+async fn definite_completion_rejection_aborts_and_releases_lock(fingerprint: &str) {
+    let mut memory = MemoryStore::default();
+    memory.definite_rejections = true;
+    let store = Arc::new(memory);
+    *store.failure.lock().unwrap() = Some("COMPLETE ".into());
+    let error = backup(
+        store.clone(),
+        Arc::new(FakeZfs::new()),
+        options(fingerprint),
+    )
+    .await
+    .err()
+    .unwrap();
+    let message = format!("{error:#}");
+    assert!(message.contains("multipart completion was definitively rejected"));
+    assert!(message.contains("injected failure: COMPLETE backups/pool/data/s1/stream.encrypted"));
+    assert!(has_event(
+        &store,
+        "ABORT backups/pool/data/s1/stream.encrypted"
+    ));
+    assert!(!has_object(&store, ".lock"));
+    assert!(!has_object(&store, "stream.encrypted"));
 }
 
 async fn lost_completion_response_still_commits(fingerprint: &str) {

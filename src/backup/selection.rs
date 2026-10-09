@@ -197,3 +197,117 @@ mod tests {
         assert!(zfs.events.lock().unwrap().is_empty());
     }
 }
+
+#[cfg(test)]
+mod filtering_tests {
+    use super::*;
+    use crate::model::SnapshotName;
+    use crate::testing::{FakeZfs, MemoryStore};
+    use bytes::Bytes;
+
+    async fn index_for(
+        store: &MemoryStore,
+        location: &S3Location,
+        snapshot: &SnapshotInfo,
+        index_guid: &str,
+        index_volume: &str,
+    ) {
+        let index = StreamIndex {
+            gpg_key_id: "fingerprint".into(),
+            fs_type: "zfs".into(),
+            vol_id: index_volume.into(),
+            current_snapshot_id: index_guid.into(),
+            base_snapshot_id: None,
+            base_object_key: None,
+        };
+        store
+            .put(
+                &location.stream_key(&snapshot.name),
+                Bytes::from_static(b"stream"),
+                &index.to_metadata().unwrap(),
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn filters_each_local_and_remote_candidate_mismatch_independently() {
+        let store = MemoryStore::default();
+        let location = S3Location::parse("s3://bucket/backups").unwrap();
+        let current = SnapshotInfo {
+            name: SnapshotName::parse("pool/data@current").unwrap(),
+            guid: "999".into(),
+            volume_guid: "1".into(),
+            createtxg: 20,
+        };
+        let candidates = [
+            SnapshotInfo {
+                name: SnapshotName::parse("pool/data@base").unwrap(),
+                guid: "100".into(),
+                volume_guid: "1".into(),
+                createtxg: 10,
+            },
+            SnapshotInfo {
+                name: SnapshotName::parse("pool/other@other-dataset").unwrap(),
+                guid: "101".into(),
+                volume_guid: "1".into(),
+                createtxg: 9,
+            },
+            SnapshotInfo {
+                name: SnapshotName::parse("pool/data@not-older").unwrap(),
+                guid: "102".into(),
+                volume_guid: "1".into(),
+                createtxg: 20,
+            },
+            SnapshotInfo {
+                name: SnapshotName::parse("pool/data@other-volume").unwrap(),
+                guid: "103".into(),
+                volume_guid: "2".into(),
+                createtxg: 8,
+            },
+            SnapshotInfo {
+                name: SnapshotName::parse("pool/data@same-guid").unwrap(),
+                guid: "999".into(),
+                volume_guid: "1".into(),
+                createtxg: 7,
+            },
+            SnapshotInfo {
+                name: SnapshotName::parse("pool/data@remote-guid").unwrap(),
+                guid: "104".into(),
+                volume_guid: "1".into(),
+                createtxg: 6,
+            },
+            SnapshotInfo {
+                name: SnapshotName::parse("pool/data@remote-volume").unwrap(),
+                guid: "105".into(),
+                volume_guid: "1".into(),
+                createtxg: 5,
+            },
+        ];
+        for candidate in &candidates {
+            let (remote_guid, remote_volume) = match candidate.name.snapshot.as_str() {
+                "remote-guid" => ("998", "1"),
+                "remote-volume" => (candidate.guid.as_str(), "2"),
+                _ => (candidate.guid.as_str(), "1"),
+            };
+            index_for(&store, &location, candidate, remote_guid, remote_volume).await;
+        }
+        let mut zfs = FakeZfs::new();
+        zfs.snapshots = candidates.to_vec();
+        let selected = select_base(&store, &zfs, &location, &current, false)
+            .await
+            .unwrap();
+        assert_eq!(selected.base.unwrap().name.full_name(), "pool/data@base");
+        assert_eq!(
+            zfs.events.lock().unwrap().as_slice(),
+            ["estimate pool/data@base"]
+        );
+        assert_eq!(
+            selected.diagnostics,
+            [
+                "exclude pool/data@remote-guid: remote GUID mismatch",
+                "exclude pool/data@remote-volume: remote GUID mismatch",
+            ]
+        );
+    }
+}
