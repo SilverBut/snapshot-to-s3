@@ -380,6 +380,69 @@ mod tests {
     }
 
     #[test]
+    fn lock_detection_mode_defaults_and_accepts_cos_mode_only_for_backup() {
+        let backup = [
+            "snapshot-to-s3",
+            "backup",
+            "zfs:pool/data@s1",
+            "s3://bucket/backups",
+            "--gpg-key-id",
+            "recipient",
+        ];
+        let default = Cli::try_parse_from(backup).unwrap();
+        let Command::Backup(args) = default.command else {
+            panic!("expected backup command");
+        };
+        assert!(matches!(
+            args.lock_detection_mode,
+            LockDetectionMode::IfNoneMatch
+        ));
+
+        let cos_mode = Cli::try_parse_from(
+            [
+                &backup[..],
+                &["--lock-detection-mode", "x-cos-forbid-overwrite"],
+            ]
+            .concat(),
+        )
+        .unwrap();
+        let Command::Backup(args) = cos_mode.command else {
+            panic!("expected backup command");
+        };
+        assert!(matches!(
+            args.lock_detection_mode,
+            LockDetectionMode::XCosForbidOverwrite
+        ));
+        let dangerous_skip = Cli::try_parse_from(
+            [&backup[..], &["--lock-detection-mode", "dangerously-skip"]].concat(),
+        )
+        .unwrap();
+        let Command::Backup(args) = dangerous_skip.command else {
+            panic!("expected backup command");
+        };
+        assert!(matches!(
+            args.lock_detection_mode,
+            LockDetectionMode::DangerouslySkip
+        ));
+        assert!(!parses(&[
+            "backup",
+            "zfs:pool/data@s1",
+            "s3://bucket/backups",
+            "--gpg-key-id",
+            "recipient",
+            "--lock-detection-mode",
+            "unsupported"
+        ]));
+        assert!(!parses(&[
+            "restore",
+            "s3://bucket/backups",
+            "stdout:pool/data@s1",
+            "--lock-detection-mode",
+            "x-cos-forbid-overwrite"
+        ]));
+    }
+
+    #[test]
     fn target_overrides_preserve_relative_dataset() {
         let src = SnapshotName::parse("pool/nested/data@s1").unwrap();
         assert_eq!(

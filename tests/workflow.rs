@@ -4,7 +4,7 @@
 //! they run in sequence inside a single test.
 
 use bytes::Bytes;
-use snapshot_to_s3::backup::{backup, BackupOptions};
+use snapshot_to_s3::backup::{backup, backup_without_lock, BackupOptions};
 use snapshot_to_s3::crypto;
 use snapshot_to_s3::model::{S3Location, SnapshotName};
 use snapshot_to_s3::restore::{restore, RestoreOptions};
@@ -142,6 +142,8 @@ async fn backup_and_restore_workflows() {
         .await
         .unwrap();
     failed_small_object_put_leaves_no_stream(&fingerprint).await;
+    dangerously_skipped_lock_still_commits_without_lock_objects(&fingerprint).await;
+    dangerously_skipped_lock_reports_unresolved_commit_without_protection(&fingerprint).await;
     upload_failures_abort_the_stream(&fingerprint).await;
     unknown_completion_retains_lock(&fingerprint).await;
     upload_shutdown_unresolved_retains_lock(&fingerprint).await;
@@ -153,6 +155,36 @@ async fn backup_and_restore_workflows() {
     multi_object_stream_round_trip(&fingerprint).await;
     continuation_failure_aborts_without_commit(&fingerprint).await;
     std::env::remove_var("GNUPGHOME");
+}
+
+async fn dangerously_skipped_lock_still_commits_without_lock_objects(fingerprint: &str) {
+    let store = Arc::new(MemoryStore::default());
+    backup_without_lock(
+        store.clone(),
+        Arc::new(FakeZfs::new()),
+        options(fingerprint),
+    )
+    .await
+    .unwrap();
+    assert!(!has_object(&store, ".lock"));
+    assert!(!has_event(&store, "LOCK "));
+    assert!(has_object(&store, "stream.encrypted"));
+}
+
+async fn dangerously_skipped_lock_reports_unresolved_commit_without_protection(fingerprint: &str) {
+    let store = Arc::new(MemoryStore::default());
+    *store.failure.lock().unwrap() = Some("COMPLETE ".into());
+    let error = backup_without_lock(
+        store.clone(),
+        Arc::new(FakeZfs::new()),
+        options(fingerprint),
+    )
+    .await
+    .err()
+    .unwrap();
+    assert!(format!("{error:#}").contains("no lock was held"));
+    assert!(!has_object(&store, ".lock"));
+    assert!(!has_event(&store, "LOCK "));
 }
 
 async fn failed_small_object_put_leaves_no_stream(fingerprint: &str) {
