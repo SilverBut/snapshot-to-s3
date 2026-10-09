@@ -106,6 +106,9 @@ kept. ETags are not used as content checksums.
 
 ## HTTP transfers
 
+PUT and POST requests always include the exact `Content-Length`, including `0` for empty
+capability-probe PUTs and multipart-initiation POSTs, for compatibility with endpoints that require it.
+
 GET, POST and part PUT requests have no total timeout. Instead, a rolling throughput guard fails a
 transfer that moves fewer than 1,024 bytes in 30 seconds. Time that a GET waits on its consumer is not
 counted. HEAD, LIST and DELETE have a 120-second timeout. Connections time out after 10 seconds.
