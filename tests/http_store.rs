@@ -987,8 +987,6 @@ async fn conditional_capability_probe_rejects_ignored_metadata_and_cleans_lock_k
     assert!(requests.contains("/fixture-bucket/backups/snapshot/.snapshot-to-s3-probes/"));
     assert!(requests.contains("/.lock HTTP/1.1"));
     assert!(requests.contains("x-fixture-meta-http-store-capability:"));
-    assert!(
-        requests.contains("DELETE /fixture-bucket/backups/snapshot/.snapshot-to-s3-probes/")
-    );
+    assert!(requests.contains("DELETE /fixture-bucket/backups/snapshot/.snapshot-to-s3-probes/"));
     Ok(())
 }

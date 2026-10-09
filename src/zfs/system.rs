@@ -145,7 +145,10 @@ impl SystemZfs {
     }
 
     /// `guid` and `createtxg` of a snapshot, or `None` if it does not exist.
-    async fn snapshot_props(&self, name: &SnapshotName) -> Result<Option<BTreeMap<String, String>>> {
+    async fn snapshot_props(
+        &self,
+        name: &SnapshotName,
+    ) -> Result<Option<BTreeMap<String, String>>> {
         let full_name = name.full_name();
         let output = self.zfs_get("guid,createtxg", &full_name).await?;
         if !output.status.success() {
@@ -413,7 +416,12 @@ impl Zfs for SystemZfs {
 
     async fn check_clean(&self, latest: &SnapshotName) -> Result<()> {
         let output = self
-            .zfs(&["diff", "-H", latest.full_name().as_str(), latest.dataset.as_str()])
+            .zfs(&[
+                "diff",
+                "-H",
+                latest.full_name().as_str(),
+                latest.dataset.as_str(),
+            ])
             .await?;
         if !output.status.success() {
             bail!("zfs diff failed: {}", output.stderr.trim());
@@ -442,7 +450,9 @@ impl Zfs for SystemZfs {
         let copied = tokio::io::copy(stream.as_mut(), &mut stdin).await;
         drop(stdin);
         if let Err(error) = copied {
-            kill_and_reap(&mut child).await.context("stop zfs receive")?;
+            kill_and_reap(&mut child)
+                .await
+                .context("stop zfs receive")?;
             let stderr = stderr_task
                 .await
                 .context("stderr collector join failed")??

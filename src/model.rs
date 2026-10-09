@@ -301,7 +301,10 @@ mod tests {
             .snapshot_of_stream_key("pool/nested", &key)
             .is_err());
         let bare = S3Location::parse("s3://bucket").unwrap();
-        assert_eq!(bare.stream_key(&source), "pool/nested/dataset/s1/stream.encrypted");
+        assert_eq!(
+            bare.stream_key(&source),
+            "pool/nested/dataset/s1/stream.encrypted"
+        );
         assert!(SnapshotName::parse("pool/../data@s").is_err());
         assert!(SnapshotName::parse("pool/data").is_err());
         assert!(SnapshotName::new("pool/data", "a/b").is_err());
@@ -319,7 +322,10 @@ mod tests {
         meta.index.base_snapshot_id = Some("3".into());
         meta.index.base_object_key = Some("b/stream.encrypted".into());
         let json = serde_json::to_vec(&meta).unwrap();
-        assert_eq!(serde_json::from_slice::<BackupMetadata>(&json).unwrap(), meta);
+        assert_eq!(
+            serde_json::from_slice::<BackupMetadata>(&json).unwrap(),
+            meta
+        );
     }
 
     #[test]

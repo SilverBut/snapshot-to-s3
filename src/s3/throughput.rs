@@ -26,7 +26,10 @@ impl ThroughputGuard {
         Self {
             window: policy.throughput_window,
             bucket_width: Duration::from_nanos(
-                policy.throughput_window.as_nanos().div_ceil(SLOTS as u128 - 1) as u64
+                policy
+                    .throughput_window
+                    .as_nanos()
+                    .div_ceil(SLOTS as u128 - 1) as u64,
             ),
             minimum: policy.minimum_bytes_per_window,
             elapsed: Duration::ZERO,
@@ -227,4 +230,3 @@ mod tests {
             .is_err());
     }
 }
-

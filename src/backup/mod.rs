@@ -155,9 +155,18 @@ impl Job<'_> {
             .upload_stream(&upload_id, send, &key, aad, estimate)
             .await?;
 
-        let log = backup_log(options, current, base.is_some(), &parts, &selected.diagnostics);
-        self.put(object::LOG, crypto::encrypt_small(&key, log.as_bytes()).await?)
-            .await?;
+        let log = backup_log(
+            options,
+            current,
+            base.is_some(),
+            &parts,
+            &selected.diagnostics,
+        );
+        self.put(
+            object::LOG,
+            crypto::encrypt_small(&key, log.as_bytes()).await?,
+        )
+        .await?;
         self.complete(upload_id, &index, &parts).await?;
         Ok(BackupResult {
             stream_key: self.stream_key.clone(),
