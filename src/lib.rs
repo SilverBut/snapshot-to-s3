@@ -13,8 +13,5 @@ pub mod s3;
 pub mod store;
 pub mod zfs;
 
-#[cfg(test)]
-pub(crate) mod testing;
-
-#[cfg(test)]
-mod workflow_tests;
+#[cfg(any(test, feature = "test-support"))]
+pub mod testing;

@@ -94,3 +94,92 @@ fn env_u64(name: &str, default: u64) -> Result<u64> {
         Err(error) => Err(error).with_context(|| format!("read {name}")),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testing::ScopedEnv;
+
+    const VARS: [&str; 5] = [
+        "SNAPSHOT_TO_S3_HTTP_WINDOW_SECS",
+        "SNAPSHOT_TO_S3_HTTP_MIN_BYTES",
+        "SNAPSHOT_TO_S3_HTTP_CONTROL_TIMEOUT_SECS",
+        "SNAPSHOT_TO_S3_HTTP_GET_RETRIES",
+        "SNAPSHOT_TO_S3_HTTP_BACKOFF_MILLIS",
+    ];
+
+    #[test]
+    fn environment_overrides_every_field_and_rejects_non_numbers() {
+        let mut env = ScopedEnv::new(&VARS.map(|name| (name, None)));
+        let defaults = HttpPolicy::from_env().unwrap();
+        assert_eq!(defaults.throughput_window, Duration::from_secs(30));
+        assert_eq!(defaults.minimum_bytes_per_window, 1024);
+        assert_eq!(defaults.control_timeout, Duration::from_secs(120));
+        assert_eq!(defaults.get_retries, 3);
+        assert_eq!(defaults.retry_backoff, Duration::from_millis(200));
+
+        for (name, value) in VARS.into_iter().zip(["7", "11", "13", "17", "19"]) {
+            env.set(name, Some(value));
+        }
+        let policy = HttpPolicy::from_env().unwrap();
+        assert_eq!(policy.throughput_window, Duration::from_secs(7));
+        assert_eq!(policy.minimum_bytes_per_window, 11);
+        assert_eq!(policy.control_timeout, Duration::from_secs(13));
+        assert_eq!(policy.get_retries, 17);
+        assert_eq!(policy.retry_backoff, Duration::from_millis(19));
+
+        env.set("SNAPSHOT_TO_S3_HTTP_GET_RETRIES", Some("three"));
+        let error = HttpPolicy::from_env().unwrap_err().to_string();
+        assert_eq!(
+            error,
+            "SNAPSHOT_TO_S3_HTTP_GET_RETRIES must be an unsigned integer"
+        );
+    }
+
+    #[test]
+    fn validate_accepts_limits_and_rejects_each_violation() {
+        let at_limits = HttpPolicy {
+            throughput_window: DAY,
+            minimum_bytes_per_window: 1,
+            control_timeout: DAY,
+            get_retries: 100,
+            retry_backoff: Duration::from_secs(60),
+        };
+        at_limits.validate().unwrap();
+        HttpPolicy::default().validate().unwrap();
+
+        let invalid: [fn(&mut HttpPolicy); 7] = [
+            |p| p.throughput_window = Duration::ZERO,
+            |p| p.throughput_window = DAY + Duration::from_secs(1),
+            |p| p.minimum_bytes_per_window = 0,
+            |p| p.control_timeout = Duration::ZERO,
+            |p| p.control_timeout = DAY + Duration::from_secs(1),
+            |p| p.get_retries = 101,
+            |p| p.retry_backoff = Duration::from_millis(60_001),
+        ];
+        for (index, change) in invalid.iter().enumerate() {
+            let mut policy = HttpPolicy::default();
+            change(&mut policy);
+            assert!(policy.validate().is_err(), "violation {index} accepted");
+        }
+    }
+
+    #[test]
+    fn retry_delay_doubles_and_caps_at_one_minute() {
+        let policy = HttpPolicy {
+            retry_backoff: Duration::from_millis(100),
+            ..HttpPolicy::default()
+        };
+        let delays: Vec<_> = (0..12).map(|retry| policy.retry_delay(retry)).collect();
+        let millis: Vec<_> = delays.iter().map(Duration::as_millis).collect();
+        assert_eq!(
+            millis,
+            [100, 200, 400, 800, 1600, 3200, 6400, 12800, 25600, 25600, 25600, 25600]
+        );
+        let slow = HttpPolicy {
+            retry_backoff: Duration::from_secs(1),
+            ..HttpPolicy::default()
+        };
+        assert_eq!(slow.retry_delay(6), Duration::from_secs(60));
+    }
+}

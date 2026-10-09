@@ -116,3 +116,62 @@ fn prefix_ranges(objects: &[(ObjectRange, u64)]) -> Vec<ObjectRange> {
     }
     ranges
 }
+
+#[cfg(test)]
+mod prefix_range_tests {
+    use super::*;
+
+    #[test]
+    fn prefix_ranges_cover_exact_bytes_across_objects_and_stop_at_limit() {
+        let first_size = VERIFY_PREFIX_BYTES - 10;
+        let objects = vec![
+            (
+                ObjectRange {
+                    key: "stream.encrypted".into(),
+                    etag: "first-etag".into(),
+                    range: None,
+                },
+                first_size,
+            ),
+            (
+                ObjectRange {
+                    key: "stream.encrypted.000001".into(),
+                    etag: "second-etag".into(),
+                    range: None,
+                },
+                20,
+            ),
+            (
+                ObjectRange {
+                    key: "stream.encrypted.000002".into(),
+                    etag: "third-etag".into(),
+                    range: None,
+                },
+                30,
+            ),
+        ];
+        let ranges = prefix_ranges(&objects);
+        assert_eq!(ranges.len(), 2);
+        assert_eq!(ranges[0].key, "stream.encrypted");
+        assert_eq!(ranges[0].etag, "first-etag");
+        assert_eq!(ranges[0].range, Some((0, first_size - 1)));
+        assert_eq!(ranges[1].key, "stream.encrypted.000001");
+        assert_eq!(ranges[1].etag, "second-etag");
+        assert_eq!(ranges[1].range, Some((0, 9)));
+    }
+
+    #[test]
+    fn prefix_range_uses_whole_object_when_it_fits() {
+        let objects = vec![(
+            ObjectRange {
+                key: "stream.encrypted".into(),
+                etag: "etag".into(),
+                range: None,
+            },
+            VERIFY_PREFIX_BYTES + 100,
+        )];
+        let ranges = prefix_ranges(&objects);
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(ranges[0].range, Some((0, VERIFY_PREFIX_BYTES - 1)));
+    }
+}

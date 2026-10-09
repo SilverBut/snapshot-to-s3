@@ -4,5 +4,9 @@
 # rustfmt backups
 **/*.rs.bk
 
-# Default GnuPG runtime directories of tests/support/zfs_s3_e2e.sh
+# Default GnuPG runtime directories of tests/e2e/run.sh
 /.gpg_*/
+
+# Python bytecode
+__pycache__/
+*.pyc

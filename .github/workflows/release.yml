@@ -48,7 +48,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           MODE: ${{ inputs.mode }}
           BUILD_REF: ${{ inputs.build_ref }}
-        run: python3 tests/support/publish_release.py select --mode "$MODE" --build-ref "$BUILD_REF"
+        run: python3 -m scripts.release.publish select --mode "$MODE" --build-ref "$BUILD_REF"
 
   build:
     name: Build and verify frozen musl archive
@@ -123,4 +123,4 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_SHA: ${{ needs.select.outputs.sha }}
-        run: python3 tests/support/publish_release.py publish --sha "$RELEASE_SHA" --assets dist
+        run: python3 -m scripts.release.publish publish --sha "$RELEASE_SHA" --assets dist

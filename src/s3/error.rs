@@ -150,3 +150,93 @@ pub(super) fn xml_root_name(bytes: &[u8]) -> Result<String> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn error_body_detail_requires_no_code_or_message_and_nonempty_body() {
+        let message_only = HttpStatusFailure::from_body(
+            "GET object",
+            StatusCode::BAD_REQUEST,
+            None,
+            b"<Error><Message>known message</Message></Error>",
+        );
+        assert_eq!(message_only.message.as_deref(), Some("known message"));
+        assert_eq!(message_only.detail, None);
+
+        let header_code = HttpStatusFailure::from_body(
+            "HEAD object",
+            StatusCode::FORBIDDEN,
+            Some("AccessDenied".into()),
+            b"not xml",
+        );
+        assert_eq!(header_code.code.as_deref(), Some("AccessDenied"));
+        assert_eq!(header_code.detail, None);
+
+        let empty = HttpStatusFailure::from_body("GET object", StatusCode::BAD_GATEWAY, None, b"");
+        assert_eq!(empty.detail, None);
+
+        let unparsed = HttpStatusFailure::from_body(
+            "GET object",
+            StatusCode::BAD_GATEWAY,
+            None,
+            b"raw response",
+        );
+        assert_eq!(
+            unparsed.detail.as_deref(),
+            Some("response body: raw response")
+        );
+    }
+
+    #[test]
+    fn error_document_marks_only_successful_known_errors_as_definite_rejections() {
+        let success = HttpStatusFailure::from_error_document(
+            "complete multipart upload",
+            StatusCode::OK,
+            b"<Error><Code>InternalError</Code></Error>",
+        );
+        assert!(success.definite_rejection);
+        assert_eq!(success.code.as_deref(), Some("InternalError"));
+
+        let server_error = HttpStatusFailure::from_error_document(
+            "complete multipart upload",
+            StatusCode::INTERNAL_SERVER_ERROR,
+            b"<Error><Code>InternalError</Code></Error>",
+        );
+        assert!(!server_error.definite_rejection);
+
+        let unknown = HttpStatusFailure::from_error_document(
+            "complete multipart upload",
+            StatusCode::OK,
+            b"<Error><Message>unknown failure</Message></Error>",
+        );
+        assert!(!unknown.definite_rejection);
+    }
+
+    #[test]
+    fn retry_classification_covers_each_transient_status_family() {
+        for (status, expected) in [
+            (StatusCode::REQUEST_TIMEOUT, true),
+            (StatusCode::TOO_MANY_REQUESTS, true),
+            (StatusCode::INTERNAL_SERVER_ERROR, true),
+            (StatusCode::BAD_REQUEST, false),
+        ] {
+            let failure = HttpStatusFailure::from_body("request", status, None, b"");
+            assert_eq!(is_retryable(&failure.into()), expected, "{status}");
+        }
+    }
+
+    #[test]
+    fn xml_root_name_returns_local_name_and_rejects_eof() {
+        assert_eq!(
+            xml_root_name(b"<s3:CompleteMultipartUploadResult/>").unwrap(),
+            "CompleteMultipartUploadResult"
+        );
+        assert_eq!(
+            xml_root_name(b"<!-- no root -->").unwrap_err().to_string(),
+            "empty XML document"
+        );
+    }
+}

@@ -21,7 +21,7 @@ use crate::model::MetadataMap;
 use anyhow::{bail, Context, Result};
 use bytes::Bytes;
 use chrono::Utc;
-use credentials::CredentialProvider;
+use credentials::Credentials;
 use error::HttpStatusFailure;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use reqwest::{Method, Response, Url};
@@ -52,7 +52,7 @@ pub struct HttpConfig {
 pub struct HttpStore {
     config: HttpConfig,
     client: reqwest::Client,
-    credentials: Arc<CredentialProvider>,
+    credentials: Arc<Credentials>,
     metadata_header_prefix: String,
     endpoint: Url,
     policy: HttpPolicy,
@@ -79,7 +79,7 @@ impl HttpStore {
             .connect_timeout(Duration::from_secs(10))
             .build()
             .context("create S3 HTTP client")?;
-        let credentials = Arc::new(CredentialProvider::from_env(client.clone())?);
+        let credentials = Arc::new(Credentials::from_env()?);
         Ok(Self {
             config,
             client,
@@ -142,7 +142,6 @@ impl HttpStore {
         mut headers: HeaderMap,
         body: Bytes,
     ) -> Result<Response> {
-        let credentials = self.credentials.get().await?;
         let url = self.object_url(key, query)?;
         let scope = sigv4::Scope {
             region: &self.config.region,
@@ -153,7 +152,7 @@ impl HttpStore {
             &method,
             &url,
             &body,
-            &credentials,
+            &self.credentials,
             &scope,
             Utc::now(),
         )?;
@@ -316,4 +315,84 @@ fn put_header(headers: &mut HeaderMap, name: &str, value: &str) -> Result<()> {
             .with_context(|| format!("invalid HTTP header value for {name}"))?,
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config(endpoint: Option<&str>, region: &str) -> HttpConfig {
+        HttpConfig {
+            bucket: "bucket".into(),
+            endpoint: endpoint.map(str::to_owned),
+            region: region.into(),
+            metadata_prefix: "X-Test-Meta---".into(),
+            signing_service: "s3".into(),
+            path_style: true,
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_credentials_fail_when_the_store_is_created() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("absent");
+        let _env = crate::testing::ScopedEnv::new(&[
+            ("AWS_ACCESS_KEY_ID", None),
+            ("AWS_SECRET_ACCESS_KEY", None),
+            ("AWS_SHARED_CREDENTIALS_FILE", path.to_str()),
+        ]);
+        let error = HttpStore::new_with_policy(
+            config(Some("http://127.0.0.1:1"), "us-east-1"),
+            HttpPolicy::default(),
+        )
+        .await
+        .err()
+        .unwrap();
+        assert_eq!(
+            error.to_string(),
+            "no AWS credentials found; set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY or configure a shared credentials file"
+        );
+    }
+
+    #[test]
+    fn endpoint_defaults_and_rejects_each_unsupported_component() {
+        assert_eq!(
+            endpoint_url(&config(None, "us-east-1")).unwrap().as_str(),
+            "https://s3.amazonaws.com/"
+        );
+        assert_eq!(
+            endpoint_url(&config(None, "eu-west-2")).unwrap().as_str(),
+            "https://s3.eu-west-2.amazonaws.com/"
+        );
+        for endpoint in [
+            "ftp://example.test",
+            "file:///tmp",
+            "http://user@example.test",
+            "http://user:pass@example.test",
+            "http://:pass@example.test",
+            "http://example.test/path?query=1",
+            "http://example.test/path#fragment",
+        ] {
+            let error = endpoint_url(&config(Some(endpoint), "us-east-1")).unwrap_err();
+            assert!(
+                error.to_string().contains("S3 endpoint"),
+                "{endpoint}: {error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn metadata_prefix_is_normalized_and_rejects_empty_or_invalid_names() {
+        assert_eq!(
+            normalize_metadata_prefix("X-Test-Meta---").unwrap(),
+            "x-test-meta"
+        );
+        for prefix in ["", "---", "bad_prefix", "bad prefix"] {
+            let error = normalize_metadata_prefix(prefix).unwrap_err().to_string();
+            assert_eq!(
+                error,
+                "metadata_prefix must be a valid HTTP header-name prefix"
+            );
+        }
+    }
 }

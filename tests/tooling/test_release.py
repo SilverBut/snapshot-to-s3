@@ -1,0 +1,342 @@
+import hashlib
+import json
+import os
+import subprocess
+import tempfile
+import tomllib
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+from scripts.release import prepare as release
+from scripts.release import publish as publish_release
+
+MANIFEST = (
+    '[package]\nname = "fixture"\nversion = "0.1.0" # preserve comment\n\n'
+    '[dependencies]\nbytes = "1"\n'
+)
+LOCK = """# Keep formatting
+version = 4
+
+[[package]]
+name = "bytes"
+version = "1.12.1"
+source = "registry+https://example.invalid"
+checksum = "unchanged"
+
+[[package]]
+name = "fixture"
+version = "0.1.0"
+dependencies = ["bytes"]
+"""
+
+
+class ReleaseTests(unittest.TestCase):
+    def fixture(self, root):
+        (root / "Cargo.toml").write_text(MANIFEST)
+        (root / "Cargo.lock").write_text(LOCK)
+
+    def test_initial_and_explicit_bumps(self):
+        self.assertEqual(release.next_version("0.1.0", [], "initial"), "0.1.0")
+        for bump, expected in (("patch", "1.2.4"), ("minor", "1.3.0"), ("major", "2.0.0")):
+            self.assertEqual(release.next_version("1.2.3", ["1.2.3"], bump), expected)
+        with self.assertRaises(ValueError):
+            release.next_version("0.1.0", [], "patch")
+        with self.assertRaises(ValueError):
+            release.next_version("1.2.3", ["1.2.3"], "initial")
+
+    def test_prerelease_iteration_and_promotion(self):
+        versions = ["0.1.0", "0.2.0-rc.1", "0.2.0-rc.2"]
+        self.assertEqual(release.next_version("0.2.0-rc.2", versions, "minor", "rc"), "0.2.0-rc.3")
+        self.assertEqual(release.next_version("0.2.0-rc.2", versions, "minor"), "0.2.0")
+        with self.assertRaises(ValueError):
+            release.next_version("0.2.0-rc.2", versions, "patch")
+        with self.assertRaises(ValueError):
+            release.next_version("0.2.0-rc.2", versions, "minor", "beta")
+
+    def test_version_validation(self):
+        for value in ("1.2", "01.2.3", "1.2.3-rc.0", '1.2.3"; exit', None):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                release.parse_version(value)
+
+    def test_updates_only_own_manifest_and_lock_version(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.fixture(root)
+            release.update_versions(root, "0.2.0")
+            self.assertIn('version = "0.2.0" # preserve comment', (root / "Cargo.toml").read_text())
+            data = tomllib.loads((root / "Cargo.lock").read_text())
+            self.assertEqual(data["package"][0]["version"], "1.12.1")
+            self.assertEqual(data["package"][0]["checksum"], "unchanged")
+            self.assertEqual(data["package"][1]["version"], "0.2.0")
+            self.assertEqual(data["version"], 4)
+
+    def test_notes_are_unique_reviewed_and_version_scoped(self):
+        old = "# Changelog\n\n## [Unreleased]\n\n### Fixed\n- A change.\n\n## [0.0.1]\n\n- Older.\n"
+        text = release.prepare_notes(old, "0.1.0")
+        self.assertEqual(text.count("- A change."), 1)
+        with self.assertRaises(ValueError):
+            release.notes_section(text, "0.1.0")
+        reviewed = text.replace(release.NOTES_MARKER, "")
+        self.assertIn("- A change.", release.notes_section(reviewed, "0.1.0"))
+        self.assertNotIn("- Older.", release.notes_section(reviewed, "0.1.0"))
+        with self.assertRaises(ValueError):
+            release.notes_section("## [0.1.0]\n### Fixed\n<!-- empty -->", "0.1.0")
+        with self.assertRaises(ValueError):
+            release.notes_section(reviewed + "\n## [0.1.0]\n- Duplicate", "0.1.0")
+
+    def test_plan_checks_all_three_version_sources(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.fixture(root)
+            path = root / release.PLAN_PATH
+            path.parent.mkdir()
+            path.write_text(
+                json.dumps(
+                    {
+                        "version": "0.1.0",
+                        "previous_tag": None,
+                        "prepared_from": "a" * 40,
+                    }
+                )
+            )
+            notes = release.prepare_notes("", "0.1.0").replace(
+                release.NOTES_MARKER, "- Maintainer reviewed the release."
+            )
+            (root / "CHANGELOG.md").write_text(notes)
+            self.assertEqual(release.check_plan(root)["version"], "0.1.0")
+            (root / "Cargo.lock").write_text(LOCK.replace('version = "0.1.0"', 'version = "0.2.0"'))
+            with self.assertRaises(ValueError):
+                release.check_plan(root)
+
+    def test_green_gate_uses_exact_sha_and_rejects_newer_failure(self):
+        gates = [
+            {
+                "id": 1,
+                "name": "CI Gate",
+                "app": {"id": 15368},
+                "status": "completed",
+                "conclusion": "success",
+            }
+        ]
+        with patch.object(publish_release, "api", return_value={"check_runs": gates}) as api:
+            publish_release.require_green("fixture/repo", Path("."), "a" * 40)
+            self.assertIn("a" * 40, api.call_args.args[0])
+            gates.append({**gates[0], "id": 2, "conclusion": "cancelled"})
+            with self.assertRaises(ValueError):
+                publish_release.require_green("fixture/repo", Path("."), "a" * 40)
+
+    def test_tag_mismatch_never_overwrites(self):
+        ref = {"ref": "refs/tags/v0.1.0", "object": {"type": "commit", "sha": "a" * 40}}
+        with patch.object(publish_release, "api", return_value=[ref]):
+            self.assertTrue(
+                publish_release.verify_tag("fixture/repo", Path("."), "v0.1.0", "a" * 40)
+            )
+            with self.assertRaises(ValueError):
+                publish_release.verify_tag("fixture/repo", Path("."), "v0.1.0", "b" * 40)
+
+    def test_asset_digest_and_exact_file_set(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            archive = root / "snapshot-to-s3-linux-x86_64.tar.gz"
+            archive.write_bytes(b"fixture archive")
+            checksum = root / "SHA256SUMS"
+            checksum.write_text(
+                f"{hashlib.sha256(archive.read_bytes()).hexdigest()}  {archive.name}\n"
+            )
+            publish_release.verify_assets(root)
+            archive.write_bytes(b"damaged")
+            with self.assertRaises(ValueError):
+                publish_release.verify_assets(root)
+
+    def test_publish_is_manual_and_main_only(self):
+        with self.assertRaises(SystemExit), patch("sys.argv", ["x", "select", "--mode", "auto"]):
+            publish_release.main()
+        workflow = (
+            Path(__file__).resolve().parents[2] / ".github/workflows/release.yml"
+        ).read_text()
+        triggers = workflow.split("\non:\n", 1)[1].split("\npermissions:", 1)[0]
+        self.assertIn("workflow_dispatch", triggers)
+        for automatic in ("workflow_run", "push", "pull_request", "schedule"):
+            self.assertNotIn(automatic, triggers)
+        env = {"GITHUB_REPOSITORY": "fixture/repo", "GITHUB_REF": "refs/heads/feature"}
+        with (
+            patch.dict(os.environ, env),
+            patch.object(publish_release, "api", return_value={"default_branch": "main"}),
+            patch.object(publish_release, "output") as output,
+        ):
+            with self.assertRaises(ValueError):
+                publish_release.select(Path.cwd(), "publish", "")
+            output.assert_not_called()
+
+    def test_draft_upload_verification_precedes_publication(self):
+        for damaged in (False, True):
+            with self.subTest(damaged=damaged), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                archive = root / "snapshot-to-s3-linux-x86_64.tar.gz"
+                archive.write_bytes(b"verified fixture")
+                sums = root / "SHA256SUMS"
+                sums.write_text(
+                    f"{hashlib.sha256(archive.read_bytes()).hexdigest()}  {archive.name}\n"
+                )
+                assets = [
+                    {
+                        "name": p.name,
+                        "size": p.stat().st_size,
+                        "digest": f"sha256:{hashlib.sha256(p.read_bytes()).hexdigest()}",
+                    }
+                    for p in (archive, sums)
+                ]
+                if damaged:
+                    assets[0]["digest"] = "sha256:" + "0" * 64
+                calls = []
+                replies = iter(
+                    [
+                        {"default_branch": "main"},
+                        {"assets": assets, "draft": True},
+                        {"draft": False, "html_url": "https://example.invalid/release"},
+                    ]
+                )
+                env = {"GITHUB_REPOSITORY": "fixture/repo", "GITHUB_REF": "refs/heads/main"}
+                with (
+                    patch.dict(os.environ, env),
+                    patch.object(publish_release, "api", side_effect=replies),
+                    patch.object(
+                        publish_release, "snapshot", return_value=("0.1.0", "- Approved.")
+                    ),
+                    patch.object(publish_release, "require_green"),
+                    patch.object(publish_release, "verify_tag", return_value=True),
+                    patch.object(publish_release, "release_records", return_value=[]),
+                    patch.object(
+                        publish_release,
+                        "run",
+                        side_effect=lambda command, *_, calls=calls: calls.append(command),
+                    ),
+                ):
+                    if damaged:
+                        with self.assertRaises(ValueError):
+                            publish_release.publish(root, "a" * 40, root)
+                    else:
+                        publish_release.publish(root, "a" * 40, root)
+                create = next(
+                    i for i, c in enumerate(calls) if c[:3] == ["gh", "release", "create"]
+                )
+                upload = next(
+                    i for i, c in enumerate(calls) if c[:3] == ["gh", "release", "upload"]
+                )
+                self.assertIn("--draft", calls[create])
+                self.assertLess(create, upload)
+                published = [c for c in calls if "--draft=false" in c]
+                self.assertEqual(len(published), 0 if damaged else 1)
+
+    def test_published_release_is_never_overwritten(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            archive = root / "snapshot-to-s3-linux-x86_64.tar.gz"
+            archive.write_bytes(b"fixture")
+            (root / "SHA256SUMS").write_text(
+                f"{hashlib.sha256(archive.read_bytes()).hexdigest()}  {archive.name}\n"
+            )
+            env = {"GITHUB_REPOSITORY": "fixture/repo", "GITHUB_REF": "refs/heads/main"}
+            with (
+                patch.dict(os.environ, env),
+                patch.object(publish_release, "api", return_value={"default_branch": "main"}),
+                patch.object(publish_release, "snapshot", return_value=("0.1.0", "- Approved.")),
+                patch.object(publish_release, "require_green"),
+                patch.object(publish_release, "verify_tag", return_value=True),
+                patch.object(
+                    publish_release,
+                    "release_records",
+                    return_value=[{"tag_name": "v0.1.0", "draft": False}],
+                ),
+                patch.object(publish_release, "run") as run,
+            ):
+                publish_release.publish(root, "a" * 40, root)
+                self.assertFalse(
+                    any(call.args[0][:2] == ["gh", "release"] for call in run.call_args_list)
+                )
+
+    def test_partial_preparation_reuses_branch_and_preserves_manual_notes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            remote = base / "remote.git"
+            seed = base / "seed"
+            seed.mkdir()
+            self.fixture(seed)
+
+            def git(args, cwd=seed):
+                return subprocess.run(
+                    ["git", *args],
+                    cwd=cwd,
+                    check=True,
+                    text=True,
+                    capture_output=True,
+                ).stdout.strip()
+
+            git(["init", "--bare", str(remote)], base)
+            git(["init", "-b", "main"])
+            git(["config", "user.name", "Fixture"])
+            git(["config", "user.email", "fixture@example.invalid"])
+            git(["add", "."])
+            git(["commit", "-m", "plain commit without conventional syntax"])
+            git(["remote", "add", "origin", str(remote)])
+            git(["push", "origin", "main"])
+            first = base / "first"
+            git(["clone", "--branch", "main", str(remote), str(first)], base)
+            real_run = release.run
+            state = {"prs": [], "creates": 0}
+
+            def runner(command, root, capture=False):
+                if command[:3] == ["gh", "pr", "list"]:
+                    return json.dumps(state["prs"])
+                if command[:3] == ["gh", "pr", "create"]:
+                    state["creates"] += 1
+                    state["prs"] = [
+                        {
+                            "number": 1,
+                            "headRefName": "automation/release-v0.1.0",
+                            "url": "https://example.invalid/pr/1",
+                        }
+                    ]
+                    return ""
+                if command[:3] == ["gh", "workflow", "run"]:
+                    return ""
+                if command[:3] == ["gh", "run", "list"]:
+                    return "[]"
+                return real_run(command, root, capture)
+
+            env = {
+                "GITHUB_REPOSITORY": "fixture/repo",
+                "GITHUB_ACTIONS": "true",
+                "GITHUB_REF": "refs/heads/main",
+            }
+            with (
+                patch.dict(os.environ, env),
+                patch.object(release, "api", return_value={"default_branch": "main"}),
+                patch.object(release, "release_records", return_value=[]),
+                patch.object(release, "run", side_effect=runner),
+            ):
+                release.prepare(first, "initial", "stable", False)
+                text = (
+                    (first / "CHANGELOG.md")
+                    .read_text()
+                    .replace(
+                        release.NOTES_MARKER, "- Handwritten release notes must survive retries."
+                    )
+                )
+                (first / "CHANGELOG.md").write_text(text)
+                git(["add", "CHANGELOG.md"], first)
+                git(["commit", "-m", "maintainer edits notes"], first)
+                git(["push", "origin", "HEAD"], first)
+                saved = git(["rev-parse", "HEAD"], first)
+                second = base / "second"
+                git(["clone", "--branch", "main", str(remote), str(second)], base)
+                release.prepare(second, "initial", "stable", False)
+                self.assertEqual(git(["rev-parse", "HEAD"], second), saved)
+                self.assertEqual((second / "CHANGELOG.md").read_text(), text)
+                self.assertEqual(state["creates"], 1)
+                self.assertEqual(release.check_plan(second)["version"], "0.1.0")
+
+
+if __name__ == "__main__":
+    unittest.main()
