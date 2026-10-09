@@ -1,7 +1,7 @@
 import os
-from pathlib import Path
 import subprocess
 import unittest
+from pathlib import Path
 
 
 class HostedGuardTests(unittest.TestCase):
@@ -13,7 +13,9 @@ class HostedGuardTests(unittest.TestCase):
                 ("true", "self-hosted", "Linux"),
                 ("true", "github-hosted", "Windows"),
             ):
-                with self.subTest(script=script, actions=actions, environment=environment, os=runner_os):
+                with self.subTest(
+                    script=script, actions=actions, environment=environment, os=runner_os
+                ):
                     self.assert_refused(script, actions, environment, runner_os)
 
     def assert_refused(self, script, actions, environment, runner_os):
