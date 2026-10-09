@@ -56,10 +56,10 @@ Some mutants cannot be caught, and that is acceptable. Record them in the PR wit
 
 * mutants of a constant expression (`MIB`, pipe sizes);
 * `<` versus `<=` where both branches produce the same result;
-* paths that need a stream of about 100 MiB or a real cloud metadata service.
+* paths that need a stream of about 100 MiB.
 
-Do not add a production hook just to catch one mutant. If code really needs an injection point (such as
-a configurable IMDS base URL), add it in its own P commit before the tests.
+Do not add a production hook just to catch one mutant. If code really needs an injection point,
+add it in its own P commit before the tests.
 
 ## Writing tests
 

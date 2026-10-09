@@ -83,9 +83,9 @@ HTTP liveness and retry behavior can be tuned with `SNAPSHOT_TO_S3_HTTP_*` varia
 ### Credentials
 
 In this order: `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` (optional `AWS_SESSION_TOKEN`); the shared
-credentials file (`AWS_SHARED_CREDENTIALS_FILE` or `~/.aws/credentials`, profile `AWS_PROFILE`); EC2
-IMDSv2 role credentials. There are no credential flags. Other provider-chain sources (SSO, ECS, web
-identity, …) are not supported.
+credentials file (`AWS_SHARED_CREDENTIALS_FILE` or `~/.aws/credentials`, profile `AWS_PROFILE`).
+Missing credentials fail immediately when the S3 client is created. There are no credential flags
+or automatic credential refresh. Other provider-chain sources (SSO, ECS, web identity, …) are not supported.
 
 ### GPG
 
