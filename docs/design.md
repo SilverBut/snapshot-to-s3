@@ -1,159 +1,91 @@
-# Design of program
+# Design
 
-## Requirements and boundaries
+## Scope
 
-This document and the linked storage and workflow documents specify the intended behavior, not the implementation
-status of each feature.
+In scope:
 
-* Back up an existing, user-selected ZFS snapshot using a raw full or incremental send.
-* Select an incremental base automatically, or send a full backup with `--force-full-snapshot`.
-* Generate an independent random key for each backup and protect it with the selected GPG public key.
-* Stream encrypted data to S3-compatible storage without application-managed plaintext temporary files.
-* Prevent participating writers from overwriting backups by following the same per-backup lock protocol.
-* Restore the required backup chain to a new target, or continue from a matching latest snapshot on an existing target.
-* Export only the selected backup's send stream to stdout, without replaying its dependencies.
+* Back up an existing ZFS filesystem snapshot as a raw full or incremental stream, with an automatically
+  selected base or `--force-full-snapshot`.
+* Encrypt each backup with its own random key, wrapped by a GPG public key.
+* Stream to S3-compatible storage with bounded memory and no temporary files, for streams up to about 4 PiB.
+* Prevent cooperating writers from overwriting each other through a per-backup lock.
+* Restore the required chain into a new or matching existing filesystem, or export one stream to stdout.
 
-A *backup* is the group of objects under one snapshot prefix. Its *source chain* follows incremental bases back to a
-full backup or a usable local base. A *committed backup* has completed the publication protocol in
-[storage.md](storage.md).
+Out of scope: creating, scheduling or pruning snapshots; retention and periodic full backups; checking
+whole remote chains at backup time; forced rollback; lock stealing; resuming an interrupted upload;
+zvols and other filesystems; loading native ZFS keys or mounting restored filesystems.
 
-Snapshot creation, scheduling, retention, periodic full backups, dependency preservation and backup inspection belong
-to external management. Backup does not prove that the remote chain can recover an empty dataset. Users also manage
-native ZFS keys, mounting and application-level checks after receiving data.
+Terms: a *backup* is the object group under one snapshot prefix ([storage.md](storage.md)). It is
+*committed* once `stream.encrypted` is published. Its *chain* follows incremental bases back to a full
+backup or a matching local snapshot.
 
-Automatic forced rollback, chain-length policies, lock stealing, cross-process upload resumption, name migration and
-additional filesystem support are not requirements of this design. Restore does not load native ZFS keys or require
-mounting the result. Raw send preserves native encryption when present; it does not add native encryption to an
-unencrypted dataset.
+## Architecture
 
-## Component layout
-
-Module names below are relative to `src/` and describe the current rebuild architecture target.
-
-### Domain and protocol model
-
-* `model.rs`: validated snapshot/dataset names, decimal GUID rules, S3 location and per-backup metadata/index
-  structures.
-* `selection.rs`: incremental-base discovery policy and candidate diagnostics.
-* `prepare.rs`: restore Prepare planning, chain validation and local/remote preconditions.
-
-### ZFS and process execution
-
-* `zfs_api.rs`: focused ZFS interface used by backup/restore workflows.
-* `zfs.rs`: Linux `zfs`/`zpool` command integration for filesystem snapshots only.
-* `process.rs`: bounded process I/O capture, child lifecycle and cancellation handling.
-
-The rebuild is filesystem-only by design; zvol/block-volume paths are rejected. No generalized dummy filesystem backend
-is part of the required architecture.
-
-#### ZFS JSON command contract
-
-Programmatic `zfs get`, `zfs list`, `zpool get` and `zpool list` require OpenZFS JSON output (`-j`, usually
-OpenZFS 2.3+). Read with `-j -p`, without `--json-int`; do not silently fall back to human-readable tables
-or legacy `-H` property parsing when a version lacks JSON support.
-
-Decode JSON directly into serde structs containing the fields the operation uses; ignore unrelated fields,
-including `output_version` and property source metadata. No custom duplicate-key validator or envelope
-version gate is needed. ZFS results contain a `datasets` map; zpool results contain a `pools` map. Each map key
-must equal its object's `name`. Dataset types are `FILESYSTEM`, `SNAPSHOT` or `VOLUME` (the application
-rejects volumes); pool type is `POOL`. Properties live under `properties[PROPERTY].value` as raw strings,
-which are decoded as strings, not numbers. Pool discovery checks `ONLINE` state/health and the exact pool property
-`user:isdev=yes` before isolated development testing; this is not a dataset property.
-
-Validate object identity, filesystem/snapshot types and required property values. Missing, null, wrongly typed
-or malformed required data and command/permission failures are explicit errors. Unused properties need not
-be present in listings. A failed existence query is not proof that a dataset is absent. Snapshot GUIDs are
-validated as positive decimal strings within the unsigned 64-bit range, without floating-point conversion;
-large GUIDs must retain every digit.
-
-`zfs diff -H` and `zfs send -nP` have separate machine-readable change-record and raw size-estimate formats;
-they do not support `-j` in OpenZFS 2.4.4. Actual send output and receive input remain binary. Commands such
-as create, set, snapshot, mount and destroy are checked by exit status and do not need JSON output.
-
-### Object-store and transfer pipeline
-
-* `store.rs`: object-store trait for HEAD/GET/PUT/list, conditional create and multipart operations.
-* `http_store.rs`: S3-compatible HTTP transport with SigV4 signing, configurable metadata header prefix, endpoint,
-  addressing mode, and signing service.
-* `transfer.rs`: lock handling, bounded multipart buffering, retries for retryable transport failures and commit checks.
-
-The object-store layer is implemented without AWS SDK dependencies. Supported credential inputs are documented in
-README; this design does not imply full AWS provider-chain parity.
-
-### Crypto and end-to-end workflows
-
-* `crypto.rs`: per-backup key generation, streaming AEAD (`AES128_GCM_HKDF_1MB`) and GPG key wrap/unwrap helpers.
-* `backup.rs`: lock acquisition, base selection, metadata publication, encrypted stream upload and commit resolution.
-* `restore.rs`: Prepare → Verification → Replay flow, including stdout export mode.
-* `rate.rs`: optional ciphertext throughput limiting in the backup pipeline.
-* `cli.rs`/`main.rs`: command-line parsing and top-level orchestration.
-
-Plaintext backup keys, metadata and stream data must remain in memory or pipes, not application-managed temporary
-files. This does not claim to control operating-system facilities such as swap or core dumps.
-
-## Resource and error handling
-
-Use bounded buffers and backpressure for data, logs, upload concurrency and retry queues; memory must not grow with
-the total stream size. Retry retained ciphertext bytes rather than re-encrypting a consumed plaintext stream.
-Multipart sizing must respect the configured service's part and object limits.
-
-Backup succeeds only when all producers and uploads succeed and the stream object is confirmed committed. Failure
-to remove the lock after commit is reported separately from failure to publish the backup.
-
-Restore succeeds only when all required streams finish authenticated decryption and `zfs receive` succeeds.
-Preparation and prefix verification do not guarantee that subsequent receive will succeed. No default second,
-full-stream verification pass is required. Authentication errors must never be treated as normal end-of-stream.
-Diagnostics and final results must be explicit; stdout export sends diagnostics to stderr.
-
-See [workflow.md](workflow.md) for the ordering of preparation, verification and replay, including early rejection by
-`zfs diff` and reporting partially completed chains.
-
-## Acceptance scenarios
-
-These are requirements for later implementation validation, not claims that tests already exist.
-
-| Scenario | Required outcome |
+| Module (`src/`) | Responsibility |
 | --- | --- |
-| Full and multi-step incremental recovery | Receive the required snapshots with matching GUIDs and data |
-| Incomplete remote chain | Warn; allow recovery from a matching local base, reject recovery to an empty target |
-| Existing target has changes, or `zfs diff` fails | Stop during Prepare, before downloading keys, metadata or stream data for Verification |
-| No matching latest local base | Reject without forced rollback |
-| Wrong parent GUID, metadata mismatch or dependency cycle | Report an error without proceeding with an invalid chain |
-| Valid prefix followed by corruption or truncation | Report decryption or receive failure, never success |
-| Send, encryption, part or log upload failure | Do not commit the stream; report cleanup and residual objects |
-| Concurrent writers or existing backup content | Only the lock holder may write; existing content is not overwritten |
-| Unknown completion result or stale lock | Report the state explicitly; do not blindly retry or steal the lock |
-| Receive fails after earlier chain steps | Stop and identify the last successfully received snapshot |
-| Stdout export | Export one stream, keep diagnostics separate, fail explicitly if the export is incomplete |
-| Small and large streams, retries and service limits | Preserve ciphertext, keep memory bounded and report exceeded limits |
+| `cli.rs`, `main.rs` | Argument parsing, wiring, signal cancellation |
+| `model.rs` | Names, object layout, `StreamIndex` / `BackupMetadata` |
+| `backup/` | Backup job and failure recovery (`mod.rs`), base selection (`selection.rs`), upload pipeline (`pipeline.rs`) |
+| `restore/` | Planning (`prepare.rs`), authentication (`verify.rs`), replay (`mod.rs`) |
+| `store/` | `ObjectStore` trait, writer lock, bounded multipart upload, chained object reads |
+| `s3/` | `ObjectStore` over HTTP: SigV4, credentials, retries, throughput guard, capability probe |
+| `crypto/` | Streaming AEAD, GPG key wrapping, key checksum |
+| `zfs/` | `Zfs` trait and its `zfs`/`zpool` command implementation |
+| `process.rs`, `rate.rs` | Bounded child-process I/O; ciphertext rate limiting |
 
-### Acceptance evidence mapping (current)
+`backup` and `restore` depend only on the `ObjectStore` and `Zfs` traits. Unit tests use in-memory fakes
+(`src/testing.rs`). The binary uses `HttpStore` and `SystemZfs`.
 
-The table below maps the normative scenarios to concrete tests/scripts. It records evidence sources, not provider-wide
-compatibility guarantees.
+### Data path and resource bounds
 
-| Scenario row | Evidence sources |
+Backup: `zfs send -w` → encryption task → 2 MiB pipe → rate limiter → 64 KiB pipe → part buffer →
+`UploadPart`. Restore: chained `GET`s (one open object at a time) → decryption task → 2 MiB pipe →
+`zfs receive -u` or stdout. Memory is thus at most one part buffer plus fixed pipes and crypto segments,
+whatever the stream size. Small objects, logs and command output are read with explicit caps. Plaintext,
+keys and metadata never touch application-managed files. Swap and core dumps are not controlled.
+
+A stream that is larger than one object continues in further objects (see
+[storage.md](storage.md#stream-objects)). With AWS limits and the default 64 MiB part buffer, each object
+holds 625 GiB, so 1 PB needs about 1,500 objects. A 512 MiB buffer gives objects of about 5 TiB.
+
+### ZFS command contract
+
+`zfs get`, `zfs list`, `zpool get` and `zpool list` are always run with `-j -p` (OpenZFS 2.3+), never
+with `--json-int` or a fallback to table output. Only the needed fields are decoded. `datasets` and
+`pools` map keys must equal each entry's `name`. Types must be `FILESYSTEM`, `SNAPSHOT` or `POOL`
+(`VOLUME` is rejected). Property values are raw strings, and GUIDs are validated as exact decimal
+`u64` values. Missing or malformed data and command or permission failures are errors. A failed query
+never counts as proof that something is absent.
+
+`zfs diff -H` and `zfs send -nP` have their own machine-readable formats (they do not support `-j`).
+Mutating commands are checked by exit status. Test harnesses can point `SNAPSHOT_TO_S3_ZFS_BIN` and
+`SNAPSHOT_TO_S3_ZPOOL_BIN` at fake commands.
+
+## Errors
+
+* Backup succeeds only if `zfs send`, encryption and every upload succeed and the commit is confirmed.
+  A failure to delete the lock after commit is reported separately.
+* Restore succeeds only if every replayed stream is fully authenticated and `zfs receive` succeeds.
+  An authentication failure is never treated as end of stream.
+* Unknown outcomes (an upload whose initiation or completion may have been applied) are reported as
+  such and keep the lock. Nothing is retried blindly.
+
+## Test coverage
+
+| Scenario | Tests |
 | --- | --- |
-| Full and multi-step incremental recovery | `tests/support/zfs_s3_e2e.sh` (full + `s1/s2/s3` replay), plus `tests/zfs_backend.rs` and `src/prepare.rs` chain planning tests |
-| Incomplete remote chain | `tests/support/zfs_s3_e2e.sh` (removed remote `s1` path: empty target reject + matching local-base continuation) and `src/prepare.rs::local_declared_base_needs_no_remote_parent` |
-| Existing target has changes, or `zfs diff` fails | `src/prepare.rs::dirty_target_stops_before_any_verification_download`, `src/prepare.rs::diff_command_failure_stops_before_verification`, and e2e dirty-target rejection in `tests/support/zfs_s3_e2e.sh` |
-| No matching latest local base | `src/prepare.rs::existing_target_without_matching_latest_is_rejected` |
-| Wrong parent GUID, metadata mismatch or dependency cycle | `src/prepare.rs::parent_mismatch_and_cycles_are_errors`, metadata/auth checks in `src/restore.rs::verify` and `tests/crypto_stream.rs` |
-| Valid prefix followed by corruption or truncation | `tests/crypto_stream.rs::authenticates_aad_segments_and_final_segment`, `tests/crypto_stream.rs::verifies_prefix_with_known_object_length` |
-| Send, encryption, part or log upload failure | `src/backup.rs::publication_failure_matrix_and_authenticated_export`, `src/transfer.rs::small_object_bound_and_cancelled_upload` |
-| Concurrent writers or existing backup content | `src/transfer.rs::only_one_writer_and_partial_content_refused`, plus opt-in real endpoint check `tests/live_http.rs::real_s3_conditions_ranges_and_multipart` |
-| Unknown completion result or stale lock | `src/transfer.rs::completion_response_loss_requires_matching_object`, `src/backup.rs::publication_failure_matrix_and_authenticated_export` |
-| Receive fails after earlier chain steps | failure-handling assertions in `src/restore.rs`/`src/prepare.rs` tests and e2e replay checks in `tests/support/zfs_s3_e2e.sh` |
-| Stdout export | `tests/support/zfs_s3_e2e.sh` stdout single-stream receive path; backup/export failure matrix in `src/backup.rs::publication_failure_matrix_and_authenticated_export` |
-| Small and large streams, retries and service limits | `src/transfer.rs::multipart_limits_and_exact_ciphertext`, `src/transfer.rs::generated_large_stream_has_fixed_buffer_budget`, `tests/zfs_rate.rs`, `tests/http_store.rs` (retry/status/range/multipart capability behavior) |
+| Full and incremental recovery, data and GUIDs | `tests/support/zfs_s3_e2e.sh`; `src/workflow_tests.rs` |
+| Multi-object streams | `src/workflow_tests.rs::multi_object_stream_round_trip`; `store::multipart` and `store::chain` tests; E2E with `--max-object-size` |
+| Incomplete remote chain | E2E (deleted `s1`); `restore::prepare::local_declared_base_needs_no_remote_parent` |
+| Changed target or failing `zfs diff` stops before downloads | `restore::prepare::{dirty_target_stops_before_any_verification_download, diff_command_failure_stops_before_verification}`; E2E |
+| No matching local base; wrong parent, metadata mismatch or cycle | `restore::prepare` tests; `workflow_tests` tampering scenario |
+| Corruption or truncation after a valid prefix | `tests/crypto_stream.rs`; `workflow_tests::corrupt_stream_tail_stops_export` |
+| Send, encryption, part, log or continuation failure | `workflow_tests` failure scenarios; `store::multipart` tests |
+| Concurrent writers, existing content | `store::lock` tests; `tests/live_http.rs` (opt-in, real S3) |
+| Unknown completion, lost completion response | `workflow_tests`; `store::multipart::completion_response_loss_requires_matching_object` |
+| Receive failure mid-chain | `workflow_tests::incremental_chain_stops_at_receive_failure_and_tampering` |
+| Bounded memory, retries, service limits | `store::multipart::generated_large_stream_has_fixed_buffer_budget`; `tests/http_store.rs`; `tests/rate_limit.rs` |
+| Tink interoperability | `tests/crypto_stream.rs` (official runtime check is opt-in) |
 
-Additional implementation evidence:
-
-* Tink interop vectors and bidirectional runtime compatibility: `tests/crypto_stream.rs`
-* Opt-in real HTTP object-store smoke coverage: `tests/live_http.rs` (requires isolated endpoint/credentials)
-* Real ZFS + local S3 end-to-end script: `tests/support/zfs_s3_e2e.sh` (safe namespace only)
-
-Provider scope note: local SeaweedFS/OpenZFS acceptance and offline tests do **not** imply live verification on AWS S3,
-MinIO, Backblaze B2, Alibaba OSS, or universal S3 compatibility. Treat each provider as unverified until separately run.
-
----
+These tests use SeaweedFS and OpenZFS. Other providers (AWS S3, MinIO, B2, …) are untested until someone
+runs `tests/live_http.rs` and the E2E script against them.

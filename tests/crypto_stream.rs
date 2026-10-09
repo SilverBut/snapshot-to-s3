@@ -119,7 +119,7 @@ async fn round_trips_empty_short_and_segment_boundaries() {
 
 #[tokio::test]
 async fn interoperates_with_independent_tink_framing_vector() {
-    let vector = hex::decode(include_str!("crypto_tink_vector.hex").trim()).unwrap();
+    let vector = hex::decode(include_str!("fixtures/tink_vector.hex").trim()).unwrap();
     let plaintext = b"Tink-compatible reference payload";
     let aad = b"tink cross-language vector";
     assert_eq!(
@@ -131,7 +131,7 @@ async fn interoperates_with_independent_tink_framing_vector() {
 
 #[tokio::test]
 async fn decrypts_ciphertext_generated_by_official_tink_python_runtime() {
-    let vector = hex::decode(include_str!("crypto_tink_runtime_vector.hex").trim()).unwrap();
+    let vector = hex::decode(include_str!("fixtures/tink_runtime_vector.hex").trim()).unwrap();
     assert_eq!(
         decrypt_bytes(&vector, b"tink cross-language vector")
             .await
@@ -159,7 +159,7 @@ async fn official_tink_runtime_bidirectional() {
     let mut child = tokio::process::Command::new(python)
         .arg(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/tests/crypto_tink_interop.py"
+            "/tests/support/tink_interop.py"
         ))
         .arg("--round-trip")
         .stdin(Stdio::piped())

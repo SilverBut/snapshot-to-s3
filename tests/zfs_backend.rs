@@ -1,8 +1,7 @@
 use anyhow::Result;
 use serde_json::{json, Value};
 use snapshot_to_s3::model::{Reader, SnapshotName};
-use snapshot_to_s3::zfs::SystemZfs;
-use snapshot_to_s3::zfs_api::Zfs;
+use snapshot_to_s3::zfs::{SystemZfs, Zfs};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -362,8 +361,8 @@ async fn candidate_invalid_returns_none() {
     configure_bins(&base);
 
     let z = SystemZfs::new();
-    let s1 = SnapshotName::parse("zfs:pool/fs@s1").unwrap();
-    let s2 = SnapshotName::parse("zfs:pool/fs@s2").unwrap();
+    let s1 = SnapshotName::parse("pool/fs@s1").unwrap();
+    let s2 = SnapshotName::parse("pool/fs@s2").unwrap();
 
     assert_eq!(z.written(&s1, &s2).await.unwrap(), None);
     assert_eq!(z.estimate(&s2, Some(&s1)).await.unwrap(), None);
@@ -376,8 +375,8 @@ async fn written_operational_errors_fail() {
     configure_bins(&base);
 
     let z = SystemZfs::new();
-    let s1 = SnapshotName::parse("zfs:pool/fs@s1").unwrap();
-    let s2 = SnapshotName::parse("zfs:pool/fs@s2").unwrap();
+    let s1 = SnapshotName::parse("pool/fs@s1").unwrap();
+    let s2 = SnapshotName::parse("pool/fs@s2").unwrap();
 
     let err = z.written(&s1, &s2).await.unwrap_err().to_string();
     assert!(err.contains("permission denied"));
@@ -402,7 +401,7 @@ async fn send_failure_truncates_stderr() {
     configure_bins(&base);
 
     let z = SystemZfs::new();
-    let s2 = SnapshotName::parse("zfs:pool/fs@s2").unwrap();
+    let s2 = SnapshotName::parse("pool/fs@s2").unwrap();
     let stream = z.send(&s2, None).await.unwrap();
     let err = stream.completion.await.unwrap().unwrap_err().to_string();
     assert!(err.contains("[stderr truncated]"));
@@ -415,7 +414,7 @@ async fn dropping_send_reader_cancels_process_after_output_started() {
     configure_bins(&base);
 
     let z = SystemZfs::new();
-    let s2 = SnapshotName::parse("zfs:pool/fs@s2").unwrap();
+    let s2 = SnapshotName::parse("pool/fs@s2").unwrap();
     let mut stream = z.send(&s2, None).await.unwrap();
 
     let mut buf = [0u8; 32];
@@ -544,7 +543,7 @@ async fn json_preserves_maximum_guid_and_numeric_properties() {
         ),
     );
     let z = SystemZfs::new();
-    let current = SnapshotName::parse("zfs:pool/fs@s2").unwrap();
+    let current = SnapshotName::parse("pool/fs@s2").unwrap();
     let info = z.snapshot(&current).await.unwrap();
     assert_eq!(info.guid, maximum);
     assert_eq!(info.volume_guid, maximum);
@@ -561,7 +560,7 @@ async fn json_preserves_maximum_guid_and_numeric_properties() {
         ),
     );
     fs::remove_file(base.join("get-snapshot.json")).unwrap();
-    let previous = SnapshotName::parse("zfs:pool/fs@s1").unwrap();
+    let previous = SnapshotName::parse("pool/fs@s1").unwrap();
     assert_eq!(
         z.written(&previous, &current).await.unwrap(),
         Some(u64::MAX)
@@ -580,7 +579,7 @@ async fn json_snapshot_rejects_invalid_documents_and_required_properties() {
         json!({"guid": property("11"), "createtxg": property("101")}),
     );
     let z = SystemZfs::new();
-    let current = SnapshotName::parse("zfs:pool/fs@s2").unwrap();
+    let current = SnapshotName::parse("pool/fs@s2").unwrap();
     for (label, value) in invalid_documents(&valid, "datasets", "pool/fs@s2") {
         write_json(&base, "get-snapshot", &value);
         assert!(z.snapshot(&current).await.is_err(), "{label} was accepted");
@@ -665,7 +664,7 @@ async fn json_filesystem_guid_requires_a_valid_decimal_string() {
     let _lock = env_lock().await;
     let base = fixture_dir("json-invalid-guid").unwrap();
     configure_bins(&base);
-    let current = SnapshotName::parse("zfs:pool/fs@s2").unwrap();
+    let current = SnapshotName::parse("pool/fs@s2").unwrap();
     let z = SystemZfs::new();
     for invalid in [
         json!({}),
@@ -688,8 +687,8 @@ async fn json_written_requires_a_valid_property_value() {
     let _lock = env_lock().await;
     let base = fixture_dir("json-invalid-written").unwrap();
     configure_bins(&base);
-    let previous = SnapshotName::parse("zfs:pool/fs@s1").unwrap();
-    let current = SnapshotName::parse("zfs:pool/fs@s2").unwrap();
+    let previous = SnapshotName::parse("pool/fs@s1").unwrap();
+    let current = SnapshotName::parse("pool/fs@s2").unwrap();
     let z = SystemZfs::new();
     for invalid in [
         json!({}),
@@ -755,7 +754,7 @@ async fn json_decoding_ignores_unused_envelope_fields() {
     let base = fixture_dir("json-unused-fields").unwrap();
     configure_bins(&base);
     let z = SystemZfs::new();
-    let current = SnapshotName::parse("zfs:pool/fs@s2").unwrap();
+    let current = SnapshotName::parse("pool/fs@s2").unwrap();
     for version in [
         None,
         Some(Value::Null),
@@ -842,8 +841,8 @@ async fn json_metadata_keeps_diff_estimates_and_streams_in_native_formats() {
     let _lock = env_lock().await;
     let base = fixture_dir("json-native-streams").unwrap();
     configure_bins(&base);
-    let previous = SnapshotName::parse("zfs:pool/fs@s1").unwrap();
-    let current = SnapshotName::parse("zfs:pool/fs@s2").unwrap();
+    let previous = SnapshotName::parse("pool/fs@s1").unwrap();
+    let current = SnapshotName::parse("pool/fs@s2").unwrap();
     let z = SystemZfs::new();
     z.check_clean(&current).await.unwrap();
     assert_eq!(z.written(&previous, &current).await.unwrap(), Some(4096));

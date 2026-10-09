@@ -52,7 +52,7 @@ PY
     trap cleanup_verify EXIT
     trap 'exit 130' INT
     trap 'exit 143' TERM
-    "$TINK_PYTHON" tests/crypto_tink_interop.py
+    "$TINK_PYTHON" tests/support/tink_interop.py
     TINK_PYTHON="$TINK_PYTHON" cargo test --locked --test crypto_stream official_tink_runtime_bidirectional -- --ignored
     cargo build --locked
     bash tests/support/local_s3.sh "$verify/s3" > "$verify/s3.log" 2>&1 &
@@ -114,7 +114,7 @@ cleanup_failed_setup() {
 }
 trap cleanup_failed_setup EXIT
 install_test_tools "$root"
-"$root/venv/bin/python" tests/crypto_tink_interop.py
+"$root/venv/bin/python" tests/support/tink_interop.py
 create_hosted_pool "$root" "$pool" 4G 4294967296
 cargo test --locked --no-run 2>&1 | tee "$root/logs/test-compile.log"
 {
