@@ -1,5 +1,5 @@
 # TEMPORARY: mutation-testing baseline for the test-refactor PR. Remove before merge.
-# rev: 1
+# rev: 2
 name: Mutants (temporary)
 
 on:
