@@ -62,7 +62,7 @@ jobs:
       - run: cargo clippy --locked --all-targets --all-features -- -D warnings
       - name: Validate CI scripts and failure gate
         run: |
-          shellcheck tests/support/ci_e2e.sh tests/support/local_s3.sh tests/support/zfs_s3_e2e.sh
+          shellcheck tests/support/ci_e2e.sh tests/support/local_s3.sh tests/support/zfs_s3_e2e.sh tests/support/hosted_environment.sh tests/support/copilot_setup.sh
           python3 -m unittest discover -s tests/support -p 'test_ci_*.py' -v
           python3 tests/support/release.py check
 
@@ -87,6 +87,12 @@ jobs:
   audit:
     name: Dependency audit
     uses: ./.github/workflows/security.yml
+
+  copilot:
+    name: Cloud agent environment handoff
+    uses: ./.github/workflows/copilot-setup-steps.yml
+    with:
+      verify_e2e: true
 
   e2e:
     name: ZFS and S3 end-to-end
@@ -126,7 +132,7 @@ jobs:
   gate:
     name: CI Gate
     if: always()
-    needs: [test, quality, release, audit, e2e]
+    needs: [test, quality, release, audit, e2e, copilot]
     runs-on: ubuntu-26.04
     timeout-minutes: 5
     steps:
