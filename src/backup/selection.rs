@@ -1,12 +1,27 @@
+//! Incremental base selection.
+//!
+//! Candidates are older snapshots of the same filesystem whose committed
+//! backup index matches their GUIDs. The four smallest by `written@` and the
+//! four newest are shortlisted, and the smallest `zfs send -nP` estimate
+//! wins (ties by name). Without a usable candidate the backup is full.
+//! Remote and ZFS operational errors fail the backup instead of silently
+//! falling back to a full stream.
+
 use crate::model::{S3Location, StreamIndex};
 use crate::store::ObjectStore;
-use crate::zfs_api::{SnapshotInfo, Zfs};
-use anyhow::Result;
+use crate::zfs::{SnapshotInfo, Zfs};
+use anyhow::{anyhow, Result};
+use std::cmp::Reverse;
 use std::collections::BTreeMap;
 
+const SHORTLIST_PER_ORDER: usize = 4;
+
 pub struct Selection {
+    /// `None` for a full stream.
     pub base: Option<SnapshotInfo>,
+    /// Plaintext send size estimate.
     pub estimate: u64,
+    /// Reasons for excluded candidates, written to the backup log.
     pub diagnostics: Vec<String>,
 }
 
@@ -20,7 +35,7 @@ pub async fn select_base(
     let full = || async {
         zfs.estimate(&current.name, None)
             .await?
-            .ok_or_else(|| anyhow::anyhow!("selected source snapshot disappeared"))
+            .ok_or_else(|| anyhow!("selected source snapshot disappeared"))
     };
     if force_full {
         return Ok(Selection {
@@ -39,35 +54,30 @@ pub async fn select_base(
         {
             continue;
         }
-        let key = format!("{}stream.encrypted", location.backup_prefix(&snapshot.name));
-        let Some(head) = store.head(&key).await? else {
+        let Some(head) = store.head(&location.stream_key(&snapshot.name)).await? else {
             continue;
         };
-        let index = StreamIndex::parse(&head.metadata)?;
+        let index = StreamIndex::from_metadata(&head.metadata)?;
         if index.current_snapshot_id != snapshot.guid || index.vol_id != current.volume_guid {
-            diagnostics.push(format!(
-                "exclude {}: remote GUID mismatch",
-                snapshot.name.full_name()
-            ));
+            diagnostics.push(format!("exclude {}: remote GUID mismatch", snapshot.name));
             continue;
         }
         match zfs.written(&snapshot.name, &current.name).await? {
             Some(written) => candidates.push((snapshot, written)),
             None => diagnostics.push(format!(
                 "exclude {}: snapshot disappeared or is no longer a send base",
-                snapshot.name.full_name()
+                snapshot.name
             )),
         }
     }
     let mut by_written: Vec<_> = candidates.iter().collect();
-    by_written
-        .sort_by_key(|(s, written)| (*written, std::cmp::Reverse(s.createtxg), s.name.full_name()));
+    by_written.sort_by_key(|(s, written)| (*written, Reverse(s.createtxg), s.name.full_name()));
     let mut by_txg: Vec<_> = candidates.iter().collect();
-    by_txg.sort_by_key(|(s, _)| (std::cmp::Reverse(s.createtxg), s.name.full_name()));
+    by_txg.sort_by_key(|(s, _)| (Reverse(s.createtxg), s.name.full_name()));
     let shortlist: BTreeMap<_, _> = by_written
         .into_iter()
-        .take(4)
-        .chain(by_txg.into_iter().take(4))
+        .take(SHORTLIST_PER_ORDER)
+        .chain(by_txg.into_iter().take(SHORTLIST_PER_ORDER))
         .map(|(s, _)| (s.name.full_name(), s))
         .collect();
     let mut estimates = Vec::new();
@@ -76,7 +86,7 @@ pub async fn select_base(
             Some(size) => estimates.push((size, snapshot.name.full_name(), (*snapshot).clone())),
             None => diagnostics.push(format!(
                 "exclude {}: estimate base disappeared or became invalid",
-                snapshot.name.full_name()
+                snapshot.name
             )),
         }
     }
@@ -98,7 +108,7 @@ pub async fn select_base(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{BackupMetadata, SnapshotName};
+    use crate::model::SnapshotName;
     use crate::testing::{FakeZfs, MemoryStore};
     use bytes::Bytes;
 
@@ -108,7 +118,7 @@ mod tests {
         let mut zfs = FakeZfs::new();
         zfs.snapshots = (1..=21)
             .map(|n| SnapshotInfo {
-                name: SnapshotName::parse(&format!("zfs:pool/data@s{n}")).unwrap(),
+                name: SnapshotName::parse(&format!("pool/data@s{n}")).unwrap(),
                 guid: (n + 100).to_string(),
                 volume_guid: "1".into(),
                 createtxg: n,
@@ -116,21 +126,19 @@ mod tests {
             .collect();
         let location = S3Location::parse("s3://b/backups").unwrap();
         for s in &zfs.snapshots {
-            let metadata = BackupMetadata {
+            let index = StreamIndex {
                 gpg_key_id: "fingerprint".into(),
                 fs_type: "zfs".into(),
                 vol_id: "1".into(),
                 current_snapshot_id: s.guid.clone(),
                 base_snapshot_id: None,
                 base_object_key: None,
-                source_dataset: s.name.dataset.clone(),
-                source_snapshot: s.name.snapshot.clone(),
             };
             store
                 .put(
-                    &format!("{}stream.encrypted", location.backup_prefix(&s.name)),
+                    &location.stream_key(&s.name),
                     Bytes::from_static(b"stream"),
-                    &metadata.index().unwrap(),
+                    &index.to_metadata().unwrap(),
                 )
                 .await
                 .unwrap();

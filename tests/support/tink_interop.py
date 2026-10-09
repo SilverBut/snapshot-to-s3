@@ -14,7 +14,7 @@ from tink.proto import aes_gcm_hkdf_streaming_pb2, common_pb2, tink_pb2
 from tink.streaming_aead import _raw_streaming_aead
 
 
-ROOT = Path(__file__).parent
+FIXTURES = Path(__file__).resolve().parent.parent / "fixtures"
 AAD = b"tink cross-language vector"
 PLAINTEXT = b"Tink-compatible reference payload"
 KEY = bytes(range(32))
@@ -43,7 +43,7 @@ def primitive():
 
 
 def decrypt_with_tink(tink_primitive, fixture: str) -> None:
-    ciphertext = bytes.fromhex((ROOT / fixture).read_text(encoding="ascii").strip())
+    ciphertext = bytes.fromhex((FIXTURES / fixture).read_text(encoding="ascii").strip())
     with tink_primitive.new_raw_decrypting_stream(
         io.BytesIO(ciphertext), AAD, close_ciphertext_source=False
     ) as plaintext:
@@ -67,8 +67,8 @@ def main() -> None:
         return
     if sys.argv[1:]:
         raise ValueError("expected no arguments or --round-trip")
-    decrypt_with_tink(tink_primitive, "crypto_tink_vector.hex")
-    decrypt_with_tink(tink_primitive, "crypto_tink_runtime_vector.hex")
+    decrypt_with_tink(tink_primitive, "tink_vector.hex")
+    decrypt_with_tink(tink_primitive, "tink_runtime_vector.hex")
 
     ciphertext = RetainedBytesIO()
     with tink_primitive.new_raw_encrypting_stream(ciphertext, AAD) as encryptor:

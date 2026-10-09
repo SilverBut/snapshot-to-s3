@@ -1,15 +1,18 @@
+//! Bounded-memory multipart upload of a stream of unknown exact length.
+
+use super::{ObjectStore, Part};
 use crate::model::{MetadataMap, Reader};
-use crate::store::{ObjectStore, Part};
 use anyhow::{bail, Context, Result};
 use bytes::Bytes;
-use rand::RngCore;
+use std::time::Duration;
 use tokio::io::AsyncReadExt;
 use tokio_util::sync::CancellationToken;
 
-pub const SMALL_OBJECT_LIMIT: usize = 4 * 1024 * 1024;
-pub const LOG_LIMIT: usize = 256 * 1024;
 const MIB: u64 = 1024 * 1024;
+/// Attempts per part, including the first, for retryable failures.
+const PART_ATTEMPTS: u64 = 3;
 
+/// Provider multipart limits and the local part-buffer budget.
 #[derive(Clone, Debug)]
 pub struct UploadLimits {
     pub min_part_size: u64,
@@ -45,6 +48,8 @@ impl UploadLimits {
         Ok(())
     }
 
+    /// Part size that fits `estimate` bytes into `max_parts`, never below
+    /// 8 MiB or `min_part_size` and never above the buffer budget.
     fn part_size(&self, estimate: u64) -> Result<usize> {
         self.validate()?;
         let required = estimate.div_ceil(u64::from(self.max_parts));
@@ -59,89 +64,16 @@ impl UploadLimits {
     }
 }
 
-pub async fn read_small(reader: Reader, limit: usize) -> Result<Vec<u8>> {
-    let mut bytes = Vec::new();
-    reader
-        .take(limit as u64 + 1)
-        .read_to_end(&mut bytes)
-        .await?;
-    if bytes.len() > limit {
-        bail!("object exceeds the {limit}-byte download limit");
-    }
-    Ok(bytes)
-}
-
-pub struct HeldLock {
-    pub key: String,
-    token: Bytes,
-}
-
-impl HeldLock {
-    pub async fn acquire(store: &dyn ObjectStore, prefix: &str) -> Result<Self> {
-        let key = format!("{prefix}.lock");
-        let mut token = [0u8; 32];
-        rand::rngs::OsRng.fill_bytes(&mut token);
-        let token = Bytes::copy_from_slice(hex::encode(token).as_bytes());
-        match store.put_if_absent(&key, token.clone()).await {
-            Ok(true) => (),
-            Ok(false) => bail!("backup lock already exists: {key}; locks are never stolen"),
-            Err(error) => {
-                let ownership = Self::read_token(store, &key).await;
-                match ownership {
-                    Ok(Some(found)) if found == token => (),
-                    _ => bail!("lock acquisition outcome is unresolved; inspect {key}; original error: {error:#}"),
-                }
-            }
-        }
-        let lock = Self { key, token };
-        // A service silently ignoring the condition must never be used for publication.
-        match store.put_if_absent(&lock.key, lock.token.clone()).await {
-            Ok(false) => Ok(lock),
-            result => {
-                let cleanup = lock.release(store).await;
-                bail!("storage does not confirm create-if-absent semantics ({result:?}); lock cleanup: {cleanup:?}");
-            }
-        }
-    }
-
-    async fn read_token(store: &dyn ObjectStore, key: &str) -> Result<Option<Bytes>> {
-        match store.head(key).await? {
-            None => Ok(None),
-            Some(head) => Ok(Some(Bytes::from(
-                read_small(store.get(key, Some(&head.etag), None).await?, 128).await?,
-            ))),
-        }
-    }
-
-    pub async fn release(&self, store: &dyn ObjectStore) -> Result<()> {
-        let found = Self::read_token(store, &self.key).await?;
-        if found.as_ref() != Some(&self.token) {
-            bail!(
-                "refusing to delete lock with absent or different ownership token: {}",
-                self.key
-            );
-        }
-        store
-            .delete(&self.key)
-            .await
-            .with_context(|| format!("release lock {}", self.key))
-    }
-
-    pub async fn ensure_empty(&self, store: &dyn ObjectStore, prefix: &str) -> Result<()> {
-        let existing = store.list(prefix).await?;
-        if let Some(key) = existing.iter().find(|key| *key != &self.key) {
-            bail!("backup prefix already contains committed or partial content: {key}");
-        }
-        Ok(())
-    }
-}
-
 pub struct UploadedParts {
     pub parts: Vec<Part>,
+    /// Total bytes uploaded.
     pub bytes: u64,
+    /// Largest part buffer allocated.
     pub peak_buffer_bytes: usize,
 }
 
+/// Uploads `reader` into an open multipart upload, holding at most one part
+/// in memory. The estimate only sizes parts; the real length may differ.
 pub async fn upload_parts(
     store: &dyn ObjectStore,
     key: &str,
@@ -152,97 +84,127 @@ pub async fn upload_parts(
     cancel: &CancellationToken,
 ) -> Result<UploadedParts> {
     let mut size = limits.part_size(estimate)?;
-    let mut parts = Vec::new();
-    let mut total = 0u64;
-    let mut peak = 0;
+    let mut uploaded = UploadedParts {
+        parts: Vec::new(),
+        bytes: 0,
+        peak_buffer_bytes: 0,
+    };
     loop {
         if cancel.is_cancelled() {
             bail!("backup cancelled");
         }
-        if parts.len() >= limits.max_parts as usize {
-            let mut byte = [0u8; 1];
-            let n = tokio::select! {
-                biased;
-                _ = cancel.cancelled() => bail!("backup cancelled"),
-                result = reader.read(&mut byte) => result?,
-            };
-            if n != 0 {
-                bail!(
-                    "multipart part-count limit exceeded; incomplete stream will not be committed"
-                );
-            }
+        if uploaded.parts.len() >= limits.max_parts as usize {
+            ensure_exhausted(reader, cancel).await?;
             break;
         }
-        if parts.len() > limits.max_parts as usize / 2 {
+        if uploaded.parts.len() > limits.max_parts as usize / 2 {
+            // Grow late parts so a stream larger than its estimate still fits.
             size = size
                 .saturating_mul(2)
                 .min(limits.buffer_limit as usize)
                 .min(limits.max_part_size as usize);
         }
-        let mut buffer = vec![0u8; size];
-        peak = peak.max(buffer.len());
-        let mut filled = 0;
-        while filled < size {
-            let n = tokio::select! {
-                biased;
-                _ = cancel.cancelled() => bail!("backup cancelled"),
-                result = reader.read(&mut buffer[filled..]) => result.context("read encrypted stream")?,
-            };
-            if n == 0 {
-                break;
-            }
-            filled += n;
-            total = total
-                .checked_add(n as u64)
-                .context("ciphertext length overflow")?;
-            if total > limits.max_object_size {
-                bail!("multipart object-size limit exceeded");
-            }
-        }
-        if filled == 0 {
+        uploaded.peak_buffer_bytes = uploaded.peak_buffer_bytes.max(size);
+        let buffer = read_part(reader, size, &mut uploaded.bytes, limits, cancel).await?;
+        if buffer.is_empty() {
             break;
         }
-        buffer.truncate(filled);
-        let bytes = Bytes::from(buffer);
-        let number = u32::try_from(parts.len() + 1)?;
-        let mut attempt = 0;
-        let etag = loop {
-            if cancel.is_cancelled() {
-                bail!("backup cancelled before part upload");
-            }
-            attempt += 1;
-            match store.upload_part(key, upload, number, bytes.clone()).await {
-                Ok(etag) => break etag,
-                Err(error) if attempt < 3 && crate::http_store::is_retryable(&error) => {
-                    tokio::select! {
-                        _ = cancel.cancelled() => bail!("backup cancelled during part retry"),
-                        _ = tokio::time::sleep(std::time::Duration::from_millis(100 * attempt)) => (),
-                    }
-                }
-                Err(error) => {
-                    return Err(error)
-                        .with_context(|| format!("upload part {number}, attempt {attempt}"))
-                }
-            }
-        };
-        if etag.is_empty() {
-            bail!("part {number} has no ETag");
-        }
-        parts.push(Part { number, etag });
-        if filled < size {
+        let last = buffer.len() < size;
+        let number = u32::try_from(uploaded.parts.len() + 1)?;
+        let etag = upload_part(store, key, upload, number, Bytes::from(buffer), cancel).await?;
+        uploaded.parts.push(Part { number, etag });
+        if last {
             break;
         }
     }
-    if parts.is_empty() {
+    if uploaded.parts.is_empty() {
         bail!("encrypted stream unexpectedly empty");
     }
-    Ok(UploadedParts {
-        parts,
-        bytes: total,
-        peak_buffer_bytes: peak,
-    })
+    Ok(uploaded)
 }
 
+/// Fills up to `size` bytes; a shorter result means end of stream.
+async fn read_part(
+    reader: &mut Reader,
+    size: usize,
+    total: &mut u64,
+    limits: &UploadLimits,
+    cancel: &CancellationToken,
+) -> Result<Vec<u8>> {
+    let mut buffer = vec![0u8; size];
+    let mut filled = 0;
+    while filled < size {
+        let n = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => bail!("backup cancelled"),
+            result = reader.read(&mut buffer[filled..]) => {
+                result.context("read encrypted stream")?
+            }
+        };
+        if n == 0 {
+            break;
+        }
+        filled += n;
+        *total = total
+            .checked_add(n as u64)
+            .context("ciphertext length overflow")?;
+        if *total > limits.max_object_size {
+            bail!("multipart object-size limit exceeded");
+        }
+    }
+    buffer.truncate(filled);
+    Ok(buffer)
+}
+
+async fn ensure_exhausted(reader: &mut Reader, cancel: &CancellationToken) -> Result<()> {
+    let mut byte = [0u8; 1];
+    let n = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => bail!("backup cancelled"),
+        result = reader.read(&mut byte) => result?,
+    };
+    if n != 0 {
+        bail!("multipart part-count limit exceeded; incomplete stream will not be committed");
+    }
+    Ok(())
+}
+
+async fn upload_part(
+    store: &dyn ObjectStore,
+    key: &str,
+    upload: &str,
+    number: u32,
+    bytes: Bytes,
+    cancel: &CancellationToken,
+) -> Result<String> {
+    let mut attempt = 0;
+    let etag = loop {
+        if cancel.is_cancelled() {
+            bail!("backup cancelled before part upload");
+        }
+        attempt += 1;
+        match store.upload_part(key, upload, number, bytes.clone()).await {
+            Ok(etag) => break etag,
+            Err(error) if attempt < PART_ATTEMPTS && store.is_retryable(&error) => {
+                tokio::select! {
+                    _ = cancel.cancelled() => bail!("backup cancelled during part retry"),
+                    _ = tokio::time::sleep(Duration::from_millis(100 * attempt)) => (),
+                }
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("upload part {number}, attempt {attempt}"))
+            }
+        }
+    };
+    if etag.is_empty() {
+        bail!("part {number} has no ETag");
+    }
+    Ok(etag)
+}
+
+/// Whether the published object matches the upload: `Ok(false)` if absent,
+/// an error if present with different metadata or length.
 pub async fn confirm_commit(
     store: &dyn ObjectStore,
     key: &str,
@@ -259,30 +221,8 @@ pub async fn confirm_commit(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::read_small;
     use crate::testing::MemoryStore;
-    use std::sync::Arc;
-
-    #[tokio::test]
-    async fn only_one_writer_and_partial_content_refused() {
-        let store = Arc::new(MemoryStore::default());
-        let (a, b) = tokio::join!(
-            HeldLock::acquire(store.as_ref(), "backup/"),
-            HeldLock::acquire(store.as_ref(), "backup/")
-        );
-        assert_ne!(a.is_ok(), b.is_ok());
-        let lock = a.or(b).unwrap();
-        store
-            .put(
-                "backup/key.gpg",
-                Bytes::from_static(b"partial"),
-                &MetadataMap::new(),
-            )
-            .await
-            .unwrap();
-        assert!(lock.ensure_empty(store.as_ref(), "backup/").await.is_err());
-        lock.release(store.as_ref()).await.unwrap();
-        assert!(store.head("backup/key.gpg").await.unwrap().is_some());
-    }
 
     #[tokio::test]
     async fn multipart_limits_and_exact_ciphertext() {

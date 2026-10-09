@@ -100,7 +100,7 @@ trap 'exit 143' TERM
 
 create_hosted_pool "$root" "$pool" 2G "$E2E_MIN_FREE_BYTES"
 install_test_tools "$root"
-"$root/venv/bin/python" tests/crypto_tink_interop.py \
+"$root/venv/bin/python" tests/support/tink_interop.py \
     2>&1 | tee "$root/logs/tink-interop.log"
 TINK_PYTHON="$root/venv/bin/python" \
     cargo test --locked --test crypto_stream official_tink_runtime_bidirectional -- --ignored \
