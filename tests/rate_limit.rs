@@ -1,31 +1,5 @@
 use snapshot_to_s3::rate;
-use std::pin::Pin;
-use std::task::{Context, Poll};
-use tokio::io::{AsyncWrite, AsyncWriteExt};
-
-#[derive(Default)]
-struct VecWriter {
-    bytes: Vec<u8>,
-}
-
-impl AsyncWrite for VecWriter {
-    fn poll_write(
-        mut self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<std::io::Result<usize>> {
-        self.bytes.extend_from_slice(buf);
-        Poll::Ready(Ok(buf.len()))
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Poll::Ready(Ok(()))
-    }
-
-    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Poll::Ready(Ok(()))
-    }
-}
+use tokio::io::AsyncWriteExt;
 
 #[tokio::test]
 async fn rejects_zero_limit() {
@@ -33,7 +7,7 @@ async fn rejects_zero_limit() {
     tx.write_all(b"a").await.unwrap();
     tx.shutdown().await.unwrap();
 
-    let mut out = VecWriter::default();
+    let mut out = Vec::new();
     let err = rate::copy_limited(&mut rx, &mut out, Some(0))
         .await
         .unwrap_err()
@@ -50,11 +24,11 @@ async fn rate_limit_waits_for_elapsed_schedule() {
     });
 
     let task = tokio::spawn(async move {
-        let mut out = VecWriter::default();
+        let mut out = Vec::new();
         let copied = rate::copy_limited(&mut rx, &mut out, Some(2))
             .await
             .unwrap();
-        (copied, out.bytes)
+        (copied, out)
     });
 
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
