@@ -69,8 +69,24 @@ impl HeldLock {
 
     /// Fails if `prefix` contains anything besides this lock.
     pub async fn ensure_empty(&self, store: &dyn ObjectStore, prefix: &str) -> Result<()> {
+        Self::ensure_prefix_empty_except(store, prefix, Some(&self.key)).await
+    }
+
+    /// Fails if `prefix` already contains any object.
+    pub async fn ensure_prefix_empty(store: &dyn ObjectStore, prefix: &str) -> Result<()> {
+        Self::ensure_prefix_empty_except(store, prefix, None).await
+    }
+
+    async fn ensure_prefix_empty_except(
+        store: &dyn ObjectStore,
+        prefix: &str,
+        allowed_key: Option<&str>,
+    ) -> Result<()> {
         let existing = store.list(prefix).await?;
-        if let Some(key) = existing.iter().find(|key| *key != &self.key) {
+        if let Some(key) = existing
+            .iter()
+            .find(|key| Some(key.as_str()) != allowed_key)
+        {
             bail!("backup prefix already contains committed or partial content: {key}");
         }
         Ok(())

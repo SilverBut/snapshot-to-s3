@@ -6,7 +6,7 @@ use anyhow::Result;
 use bytes::Bytes;
 use snapshot_to_s3::{
     model::MetadataMap,
-    s3::{is_retryable, HttpStore},
+    s3::{is_retryable, HttpStore, LockDetectionMode},
     store::ObjectStore,
 };
 use tokio::{
@@ -393,6 +393,89 @@ async fn capability_probe_names_an_ignored_successful_conditional_put() -> Resul
     let error = store.probe_capabilities("backup").await.unwrap_err();
     assert!(format!("{error:#}").contains("ignored If-None-Match: *"));
     assert_eq!(split_captured_requests(&server.await?).len(), 3);
+    Ok(())
+}
+
+#[tokio::test]
+async fn cos_forbid_overwrite_is_create_if_absent_and_signed() -> Result<()> {
+    let _env = EnvGuard::new();
+    let body =
+        "<Error><Code>FileAlreadyExists</Code><Message>File already exists.</Message></Error>";
+    let (endpoint, server) = fixture_sequence(vec![
+        "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into(),
+        format!(
+            "HTTP/1.1 409 Conflict\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        ),
+    ])
+    .await?;
+    let store = HttpStore::new(config(endpoint))
+        .await?
+        .with_lock_detection_mode(LockDetectionMode::XCosForbidOverwrite);
+    assert!(store.put_if_absent("lock", Bytes::new()).await?);
+    assert!(!store.put_if_absent("lock", Bytes::new()).await?);
+
+    for (head, body) in split_captured_requests(&server.await?) {
+        assert!(head.starts_with("PUT "));
+        assert!(head.contains("x-cos-forbid-overwrite: true"));
+        assert!(!head.contains("if-none-match:"));
+        verify_wire_signature(&format!("{head}\r\n\r\n"), "fixture-secret");
+        assert!(body.is_empty());
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn cos_capability_probe_rejects_ignored_forbid_overwrite_header() -> Result<()> {
+    let _env = EnvGuard::new();
+    let (endpoint, server) = fixture_sequence(vec![
+        "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into(),
+        "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into(),
+        "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into(),
+    ])
+    .await?;
+    let store = HttpStore::new(config(endpoint))
+        .await?
+        .with_lock_detection_mode(LockDetectionMode::XCosForbidOverwrite);
+    let error = store.probe_capabilities("backup").await.unwrap_err();
+    assert!(format!("{error:#}").contains("ignored x-cos-forbid-overwrite: true"));
+
+    let requests = split_captured_requests(&server.await?);
+    assert_eq!(requests.len(), 3);
+    for (head, body) in requests.iter().take(2) {
+        assert!(head.starts_with("PUT "));
+        assert!(head.contains("x-cos-forbid-overwrite: true"));
+        assert!(!head.contains("if-none-match:"));
+        verify_wire_signature(&format!("{head}\r\n\r\n"), "fixture-secret");
+        assert!(body.is_empty());
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn dangerously_skip_probe_checks_metadata_without_conditional_puts() -> Result<()> {
+    let _env = EnvGuard::new();
+    let (endpoint, server) = fixture_sequence(vec![
+        "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into(),
+        "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nETag: \"probe\"\r\nConnection: close\r\n\r\n"
+            .into(),
+        "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into(),
+    ])
+    .await?;
+    let store = HttpStore::new(config(endpoint))
+        .await?
+        .with_lock_detection_mode(LockDetectionMode::DangerouslySkip);
+    let error = store
+        .probe_metadata_capability("backup")
+        .await
+        .expect_err("the fixture omits the probed user metadata");
+    assert!(format!("{error:#}").contains("did not preserve configured metadata"));
+
+    let requests = split_captured_requests(&server.await?);
+    assert_eq!(requests.len(), 3);
+    assert!(requests[0].0.starts_with("PUT "));
+    assert!(!requests[0].0.contains("if-none-match:"));
+    assert!(!requests[0].0.contains("x-cos-forbid-overwrite:"));
     Ok(())
 }
 

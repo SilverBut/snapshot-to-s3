@@ -1,9 +1,9 @@
 //! Command-line interface.
 
-use crate::backup::{backup, BackupOptions};
+use crate::backup::{backup, backup_without_lock, BackupOptions};
 use crate::model::{validate_dataset, S3Location, SnapshotName};
 use crate::restore::{restore, RestoreOptions};
-use crate::s3::{HttpConfig, HttpStore};
+use crate::s3::{HttpConfig, HttpStore, LockDetectionMode};
 use crate::store::UploadLimits;
 use crate::zfs::SystemZfs;
 use anyhow::{bail, Context, Result};
@@ -43,6 +43,9 @@ struct BackupArgs {
     /// Send a full stream without looking for an incremental base
     #[arg(long)]
     force_full_snapshot: bool,
+    /// Backup lock strategy; dangerously-skip disables locking and permits writer races
+    #[arg(long, value_enum, default_value_t = LockDetectionMode::IfNoneMatch)]
+    lock_detection_mode: LockDetectionMode,
     /// Ciphertext bytes per second through the backup pipeline
     #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
     rate_limit: Option<u64>,
@@ -147,7 +150,11 @@ impl PartArgs {
 }
 
 impl StorageArgs {
-    async fn store(self, bucket: String) -> Result<HttpStore> {
+    async fn store(
+        self,
+        bucket: String,
+        lock_detection_mode: LockDetectionMode,
+    ) -> Result<HttpStore> {
         let path_style = self.path_style || (self.endpoint.is_some() && !self.virtual_hosted_style);
         HttpStore::new(HttpConfig {
             bucket,
@@ -161,6 +168,7 @@ impl StorageArgs {
             path_style,
         })
         .await
+        .map(|store| store.with_lock_detection_mode(lock_detection_mode))
     }
 }
 
@@ -185,8 +193,16 @@ async fn run_backup(
     let limits = args.parts.limits();
     limits.validate()?;
     let location = args.destination;
-    let store = Arc::new(args.storage.store(location.bucket.clone()).await?);
-    store.probe_capabilities(&location.prefix).await?;
+    let store = Arc::new(
+        args.storage
+            .store(location.bucket.clone(), args.lock_detection_mode)
+            .await?,
+    );
+    if args.lock_detection_mode == LockDetectionMode::DangerouslySkip {
+        store.probe_metadata_capability(&location.prefix).await?;
+    } else {
+        store.probe_capabilities(&location.prefix).await?;
+    }
     let options = BackupOptions {
         source: args.source,
         location,
@@ -196,7 +212,11 @@ async fn run_backup(
         limits,
         cancel,
     };
-    let result = backup(store, zfs, options).await?;
+    let result = if args.lock_detection_mode == LockDetectionMode::DangerouslySkip {
+        backup_without_lock(store, zfs, options).await?
+    } else {
+        backup(store, zfs, options).await?
+    };
     eprintln!(
         "backup committed: {} (snapshot GUID {}, {} ciphertext bytes in {} object{})",
         result.stream_key,
@@ -226,7 +246,11 @@ async fn run_restore(
         }
     };
     let location = args.source;
-    let store = Arc::new(args.storage.store(location.bucket.clone()).await?);
+    let store = Arc::new(
+        args.storage
+            .store(location.bucket.clone(), LockDetectionMode::default())
+            .await?,
+    );
     let options = RestoreOptions {
         location,
         source,
@@ -353,6 +377,69 @@ mod tests {
             "zfs:pool/data@s1"
         ]));
         assert!(!parses(&["restore", "s3://bucket/backups", "pool/data@s1"]));
+    }
+
+    #[test]
+    fn lock_detection_mode_defaults_and_accepts_cos_mode_only_for_backup() {
+        let backup = [
+            "snapshot-to-s3",
+            "backup",
+            "zfs:pool/data@s1",
+            "s3://bucket/backups",
+            "--gpg-key-id",
+            "recipient",
+        ];
+        let default = Cli::try_parse_from(backup).unwrap();
+        let Command::Backup(args) = default.command else {
+            panic!("expected backup command");
+        };
+        assert!(matches!(
+            args.lock_detection_mode,
+            LockDetectionMode::IfNoneMatch
+        ));
+
+        let cos_mode = Cli::try_parse_from(
+            [
+                &backup[..],
+                &["--lock-detection-mode", "x-cos-forbid-overwrite"],
+            ]
+            .concat(),
+        )
+        .unwrap();
+        let Command::Backup(args) = cos_mode.command else {
+            panic!("expected backup command");
+        };
+        assert!(matches!(
+            args.lock_detection_mode,
+            LockDetectionMode::XCosForbidOverwrite
+        ));
+        let dangerous_skip = Cli::try_parse_from(
+            [&backup[..], &["--lock-detection-mode", "dangerously-skip"]].concat(),
+        )
+        .unwrap();
+        let Command::Backup(args) = dangerous_skip.command else {
+            panic!("expected backup command");
+        };
+        assert!(matches!(
+            args.lock_detection_mode,
+            LockDetectionMode::DangerouslySkip
+        ));
+        assert!(!parses(&[
+            "backup",
+            "zfs:pool/data@s1",
+            "s3://bucket/backups",
+            "--gpg-key-id",
+            "recipient",
+            "--lock-detection-mode",
+            "unsupported"
+        ]));
+        assert!(!parses(&[
+            "restore",
+            "s3://bucket/backups",
+            "stdout:pool/data@s1",
+            "--lock-detection-mode",
+            "x-cos-forbid-overwrite"
+        ]));
     }
 
     #[test]

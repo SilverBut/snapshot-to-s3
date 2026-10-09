@@ -50,11 +50,33 @@ pub async fn backup(
     zfs: Arc<dyn Zfs>,
     options: BackupOptions,
 ) -> Result<BackupResult> {
+    backup_with_lock(store, zfs, options, true).await
+}
+
+/// Runs a backup without a writer lock. The caller must prevent concurrent writers.
+pub async fn backup_without_lock(
+    store: Arc<dyn ObjectStore>,
+    zfs: Arc<dyn Zfs>,
+    options: BackupOptions,
+) -> Result<BackupResult> {
+    backup_with_lock(store, zfs, options, false).await
+}
+
+async fn backup_with_lock(
+    store: Arc<dyn ObjectStore>,
+    zfs: Arc<dyn Zfs>,
+    options: BackupOptions,
+    locking_enabled: bool,
+) -> Result<BackupResult> {
     options.limits.validate()?;
     ensure!(options.rate_limit != Some(0), "rate limit must be positive");
     let current = zfs.snapshot(&options.source).await?;
     let prefix = options.location.backup_prefix(&options.source);
-    let lock = HeldLock::acquire(store.as_ref(), &prefix).await?;
+    let lock = if locking_enabled {
+        Some(HeldLock::acquire(store.as_ref(), &prefix).await?)
+    } else {
+        None
+    };
     let mut job = Job {
         store: store.as_ref(),
         options: &options,
@@ -62,15 +84,18 @@ pub async fn backup(
         prefix,
         upload: Upload::NotStarted,
     };
-    match job.run(zfs.as_ref(), &lock, &current).await {
-        Ok(result) => match lock.release(job.store).await {
-            Ok(()) => Ok(result),
-            Err(error) => bail!(
-                "backup committed, lock cleanup failed: {}: {error:#}",
-                result.stream_key
-            ),
+    match job.run(zfs.as_ref(), lock.as_ref(), &current).await {
+        Ok(result) => match lock.as_ref() {
+            Some(lock) => match lock.release(job.store).await {
+                Ok(()) => Ok(result),
+                Err(error) => bail!(
+                    "backup committed, lock cleanup failed: {}: {error:#}",
+                    result.stream_key
+                ),
+            },
+            None => Ok(result),
         },
-        Err(error) => Err(job.recover(&lock, error).await),
+        Err(error) => Err(job.recover(lock.as_ref(), error).await),
     }
 }
 
@@ -108,11 +133,14 @@ impl Job<'_> {
     async fn run(
         &mut self,
         zfs: &dyn Zfs,
-        lock: &HeldLock,
+        lock: Option<&HeldLock>,
         current: &SnapshotInfo,
     ) -> Result<BackupResult> {
         let options = self.options;
-        lock.ensure_empty(self.store, &self.prefix).await?;
+        match lock {
+            Some(lock) => lock.ensure_empty(self.store, &self.prefix).await?,
+            None => HeldLock::ensure_prefix_empty(self.store, &self.prefix).await?,
+        }
         let selected = select_base(
             self.store,
             zfs,
@@ -171,7 +199,7 @@ impl Job<'_> {
             crypto::encrypt_small(&key, log.as_bytes()).await?,
         )
         .await?;
-        self.complete(upload_id, &index, &stream.head).await?;
+        self.complete(upload_id, &index, &stream.head, lock).await?;
         Ok(BackupResult {
             stream_key: self.stream_key.clone(),
             snapshot_guid: current.guid.clone(),
@@ -209,6 +237,7 @@ impl Job<'_> {
         upload_id: String,
         index: &MetadataMap,
         parts: &UploadedParts,
+        lock: Option<&HeldLock>,
     ) -> Result<()> {
         self.upload = Upload::CompletionUnknown(upload_id.clone());
         let completed = self
@@ -237,31 +266,33 @@ impl Job<'_> {
                 Err(error).context("multipart completion was definitively rejected")
             }
             Ok(false) => bail!(
-                "commit outcome unknown: stream absent after completion; lock retained; \
-                 completion={completed:?}"
+                "commit outcome unknown: stream absent after completion; {}; \
+                 completion={completed:?}",
+                completion_lock_status(lock)
             ),
             Err(error) => bail!(
-                "commit outcome unresolved; lock retained; completion={completed:?}; \
-                 confirmation={error:#}"
+                "commit outcome unresolved; {}; completion={completed:?}; \
+                 confirmation={error:#}",
+                completion_lock_status(lock)
             ),
         }
     }
 
     /// Aborts an open upload and releases the lock when no upload can still
     /// publish the stream; otherwise keeps the lock for manual recovery.
-    async fn recover(&self, lock: &HeldLock, error: Error) -> Error {
+    async fn recover(&self, lock: Option<&HeldLock>, error: Error) -> Error {
         let upload_id = self.upload.id();
+        let lock_status = lock_status(lock);
         let stopped = match &self.upload {
             Upload::CompletionUnknown(_) => {
                 return anyhow::anyhow!(
-                    "{error:#}; outcome unknown, retaining lock {}; upload-id={upload_id:?}",
-                    lock.key
+                    "{error:#}; outcome unknown, {lock_status}; upload-id={upload_id:?}"
                 );
             }
             Upload::Open(id) => match self.store.abort_upload(&self.stream_key, id).await {
                 Ok(()) => true,
                 Err(cleanup) => {
-                    eprintln!("multipart abort failed; lock retained: {cleanup:#}");
+                    eprintln!("multipart abort failed; {lock_status}: {cleanup:#}");
                     false
                 }
             },
@@ -274,14 +305,30 @@ impl Job<'_> {
         }
         if !stopped {
             return anyhow::anyhow!(
-                "{error:#}; upload shutdown unresolved, retaining lock {}; upload-id={upload_id:?}",
-                lock.key
+                "{error:#}; upload shutdown unresolved, {lock_status}; \
+                 upload-id={upload_id:?}"
             );
         }
-        match lock.release(self.store).await {
-            Ok(()) => error,
-            Err(cleanup) => anyhow::anyhow!("{error:#}; lock cleanup failed: {cleanup:#}"),
+        match lock {
+            Some(lock) => match lock.release(self.store).await {
+                Ok(()) => error,
+                Err(cleanup) => anyhow::anyhow!("{error:#}; lock cleanup failed: {cleanup:#}"),
+            },
+            None => error,
         }
+    }
+}
+
+fn lock_status(lock: Option<&HeldLock>) -> String {
+    lock.map(|lock| format!("retaining lock {}", lock.key))
+        .unwrap_or_else(|| "no lock was held".into())
+}
+
+fn completion_lock_status(lock: Option<&HeldLock>) -> &'static str {
+    if lock.is_some() {
+        "lock retained"
+    } else {
+        "no lock was held"
     }
 }
 

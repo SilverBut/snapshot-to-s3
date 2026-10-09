@@ -95,13 +95,20 @@ The selector is resolved to a full fingerprint, which is stored with the backup.
 
 ### Bucket permissions
 
-`s3:PutObject` (objects, multipart uploads and the conditional lock), `s3:GetObject`, `s3:ListBucket`,
-`s3:AbortMultipartUpload`, and `s3:DeleteObject` for lock objects (`*/.lock`). Removing partial backups
-is a manual operator task.
+`s3:PutObject` (objects and, unless locking is disabled, the conditional lock), `s3:GetObject`,
+`s3:ListBucket`, `s3:AbortMultipartUpload`, and `s3:DeleteObject` for lock objects (`*/.lock`).
+Removing partial backups is a manual operator task.
 
-The service must support `If-None-Match: *` on PUT and preserve user metadata. Each backup checks both
-with a probe object under `<prefix>/.snapshot-to-s3-probes/` and deletes it afterwards. A lifecycle rule
-that aborts incomplete multipart uploads is recommended.
+When locking is enabled, the service must support conditional create on PUT and preserve user metadata.
+By default, locks use `If-None-Match: *`; for Tencent COS,
+`--lock-detection-mode x-cos-forbid-overwrite` selects COS's `x-cos-forbid-overwrite: true` header
+(not effective on versioning-enabled buckets). Each backup checks the selected lock mode and metadata
+with a probe object under `<prefix>/.snapshot-to-s3-probes/` and deletes it afterwards. A lifecycle
+rule that aborts incomplete multipart uploads is recommended.
+
+`--lock-detection-mode dangerously-skip` disables the lock and its capability probe; it is unsafe if
+another writer can back up the same prefix concurrently. Metadata probing and the empty-prefix check
+still run.
 
 ## Limits and resource use
 
