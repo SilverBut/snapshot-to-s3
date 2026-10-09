@@ -1,5 +1,7 @@
 import json
+import re
 import unittest
+from pathlib import Path
 
 from scripts.ci.gate import REQUIRED_JOBS, failures
 
@@ -41,6 +43,14 @@ class GateTests(unittest.TestCase):
             jobs["e2e"] = invalid
             with self.subTest(result=invalid), self.assertRaises(ValueError):
                 failures(json.dumps(jobs))
+
+    def test_required_jobs_match_the_gate_job_needs(self):
+        workflow = Path(__file__).resolve().parents[2] / ".github/workflows/ci.yml"
+        gate = re.search(
+            r"(?m)^  gate:\n(?:    .*\n)*?    needs: \[([^\]]*)\]", workflow.read_text()
+        )
+        self.assertIsNotNone(gate, "ci.yml has no gate job with an inline needs list")
+        self.assertEqual({job.strip() for job in gate[1].split(",")}, set(REQUIRED_JOBS))
 
 
 if __name__ == "__main__":
