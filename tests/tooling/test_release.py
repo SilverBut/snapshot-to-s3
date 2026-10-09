@@ -1,19 +1,21 @@
 import hashlib
 import json
 import os
-from pathlib import Path
 import subprocess
 import tempfile
 import tomllib
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
-from scripts.release import publish as publish_release
 from scripts.release import prepare as release
+from scripts.release import publish as publish_release
 
-
-MANIFEST = '[package]\nname = "fixture"\nversion = "0.1.0" # preserve comment\n\n[dependencies]\nbytes = "1"\n'
-LOCK = '''# Keep formatting
+MANIFEST = (
+    '[package]\nname = "fixture"\nversion = "0.1.0" # preserve comment\n\n'
+    '[dependencies]\nbytes = "1"\n'
+)
+LOCK = """# Keep formatting
 version = 4
 
 [[package]]
@@ -26,7 +28,7 @@ checksum = "unchanged"
 name = "fixture"
 version = "0.1.0"
 dependencies = ["bytes"]
-'''
+"""
 
 
 class ReleaseTests(unittest.TestCase):
@@ -89,9 +91,15 @@ class ReleaseTests(unittest.TestCase):
             self.fixture(root)
             path = root / release.PLAN_PATH
             path.parent.mkdir()
-            path.write_text(json.dumps({
-                "version": "0.1.0", "previous_tag": None, "prepared_from": "a" * 40,
-            }))
+            path.write_text(
+                json.dumps(
+                    {
+                        "version": "0.1.0",
+                        "previous_tag": None,
+                        "prepared_from": "a" * 40,
+                    }
+                )
+            )
             notes = release.prepare_notes("", "0.1.0").replace(
                 release.NOTES_MARKER, "- Maintainer reviewed the release."
             )
@@ -102,8 +110,15 @@ class ReleaseTests(unittest.TestCase):
                 release.check_plan(root)
 
     def test_green_gate_uses_exact_sha_and_rejects_newer_failure(self):
-        gates = [{"id": 1, "name": "CI Gate", "app": {"id": 15368},
-                  "status": "completed", "conclusion": "success"}]
+        gates = [
+            {
+                "id": 1,
+                "name": "CI Gate",
+                "app": {"id": 15368},
+                "status": "completed",
+                "conclusion": "success",
+            }
+        ]
         with patch.object(publish_release, "api", return_value={"check_runs": gates}) as api:
             publish_release.require_green("fixture/repo", Path("."), "a" * 40)
             self.assertIn("a" * 40, api.call_args.args[0])
@@ -114,7 +129,9 @@ class ReleaseTests(unittest.TestCase):
     def test_tag_mismatch_never_overwrites(self):
         ref = {"ref": "refs/tags/v0.1.0", "object": {"type": "commit", "sha": "a" * 40}}
         with patch.object(publish_release, "api", return_value=[ref]):
-            self.assertTrue(publish_release.verify_tag("fixture/repo", Path("."), "v0.1.0", "a" * 40))
+            self.assertTrue(
+                publish_release.verify_tag("fixture/repo", Path("."), "v0.1.0", "a" * 40)
+            )
             with self.assertRaises(ValueError):
                 publish_release.verify_tag("fixture/repo", Path("."), "v0.1.0", "b" * 40)
 
@@ -124,7 +141,9 @@ class ReleaseTests(unittest.TestCase):
             archive = root / "snapshot-to-s3-linux-x86_64.tar.gz"
             archive.write_bytes(b"fixture archive")
             checksum = root / "SHA256SUMS"
-            checksum.write_text(f"{hashlib.sha256(archive.read_bytes()).hexdigest()}  {archive.name}\n")
+            checksum.write_text(
+                f"{hashlib.sha256(archive.read_bytes()).hexdigest()}  {archive.name}\n"
+            )
             publish_release.verify_assets(root)
             archive.write_bytes(b"damaged")
             with self.assertRaises(ValueError):
@@ -133,15 +152,19 @@ class ReleaseTests(unittest.TestCase):
     def test_publish_is_manual_and_main_only(self):
         with self.assertRaises(SystemExit), patch("sys.argv", ["x", "select", "--mode", "auto"]):
             publish_release.main()
-        workflow = (Path(__file__).resolve().parents[2] / ".github/workflows/release.yml").read_text()
+        workflow = (
+            Path(__file__).resolve().parents[2] / ".github/workflows/release.yml"
+        ).read_text()
         triggers = workflow.split("\non:\n", 1)[1].split("\npermissions:", 1)[0]
         self.assertIn("workflow_dispatch", triggers)
         for automatic in ("workflow_run", "push", "pull_request", "schedule"):
             self.assertNotIn(automatic, triggers)
         env = {"GITHUB_REPOSITORY": "fixture/repo", "GITHUB_REF": "refs/heads/feature"}
-        with patch.dict(os.environ, env), patch.object(
-            publish_release, "api", return_value={"default_branch": "main"}
-        ), patch.object(publish_release, "output") as output:
+        with (
+            patch.dict(os.environ, env),
+            patch.object(publish_release, "api", return_value={"default_branch": "main"}),
+            patch.object(publish_release, "output") as output,
+        ):
             with self.assertRaises(ValueError):
                 publish_release.select(Path.cwd(), "publish", "")
             output.assert_not_called()
@@ -153,35 +176,54 @@ class ReleaseTests(unittest.TestCase):
                 archive = root / "snapshot-to-s3-linux-x86_64.tar.gz"
                 archive.write_bytes(b"verified fixture")
                 sums = root / "SHA256SUMS"
-                sums.write_text(f"{hashlib.sha256(archive.read_bytes()).hexdigest()}  {archive.name}\n")
+                sums.write_text(
+                    f"{hashlib.sha256(archive.read_bytes()).hexdigest()}  {archive.name}\n"
+                )
                 assets = [
-                    {"name": p.name, "size": p.stat().st_size,
-                     "digest": f"sha256:{hashlib.sha256(p.read_bytes()).hexdigest()}"}
+                    {
+                        "name": p.name,
+                        "size": p.stat().st_size,
+                        "digest": f"sha256:{hashlib.sha256(p.read_bytes()).hexdigest()}",
+                    }
                     for p in (archive, sums)
                 ]
                 if damaged:
                     assets[0]["digest"] = "sha256:" + "0" * 64
                 calls = []
-                replies = iter([
-                    {"default_branch": "main"},
-                    {"assets": assets, "draft": True},
-                    {"draft": False, "html_url": "https://example.invalid/release"},
-                ])
+                replies = iter(
+                    [
+                        {"default_branch": "main"},
+                        {"assets": assets, "draft": True},
+                        {"draft": False, "html_url": "https://example.invalid/release"},
+                    ]
+                )
                 env = {"GITHUB_REPOSITORY": "fixture/repo", "GITHUB_REF": "refs/heads/main"}
-                with patch.dict(os.environ, env), patch.object(
-                    publish_release, "api", side_effect=lambda *_: next(replies)
-                ), patch.object(publish_release, "snapshot", return_value=("0.1.0", "- Approved.")), \
-                    patch.object(publish_release, "require_green"), \
-                    patch.object(publish_release, "verify_tag", return_value=True), \
-                    patch.object(publish_release, "release_records", return_value=[]), \
-                    patch.object(publish_release, "run", side_effect=lambda command, *_: calls.append(command)):
+                with (
+                    patch.dict(os.environ, env),
+                    patch.object(publish_release, "api", side_effect=replies),
+                    patch.object(
+                        publish_release, "snapshot", return_value=("0.1.0", "- Approved.")
+                    ),
+                    patch.object(publish_release, "require_green"),
+                    patch.object(publish_release, "verify_tag", return_value=True),
+                    patch.object(publish_release, "release_records", return_value=[]),
+                    patch.object(
+                        publish_release,
+                        "run",
+                        side_effect=lambda command, *_, calls=calls: calls.append(command),
+                    ),
+                ):
                     if damaged:
                         with self.assertRaises(ValueError):
                             publish_release.publish(root, "a" * 40, root)
                     else:
                         publish_release.publish(root, "a" * 40, root)
-                create = next(i for i, c in enumerate(calls) if c[:3] == ["gh", "release", "create"])
-                upload = next(i for i, c in enumerate(calls) if c[:3] == ["gh", "release", "upload"])
+                create = next(
+                    i for i, c in enumerate(calls) if c[:3] == ["gh", "release", "create"]
+                )
+                upload = next(
+                    i for i, c in enumerate(calls) if c[:3] == ["gh", "release", "upload"]
+                )
                 self.assertIn("--draft", calls[create])
                 self.assertLess(create, upload)
                 published = [c for c in calls if "--draft=false" in c]
@@ -196,18 +238,23 @@ class ReleaseTests(unittest.TestCase):
                 f"{hashlib.sha256(archive.read_bytes()).hexdigest()}  {archive.name}\n"
             )
             env = {"GITHUB_REPOSITORY": "fixture/repo", "GITHUB_REF": "refs/heads/main"}
-            with patch.dict(os.environ, env), patch.object(
-                publish_release, "api", return_value={"default_branch": "main"}
-            ), patch.object(publish_release, "snapshot", return_value=("0.1.0", "- Approved.")), \
-                patch.object(publish_release, "require_green"), \
-                patch.object(publish_release, "verify_tag", return_value=True), \
-                patch.object(publish_release, "release_records", return_value=[
-                    {"tag_name": "v0.1.0", "draft": False}
-                ]), patch.object(publish_release, "run") as run:
+            with (
+                patch.dict(os.environ, env),
+                patch.object(publish_release, "api", return_value={"default_branch": "main"}),
+                patch.object(publish_release, "snapshot", return_value=("0.1.0", "- Approved.")),
+                patch.object(publish_release, "require_green"),
+                patch.object(publish_release, "verify_tag", return_value=True),
+                patch.object(
+                    publish_release,
+                    "release_records",
+                    return_value=[{"tag_name": "v0.1.0", "draft": False}],
+                ),
+                patch.object(publish_release, "run") as run,
+            ):
                 publish_release.publish(root, "a" * 40, root)
-                self.assertFalse(any(
-                    call.args[0][:2] == ["gh", "release"] for call in run.call_args_list
-                ))
+                self.assertFalse(
+                    any(call.args[0][:2] == ["gh", "release"] for call in run.call_args_list)
+                )
 
     def test_partial_preparation_reuses_branch_and_preserves_manual_notes(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -219,8 +266,11 @@ class ReleaseTests(unittest.TestCase):
 
             def git(args, cwd=seed):
                 return subprocess.run(
-                    ["git", *args], cwd=cwd, check=True, text=True,
-                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    ["git", *args],
+                    cwd=cwd,
+                    check=True,
+                    text=True,
+                    capture_output=True,
                 ).stdout.strip()
 
             git(["init", "--bare", str(remote)], base)
@@ -241,8 +291,13 @@ class ReleaseTests(unittest.TestCase):
                     return json.dumps(state["prs"])
                 if command[:3] == ["gh", "pr", "create"]:
                     state["creates"] += 1
-                    state["prs"] = [{"number": 1, "headRefName": "automation/release-v0.1.0",
-                                     "url": "https://example.invalid/pr/1"}]
+                    state["prs"] = [
+                        {
+                            "number": 1,
+                            "headRefName": "automation/release-v0.1.0",
+                            "url": "https://example.invalid/pr/1",
+                        }
+                    ]
                     return ""
                 if command[:3] == ["gh", "workflow", "run"]:
                     return ""
@@ -250,16 +305,24 @@ class ReleaseTests(unittest.TestCase):
                     return "[]"
                 return real_run(command, root, capture)
 
-            env = {"GITHUB_REPOSITORY": "fixture/repo", "GITHUB_ACTIONS": "true",
-                   "GITHUB_REF": "refs/heads/main"}
-            with patch.dict(os.environ, env), patch.object(
-                release, "api", return_value={"default_branch": "main"}
-            ), patch.object(release, "release_records", return_value=[]), patch.object(
-                release, "run", side_effect=runner
+            env = {
+                "GITHUB_REPOSITORY": "fixture/repo",
+                "GITHUB_ACTIONS": "true",
+                "GITHUB_REF": "refs/heads/main",
+            }
+            with (
+                patch.dict(os.environ, env),
+                patch.object(release, "api", return_value={"default_branch": "main"}),
+                patch.object(release, "release_records", return_value=[]),
+                patch.object(release, "run", side_effect=runner),
             ):
                 release.prepare(first, "initial", "stable", False)
-                text = (first / "CHANGELOG.md").read_text().replace(
-                    release.NOTES_MARKER, "- Handwritten release notes must survive retries."
+                text = (
+                    (first / "CHANGELOG.md")
+                    .read_text()
+                    .replace(
+                        release.NOTES_MARKER, "- Handwritten release notes must survive retries."
+                    )
                 )
                 (first / "CHANGELOG.md").write_text(text)
                 git(["add", "CHANGELOG.md"], first)
