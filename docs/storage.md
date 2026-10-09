@@ -69,8 +69,10 @@ it agrees with the authenticated `meta.json`.
 
 ## Lock and commit protocol
 
-1. Create `.lock` with `PUT` and `If-None-Match: *`, containing a random token. If the lock exists, stop.
-   A `HEAD` followed by a `PUT` is not a lock, so services without conditional `PUT` are rejected.
+1. Normally create `.lock` with a conditional `PUT`, containing a random token. By default this uses
+   `If-None-Match: *`; `--lock-detection-mode x-cos-forbid-overwrite` uses COS's
+   `x-cos-forbid-overwrite: true` instead. If the lock exists, stop. A `HEAD` followed by a `PUT` is
+   not a lock, so services without conditional create are rejected.
 2. Holding the lock, require that the prefix contains nothing else.
 3. Upload `key.gpg`, `key.sha256sum` and `meta.json.encrypted`.
 4. Start the multipart upload of `stream.encrypted` and upload its parts. Upload, complete and confirm
@@ -82,6 +84,16 @@ it agrees with the authenticated `meta.json`.
 
 The lock never expires and is never taken over. An operator may delete a stale lock or partial backup only
 after making sure that its writer and uploads have stopped.
+
+`--lock-detection-mode dangerously-skip` is an unsafe alternative: it does not create, acquire, or
+release `.lock` and permits concurrent writers to race. The prefix is still listed and must be empty
+before upload, but that check is not atomic.
+
+Unless locking is skipped, the selected mode is checked before every backup using a temporary probe
+object. COS mode requires `x-cos-forbid-overwrite` to reject an overwrite with the `FileAlreadyExists`
+error. Tencent COS documents that this header does not prevent overwrites when bucket versioning is
+enabled; the capability probe rejects such a configuration if the header is ignored. Skip mode omits
+the conditional-create probe but still checks metadata preservation.
 
 Failure handling depends on what is known about the `stream.encrypted` upload:
 
@@ -95,6 +107,9 @@ Failure handling depends on what is known about the `stream.encrypted` upload:
 An unfinished continuation upload is aborted. Residual objects are listed on stderr. A later backup
 of the same snapshot refuses the prefix until the partial content is removed. If the lock cannot be deleted
 after a confirmed commit, the error says `backup committed, lock cleanup failed`.
+
+With `dangerously-skip`, unresolved upload outcomes have no lock protecting the prefix; stop other
+writers and inspect the upload and objects manually before retrying.
 
 ## Multipart uploads
 
