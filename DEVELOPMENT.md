@@ -182,3 +182,25 @@ gh pr checks PR_NUMBER
 Passing local tests or merely linting the workflow is not remote acceptance. All opt-in and real ZFS tests
 must actually run. Verify both the run results and the server-side protection settings; workflow YAML alone
 does not configure a repository's required checks.
+
+## Release workflow verification
+
+Release preparation is explicitly selected in the Actions UI; normal main updates do not create version branches.
+See [CONTRIBUTING.md](CONTRIBUTING.md#versioning-and-releases) for bump, notes, prerelease and retry operations.
+The preparation and publication helpers are covered by `test_ci_release.py`, including a real local bare-Git
+test that recovers an existing release branch without force-pushing or discarding handwritten notes.
+
+`release.py check` adds release metadata validation to the existing quality gate. Empty/unreviewed notes and
+inconsistent package/lockfile/proposal versions fail CI. Main push CI groups include the commit SHA so newer
+main commits cannot cancel the CI of an accepted release snapshot; stale PR runs can still be cancelled.
+
+The Release controller only trusts successful CI from this repository. Publication requires an associated
+merged release PR, the exact merge SHA's GitHub Actions CI Gate, main ancestry, consistent frozen metadata,
+an unchanged tag and verified artifact digests. A successful release-branch CI can mark its draft PR ready,
+but cannot publish. Fork/ordinary PR completions do not authorize publication. Privileged controller code is
+checked out from main for automatic/retry runs, never executed from an untrusted upstream artifact.
+
+Verify workflow changes with **Release -> build-only** and **Prepare Release -> dry_run** on a topic branch.
+Build-only produces the actual static archive, checks the CLI version/ELF linkage and never creates tags or
+GitHub Releases. Do not merge a real version proposal or publish an official tag merely to test the automation.
+After deployment, rerun an initial dry preview twice to prove no release branch/PR/tag is created by preview.
