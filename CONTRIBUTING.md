@@ -45,14 +45,19 @@ Versions are SemVer tags: `vX.Y.Z`, or `vX.Y.Z-alpha.N` / `-beta.N` / `-rc.N` / 
 1. Run **Actions → Prepare Release** on `main` with a bump (`initial`, `patch`, `minor`, `major`) and a
    channel (`stable`, `alpha`, `beta`, `pre`, `rc`). It opens a PR on
    `automation/release-vVERSION` that updates the versions, adds `.github/release-plan.json` and starts
-   a `CHANGELOG.md` section.
-2. On that branch, write the release notes and remove `<!-- RELEASE_NOTES_NEED_REVIEW -->`. CI fails
-   while the notes are unreviewed or the versions disagree.
+   a `CHANGELOG.md` section with a Copilot-generated draft. This requires the
+   `COPILOT_GITHUB_TOKEN` repository or organization secret.
+2. Review and edit the draft on that branch, then remove `<!-- RELEASE_NOTES_NEED_REVIEW -->`.
+   CI fails while the notes are unreviewed or the versions disagree.
 3. When CI passes, merge it with a **merge commit** and wait for CI on that merge commit in `main`.
 4. Run **Actions → Release** on `main` with mode **publish**. It builds a static x86_64 musl binary,
    verifies it, and publishes it with `SHA256SUMS` (check with `sha256sum -c SHA256SUMS`).
 
 Both workflows run only when started manually; no push, PR or CI completion starts a release.
+Both Prepare Release jobs also require the default branch, including dry runs. Copilot note generation
+runs with read-only repository permissions; its token is not passed to the job that creates the PR.
+The release PR points to the CHANGELOG draft rather than generating a separate candidate-commit list.
+An empty generated draft fails preparation instead of silently substituting a template.
 
 Preparing the same version again reuses its PR and keeps the notes. If an accepted release was not
 published, run **Actions → Release → publish** again instead of bumping. **Release → build-only** and

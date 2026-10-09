@@ -85,6 +85,78 @@ class ReleaseTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             release.notes_section(reviewed + "\n## [0.1.0]\n- Duplicate", "0.1.0")
 
+    def test_generated_notes_are_added_to_marked_release_draft(self):
+        text = release.prepare_notes("", "0.1.0", "- Generated user-facing change.")
+        self.assertIn(release.NOTES_MARKER, text)
+        with self.assertRaises(ValueError):
+            release.notes_section(text, "0.1.0")
+        reviewed = text.replace(release.NOTES_MARKER, "")
+        self.assertEqual(
+            release.notes_section(reviewed, "0.1.0"),
+            "- Generated user-facing change.",
+        )
+
+    def test_prepare_workflow_is_manual_and_default_branch_only(self):
+        workflow = (
+            Path(__file__).resolve().parents[2] / ".github/workflows/version-bump.yml"
+        ).read_text()
+        triggers = workflow.split("\non:\n", 1)[1].split("\npermissions:", 1)[0]
+        self.assertIn("workflow_dispatch:", triggers)
+        for automatic in ("workflow_run", "push", "pull_request", "schedule", "workflow_call"):
+            self.assertNotIn(automatic, triggers)
+        jobs = workflow.split("\njobs:\n", 1)[1]
+        generation, preparation = jobs.split("\n  prepare:\n", 1)
+        guard = (
+            "if: github.event_name == 'workflow_dispatch' && "
+            "github.ref == format('refs/heads/{0}', github.event.repository.default_branch)"
+        )
+        for job in (generation, preparation):
+            self.assertIn(guard, job)
+            self.assertIn("ref: ${{ github.sha }}", job)
+        self.assertIn("contents: read", generation)
+        self.assertIn("pull-requests: read", generation)
+        self.assertNotIn(": write", generation)
+        self.assertIn("persist-credentials: false", generation)
+        self.assertIn("COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_GITHUB_TOKEN }}", generation)
+        self.assertNotIn("COPILOT_GITHUB_TOKEN", preparation)
+        self.assertIn("needs: generate-notes", preparation)
+        self.assertIn(
+            "RELEASE_NOTES: ${{ needs.generate-notes.outputs.release_notes }}", preparation
+        )
+        self.assertNotIn("run: ${{", preparation)
+
+    def test_release_pr_uses_changelog_draft_without_legacy_commit_summary(self):
+        plan = {"version": "0.1.0", "prepared_from": "a" * 40, "previous_tag": None}
+        bodies = []
+
+        def runner(command, root, capture=False):
+            self.assertEqual(command[:3], ["gh", "pr", "create"])
+            bodies.append(Path(command[command.index("--body-file") + 1]).read_text())
+
+        with patch.object(release, "run", side_effect=runner):
+            release._open_release_pr(Path("."), plan, "automation/release-v0.1.0", "main")
+        self.assertEqual(len(bodies), 1)
+        self.assertIn("Review the generated draft", bodies[0])
+        self.assertNotIn("Candidate commits", bodies[0])
+
+    def test_empty_generated_notes_file_fails_before_preparation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "notes.md"
+            path.write_text(" \n")
+            with (
+                patch(
+                    "sys.argv",
+                    ["x", "prepare", "--bump", "initial", "--generated-notes-file", str(path)],
+                ),
+                patch.object(release, "prepare") as prepare,
+                patch("sys.stderr") as stderr,
+            ):
+                self.assertEqual(release.main(), 1)
+                prepare.assert_not_called()
+                self.assertIn(
+                    "generated release notes are empty", stderr.write.call_args_list[0].args[0]
+                )
+
     def test_plan_checks_all_three_version_sources(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

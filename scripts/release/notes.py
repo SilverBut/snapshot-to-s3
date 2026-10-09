@@ -42,7 +42,7 @@ def notes_section(text: str, version: str, reviewed: bool = True) -> str:
     return section
 
 
-def prepare_notes(text: str, target: str) -> str:
+def prepare_notes(text: str, target: str, generated_notes: str | None = None) -> str:
     """Move Unreleased content (or a template) into a new marked `target` section."""
     if re.search(rf"(?m)^## \[{re.escape(target)}\]", text):
         raise ValueError(f"CHANGELOG already contains {target}")
@@ -55,6 +55,9 @@ def prepare_notes(text: str, target: str) -> str:
         remaining = text
     if remaining.startswith("# Changelog"):
         remaining = remaining[len("# Changelog") :].lstrip()
+    if generated_notes and generated_notes.strip():
+        generated = generated_notes.strip()
+        content = f"{content}\n\n{generated}".strip() if content else generated
     if not content:
         content = NOTES_TEMPLATE
     return (
