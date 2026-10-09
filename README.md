@@ -120,6 +120,7 @@ that aborts incomplete multipart uploads is recommended.
 * [Design](docs/design.md): scope, architecture, resource bounds and test coverage
 * [Storage](docs/storage.md): object layout, encryption, lock and commit protocol, HTTP behavior
 * [Workflow](docs/workflow.md): backup and restore step by step
+* [Engineering practices](docs/engineering.md): safe refactoring, test integrity, mutation testing
 * [Contributing](CONTRIBUTING.md) and [development environment](DEVELOPMENT.md)
 
 ## License

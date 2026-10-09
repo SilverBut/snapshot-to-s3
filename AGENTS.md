@@ -1,59 +1,28 @@
-# Hints for Agents
+# Agent guide
 
-## ZFS Development
+Open only the documents your task needs. Each one is the single source for its topic.
 
-### Use existing labeled pools only
+## Always
 
-This section ONLY applies to local running agents's unit/e2e test procedure.
+* **ZFS pools are shared with the host.** Never create, import, export, destroy or relabel pools. Use an
+  existing `ONLINE` pool whose pool property `user:isdev` is `yes`, and only inside your own new child
+  dataset. Read [ZFS development pools](DEVELOPMENT.md#zfs-development-pools) before running any `zfs` or
+  `zpool` command.
+* Never run `tests/provision/ci_e2e.sh` or the cloud setup bootstrap. They own and destroy pools.
+* Never weaken or delete a test to make a change pass.
+* Release workflows are started manually (`workflow_dispatch`) only.
 
-Agents must not create or recreate zpools, prepare backing devices or
-files, or import, export, or destroy pools. Use only existing development
-pools marked with the pool property `user:isdev=yes`. This is a **zpool
-property**, not a dataset property.
+## When you need to
 
-Discover eligible pools on the current machine; never hard-code pool
-names or backing paths. The container uses the host's ZFS kernel module
-through `/dev/zfs`, so visible pools are not isolated from the host.
-
-Easy command to check conditions:
-
-```bash
-zfs version
-zpool list
-zpool get user:isdev
-zpool status -P
-sudo -n true
-```
-
-- Select only an `ONLINE` pool whose `user:isdev` value is exactly `yes`;
-  verify the chosen pool with `zpool get -H -o value user:isdev "$pool"`.
-  Stop and report an error if no suitable pool exists; ask the user to
-  provide a labeled development pool rather than creating one. Never
-  change pool properties or labels to make a pool eligible.
-- The label permits development testing, not unrestricted destruction.
-  Use a unique child namespace, such as `$pool/smoke_<unique-id>`, and
-  verify that it does not already exist before creating it.
-- Change properties, write data, receive streams, roll back, and destroy
-  datasets only within the namespace created by the current test.
-- Use explicit temporary mountpoints and `canmount=on` for test
-  filesystems. Confirm that they are actually mounted as ZFS with
-  `findmnt -n -o FSTYPE -T "$mountpoint"` before writing.
-- Set `atime=off` on source and received test filesystems. Verification
-  reads can otherwise update the destination after its snapshot and cause
-  incremental receive to fail with "destination ... has been modified".
-  Do not use `zfs receive -F` to hide unexpected destination changes.
-- Use `set -euo pipefail` in test scripts and an exit trap for cleanup.
-  Report cleanup failures and retain test files or streams needed to
-  diagnose them; never remove a mountpoint tree while its dataset remains
-  mounted.
-
-### Cloud Copilot environment
-
-The cloud setup job prepares a labeled pool before the agent starts. If
-`target/copilot-dev/env.sh` exists, source it for the prepared tool paths and
-test budgets; `bash tests/provision/copilot_setup.sh --verify` tests that
-existing pool without replacing it. Do not run the setup bootstrap or
-`ci_e2e.sh` from the agent: the latter owns and destroys its separate CI pool.
-If the handoff is missing or its pool/GUID check fails, report setup failure
-instead of creating, importing or relabeling a pool. See
-[the cloud handoff guide](DEVELOPMENT.md#cloud-copilot-handoff).
+| Task | Read |
+| --- | --- |
+| Build, lint and test before a PR | [CONTRIBUTING: build and check](CONTRIBUTING.md#build-and-check) |
+| Find the module that owns a feature | [design: architecture](docs/design.md#architecture) |
+| Touch object layout, encryption, metadata or locking | [storage.md](docs/storage.md) |
+| Change backup or restore steps | [workflow.md](docs/workflow.md) |
+| Add or change tests, fakes or fixtures | [tests/README.md](tests/README.md), [engineering: writing tests](docs/engineering.md#writing-tests) |
+| Refactor, or improve code and test quality | [engineering.md](docs/engineering.md) |
+| Run the ZFS, S3 or Tink tests locally | [DEVELOPMENT: local E2E](DEVELOPMENT.md#local-end-to-end-tests) |
+| Work in the cloud Copilot VM (`target/copilot-dev/env.sh` exists) | [DEVELOPMENT: cloud handoff](DEVELOPMENT.md#cloud-copilot-handoff) |
+| Run heavy checks (E2E, mutation testing) or read CI | [engineering: validation](docs/engineering.md#validation-and-resources), [DEVELOPMENT: CI](DEVELOPMENT.md#ci) |
+| Prepare or publish a release | [CONTRIBUTING: releases](CONTRIBUTING.md#releases) |
