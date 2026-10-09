@@ -1,6 +1,6 @@
 use crate::model::{MetadataMap, Reader, SnapshotName};
 use crate::store::{ObjectHead, ObjectStore, Part};
-use crate::zfs_api::{SendStream, SnapshotInfo, TargetInfo, Zfs};
+use crate::zfs::{SendStream, SnapshotInfo, TargetInfo, Zfs};
 use anyhow::{bail, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -187,7 +187,7 @@ impl FakeZfs {
     pub fn new() -> Self {
         Self {
             snapshots: vec![SnapshotInfo {
-                name: SnapshotName::parse("zfs:pool/data@s1").unwrap(),
+                name: SnapshotName::parse("pool/data@s1").unwrap(),
                 guid: "10".into(),
                 volume_guid: "1".into(),
                 createtxg: 1,

@@ -1,5 +1,5 @@
 /* Independent OpenSSL EVP reference for the Tink raw AES128_GCM_HKDF_1MB wire format.
- * Build with: cc tests/crypto_reference.c -lcrypto -o tests/crypto_reference
+ * Build with: cc tests/fixtures/tink_reference.c -lcrypto -o target/tink_reference
  */
 #include <openssl/core_names.h>
 #include <openssl/evp.h>

@@ -1,16 +1,14 @@
 name: Release
 
+# Manual only: nothing here runs on push, PR or CI completion.
 on:
-  workflow_run:
-    workflows: [CI]
-    types: [completed]
   workflow_dispatch:
     inputs:
       mode:
-        description: Build without publishing, or retry the accepted release on main
+        description: Build without publishing, or publish the merged release PR on main
         type: choice
         default: build-only
-        options: [build-only, retry]
+        options: [build-only, publish]
       build_ref:
         description: Build-only reference (empty uses this workflow's commit)
         type: string
@@ -20,21 +18,17 @@ permissions:
   contents: read
 
 concurrency:
-  group: release-${{ github.event_name }}-${{ github.event.workflow_run.head_sha || github.sha }}
+  group: release-${{ inputs.mode }}-${{ github.sha }}
   cancel-in-progress: false
 
 jobs:
   select:
     name: Select only an authorized frozen release
-    if: >-
-      github.event_name == 'workflow_dispatch' ||
-      (github.event.workflow_run.conclusion == 'success' &&
-       github.event.workflow_run.head_repository.full_name == github.repository)
     runs-on: ubuntu-26.04
     timeout-minutes: 10
     permissions:
       contents: read
-      pull-requests: write
+      pull-requests: read
       checks: read
     outputs:
       action: ${{ steps.select.outputs.action }}
@@ -45,14 +39,14 @@ jobs:
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && github.ref || github.event.repository.default_branch }}
+          ref: ${{ github.ref }}
           fetch-depth: 0
           persist-credentials: false
-      - name: Validate event, proposal and exact commit CI
+      - name: Validate mode, proposal and exact commit CI
         id: select
         env:
           GH_TOKEN: ${{ github.token }}
-          MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.mode || 'auto' }}
+          MODE: ${{ inputs.mode }}
           BUILD_REF: ${{ inputs.build_ref }}
         run: python3 tests/support/publish_release.py select --mode "$MODE" --build-ref "$BUILD_REF"
 

@@ -1,10 +1,12 @@
+//! Command-line interface.
+
 use crate::backup::{backup, BackupOptions};
-use crate::http_store::{HttpConfig, HttpStore};
 use crate::model::{validate_dataset, S3Location, SnapshotName};
 use crate::restore::{restore, RestoreOptions};
-use crate::transfer::UploadLimits;
+use crate::s3::{HttpConfig, HttpStore};
+use crate::store::UploadLimits;
 use crate::zfs::SystemZfs;
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
@@ -19,20 +21,129 @@ pub struct Cli {
     command: Command,
 }
 
+#[derive(Subcommand)]
+enum Command {
+    /// Back up an existing ZFS filesystem snapshot; never creates a snapshot.
+    Backup(BackupArgs),
+    /// Restore a required chain, or export only the selected send stream to stdout.
+    Restore(RestoreArgs),
+}
+
+#[derive(Args)]
+struct BackupArgs {
+    /// Snapshot to back up: zfs:<dataset>@<snapshot>
+    #[arg(value_parser = parse_backup_source)]
+    source: SnapshotName,
+    /// Backup location: s3://<bucket>[/<prefix>]
+    #[arg(value_parser = S3Location::parse)]
+    destination: S3Location,
+    /// GPG selector that resolves to exactly one encryption-capable key
+    #[arg(long, env = "GPG_KEY_ID")]
+    gpg_key_id: String,
+    /// Send a full stream without looking for an incremental base
+    #[arg(long)]
+    force_full_snapshot: bool,
+    /// Ciphertext bytes per second through the backup pipeline
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+    rate_limit: Option<u64>,
+    #[command(flatten)]
+    parts: PartArgs,
+    #[command(flatten)]
+    storage: StorageArgs,
+}
+
+#[derive(Args)]
+struct RestoreArgs {
+    /// Backup location: s3://<bucket>[/<prefix>]
+    #[arg(value_parser = S3Location::parse)]
+    source: S3Location,
+    /// zfs:<dataset>@<snapshot> to receive, or stdout:<dataset>@<snapshot>
+    /// to export only that stream; names are as backed up
+    #[arg(value_parser = parse_restore_destination)]
+    destination: Destination,
+    /// Check the selected backup's recipient, not every chain node's recipient
+    #[arg(long, env = "GPG_KEY_ID")]
+    gpg_key_id: Option<String>,
+    /// Receive into this pool instead of the source pool
+    #[arg(long)]
+    target_pool: Option<String>,
+    /// Dataset path relative to the target pool
+    #[arg(long)]
+    target_dataset: Option<String>,
+    #[command(flatten)]
+    storage: StorageArgs,
+}
+
+#[derive(Args)]
+struct PartArgs {
+    /// Provider minimum size of every part but the last
+    #[arg(long, default_value_t = 5 * 1024 * 1024)]
+    min_part_size: u64,
+    /// Provider maximum part size
+    #[arg(long, default_value_t = 5 * 1024 * 1024 * 1024)]
+    max_part_size: u64,
+    /// Provider maximum parts per object
+    #[arg(long, default_value_t = 10_000)]
+    max_parts: u32,
+    /// Largest object; longer streams continue in further objects
+    #[arg(long, default_value_t = 5 * 1024 * 1024 * 1024 * 1024)]
+    max_object_size: u64,
+    /// Largest part held in memory
+    #[arg(long, default_value_t = 64 * 1024 * 1024)]
+    part_buffer_size: u64,
+}
+
 #[derive(Args)]
 struct StorageArgs {
+    /// S3 endpoint URL; implies path-style requests
     #[arg(long)]
     endpoint: Option<String>,
+    /// Signing region [default: AWS_DEFAULT_REGION, then us-east-1]
     #[arg(long, env = "AWS_REGION")]
     region: Option<String>,
+    /// HTTP header prefix for user metadata
     #[arg(long, default_value = "x-amz-meta")]
     metadata_prefix: String,
+    /// SigV4 service name
     #[arg(long, default_value = "s3")]
     signing_service: String,
     #[arg(long, conflicts_with = "virtual_hosted_style")]
     path_style: bool,
     #[arg(long, conflicts_with = "path_style")]
     virtual_hosted_style: bool,
+}
+
+#[derive(Clone)]
+enum Destination {
+    Zfs(SnapshotName),
+    Stdout(SnapshotName),
+}
+
+fn parse_backup_source(value: &str) -> Result<SnapshotName> {
+    let name = value
+        .strip_prefix("zfs:")
+        .context("backup source must be a zfs: filesystem snapshot")?;
+    SnapshotName::parse(name)
+}
+
+fn parse_restore_destination(value: &str) -> Result<Destination> {
+    match value.split_once(':') {
+        Some(("zfs", name)) => Ok(Destination::Zfs(SnapshotName::parse(name)?)),
+        Some(("stdout", name)) => Ok(Destination::Stdout(SnapshotName::parse(name)?)),
+        _ => bail!("expected zfs:<dataset>@<snapshot> or stdout:<dataset>@<snapshot>"),
+    }
+}
+
+impl PartArgs {
+    fn limits(&self) -> UploadLimits {
+        UploadLimits {
+            min_part_size: self.min_part_size,
+            max_part_size: self.max_part_size,
+            max_parts: self.max_parts,
+            max_object_size: self.max_object_size,
+            buffer_limit: self.part_buffer_size,
+        }
+    }
 }
 
 impl StorageArgs {
@@ -53,49 +164,94 @@ impl StorageArgs {
     }
 }
 
-#[derive(Subcommand)]
-enum Command {
-    /// Back up an existing ZFS filesystem snapshot; never creates a snapshot.
-    Backup {
-        source: String,
-        destination: String,
-        #[arg(long, env = "GPG_KEY_ID")]
-        gpg_key_id: String,
-        #[arg(long)]
-        force_full_snapshot: bool,
-        /// Ciphertext bytes per second through the backup pipeline.
-        #[arg(long)]
-        rate_limit: Option<u64>,
-        #[arg(long, default_value_t = 5 * 1024 * 1024)]
-        min_part_size: u64,
-        #[arg(long, default_value_t = 5 * 1024 * 1024 * 1024)]
-        max_part_size: u64,
-        #[arg(long, default_value_t = 10_000)]
-        max_parts: u32,
-        #[arg(long, default_value_t = 5 * 1024 * 1024 * 1024 * 1024)]
-        max_object_size: u64,
-        #[arg(long, default_value_t = 64 * 1024 * 1024)]
-        part_buffer_size: u64,
-        #[command(flatten)]
-        storage: StorageArgs,
-    },
-    /// Restore a required chain, or export only the selected send stream to stdout.
-    Restore {
-        source: String,
-        destination: String,
-        /// Optionally check the selected backup's recipient, not every chain node's recipient.
-        #[arg(long, env = "GPG_KEY_ID")]
-        gpg_key_id: Option<String>,
-        #[arg(long)]
-        target_pool: Option<String>,
-        /// Dataset path relative to the target pool.
-        #[arg(long)]
-        target_dataset: Option<String>,
-        #[command(flatten)]
-        storage: StorageArgs,
-    },
+pub async fn run(cli: Cli) -> Result<()> {
+    let cancel = CancellationToken::new();
+    let signal = tokio::spawn(cancel_on_signal(cancel.clone()));
+    let zfs = Arc::new(SystemZfs::new());
+    let result = match cli.command {
+        Command::Backup(args) => run_backup(args, zfs, cancel).await,
+        Command::Restore(args) => run_restore(args, zfs, cancel).await,
+    };
+    signal.abort();
+    let _ = signal.await;
+    result
 }
 
+async fn run_backup(
+    args: BackupArgs,
+    zfs: Arc<SystemZfs>,
+    cancel: CancellationToken,
+) -> Result<()> {
+    let limits = args.parts.limits();
+    limits.validate()?;
+    let location = args.destination;
+    let store = Arc::new(args.storage.store(location.bucket.clone()).await?);
+    store.probe_capabilities(&location.prefix).await?;
+    let options = BackupOptions {
+        source: args.source,
+        location,
+        gpg_key_id: args.gpg_key_id,
+        force_full: args.force_full_snapshot,
+        rate_limit: args.rate_limit,
+        limits,
+        cancel,
+    };
+    let result = backup(store, zfs, options).await?;
+    eprintln!(
+        "backup committed: {} (snapshot GUID {}, {} ciphertext bytes in {} object{})",
+        result.stream_key,
+        result.snapshot_guid,
+        result.ciphertext_bytes,
+        result.stream_objects,
+        if result.stream_objects == 1 { "" } else { "s" }
+    );
+    Ok(())
+}
+
+async fn run_restore(
+    args: RestoreArgs,
+    zfs: Arc<SystemZfs>,
+    cancel: CancellationToken,
+) -> Result<()> {
+    let (source, target) = match args.destination {
+        Destination::Stdout(source) => {
+            if args.target_pool.is_some() || args.target_dataset.is_some() {
+                bail!("stdout export does not accept target overrides");
+            }
+            (source, None)
+        }
+        Destination::Zfs(source) => {
+            let target = target_dataset(&source, args.target_pool, args.target_dataset)?;
+            (source, Some(target))
+        }
+    };
+    let location = args.source;
+    let store = Arc::new(args.storage.store(location.bucket.clone()).await?);
+    let options = RestoreOptions {
+        location,
+        source,
+        target,
+        gpg_key_id: args.gpg_key_id,
+        cancel,
+    };
+    let result = restore(store, zfs, options, &mut tokio::io::stdout()).await?;
+    if result.stdout_export {
+        eprintln!("stdout export completed and authenticated");
+    } else if result.received.is_empty() {
+        eprintln!(
+            "target is already at requested snapshot; clean-target check passed; \
+             no replay needed"
+        );
+    } else {
+        eprintln!(
+            "restore completed: received snapshot GUIDs {:?}",
+            result.received
+        );
+    }
+    Ok(())
+}
+
+/// Receive target: the source dataset with optional pool and relative-path overrides.
 fn target_dataset(
     source: &SnapshotName,
     pool: Option<String>,
@@ -119,77 +275,30 @@ fn target_dataset(
     Ok(target)
 }
 
-async fn watch_signal(cancel: CancellationToken) -> Result<()> {
+/// Cancels on SIGINT or SIGTERM, or if signal handling cannot be set up.
+async fn cancel_on_signal(cancel: CancellationToken) {
+    match wait_for_signal().await {
+        Ok(()) => {
+            eprintln!("cancellation requested; stopping producers and resolving upload state")
+        }
+        Err(error) => eprintln!("signal monitoring failed: {error:#}"),
+    }
+    cancel.cancel();
+}
+
+async fn wait_for_signal() -> Result<()> {
     #[cfg(unix)]
     {
-        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut terminate = signal(SignalKind::terminate())?;
         tokio::select! {
             result = tokio::signal::ctrl_c() => result?,
-            _ = term.recv() => (),
+            _ = terminate.recv() => (),
         }
     }
     #[cfg(not(unix))]
     tokio::signal::ctrl_c().await?;
-    eprintln!("cancellation requested; stopping producers and resolving upload state");
-    cancel.cancel();
     Ok(())
-}
-
-pub async fn run(cli: Cli) -> Result<()> {
-    let cancel = CancellationToken::new();
-    let signal_cancel = cancel.clone();
-    let signal = tokio::spawn(async move {
-        if let Err(error) = watch_signal(signal_cancel.clone()).await {
-            eprintln!("signal monitoring failed: {error:#}");
-            signal_cancel.cancel();
-        }
-    });
-    let result = async {
-        let zfs = Arc::new(SystemZfs::new());
-        match cli.command {
-            Command::Backup { source, destination, gpg_key_id, force_full_snapshot, rate_limit,
-                min_part_size, max_part_size, max_parts, max_object_size, part_buffer_size, storage } => {
-                if !source.starts_with("zfs:") { bail!("backup source must be a zfs: filesystem snapshot"); }
-                let source = SnapshotName::parse(&source)?;
-                let location = S3Location::parse(&destination)?;
-                let limits = UploadLimits { min_part_size, max_part_size, max_parts, max_object_size, buffer_limit: part_buffer_size };
-                limits.validate()?;
-                let store = Arc::new(storage.store(location.bucket.clone()).await?);
-                let probe_prefix = if location.prefix.is_empty() {
-                    ".snapshot-to-s3-probes/".into()
-                } else {
-                    format!("{}/.snapshot-to-s3-probes/", location.prefix)
-                };
-                store.validate_conditional_put(&probe_prefix).await?;
-                let result = backup(store, zfs, BackupOptions { source, location, gpg_key_id,
-                    force_full: force_full_snapshot, rate_limit, limits, cancel }).await?;
-                eprintln!("backup committed: {} (snapshot GUID {}, {} ciphertext bytes)", result.stream_key, result.snapshot_guid, result.ciphertext_bytes);
-            }
-            Command::Restore { source, destination, gpg_key_id, target_pool, target_dataset: dataset, storage } => {
-                let location = S3Location::parse(&source)?;
-                let selected = SnapshotName::parse(&destination)?;
-                let target = if destination.starts_with("stdout:") {
-                    if target_pool.is_some() || dataset.is_some() { bail!("stdout export does not accept target overrides"); }
-                    None
-                } else {
-                    Some(target_dataset(&selected, target_pool, dataset)?)
-                };
-                let store = Arc::new(storage.store(location.bucket.clone()).await?);
-                let result = restore(store, zfs, RestoreOptions { location, source: selected, target, gpg_key_id, cancel }, &mut tokio::io::stdout()).await?;
-                if result.stdout_export {
-                    eprintln!("stdout export completed and authenticated");
-                } else if result.received.is_empty() {
-                    eprintln!("target is already at requested snapshot; clean-target check passed; no replay needed");
-                } else {
-                    eprintln!("restore completed: received snapshot GUIDs {:?}", result.received);
-                }
-            }
-        }
-        Ok(())
-    }.await;
-    signal.abort();
-    let _ = signal.await;
-    result
 }
 
 #[cfg(test)]
@@ -197,42 +306,58 @@ mod tests {
     use super::*;
     use clap::CommandFactory;
 
+    fn parses(args: &[&str]) -> bool {
+        Cli::try_parse_from(std::iter::once("snapshot-to-s3").chain(args.iter().copied())).is_ok()
+    }
+
     #[test]
     fn current_cli_and_removed_credentials() {
         Cli::command().debug_assert();
-        assert!(Cli::try_parse_from([
-            "snapshot-to-s3",
+        let backup = ["backup", "zfs:pool/data@s1", "s3://bucket/backups"];
+        assert!(parses(
+            &[
+                &backup[..],
+                &["--gpg-key-id", "recipient", "--force-full-snapshot"]
+            ]
+            .concat()
+        ));
+        assert!(!parses(
+            &[
+                &backup[..],
+                &["--gpg-key-id", "recipient", "--secret-access-key", "secret"]
+            ]
+            .concat()
+        ));
+        assert!(!parses(
+            &[
+                &backup[..],
+                &["--gpg-key-id", "recipient", "--rate-limit", "0"]
+            ]
+            .concat()
+        ));
+        assert!(!parses(&[
             "backup",
-            "zfs:pool/data@s1",
+            "stdout:pool/data@s1",
             "s3://bucket/backups",
             "--gpg-key-id",
-            "recipient",
-            "--force-full-snapshot"
-        ])
-        .is_ok());
-        assert!(Cli::try_parse_from([
-            "snapshot-to-s3",
-            "backup",
-            "zfs:pool/data@s1",
-            "s3://bucket/backups",
-            "--gpg-key-id",
-            "recipient",
-            "--secret-access-key",
-            "secret"
-        ])
-        .is_err());
-        assert!(Cli::try_parse_from([
-            "snapshot-to-s3",
+            "recipient"
+        ]));
+        assert!(parses(&[
             "restore",
             "s3://bucket/backups",
             "stdout:pool/data@s1"
-        ])
-        .is_ok());
+        ]));
+        assert!(parses(&[
+            "restore",
+            "s3://bucket/backups",
+            "zfs:pool/data@s1"
+        ]));
+        assert!(!parses(&["restore", "s3://bucket/backups", "pool/data@s1"]));
     }
 
     #[test]
     fn target_overrides_preserve_relative_dataset() {
-        let src = SnapshotName::parse("zfs:pool/nested/data@s1").unwrap();
+        let src = SnapshotName::parse("pool/nested/data@s1").unwrap();
         assert_eq!(
             target_dataset(&src, Some("other".into()), None).unwrap(),
             "other/nested/data"

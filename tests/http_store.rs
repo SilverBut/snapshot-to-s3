@@ -3,10 +3,9 @@ use bytes::Bytes;
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
 use snapshot_to_s3::{
-    http_store::{is_definite_rejection, is_retryable, HttpConfig, HttpPolicy, HttpStore},
     model::MetadataMap,
-    store::{ObjectStore, Part},
-    transfer::{upload_parts, UploadLimits},
+    s3::{is_definite_rejection, is_retryable, HttpConfig, HttpPolicy, HttpStore},
+    store::{upload_parts, ObjectStore, Part, UploadLimits},
 };
 use std::{
     io,
@@ -897,8 +896,7 @@ async fn upload_parts_retries_identical_bytes_and_returns_only_final_etag() -> R
     let (endpoint, server) = fixture_sequence(responses).await?;
     let store = HttpStore::new(config(endpoint)).await?;
     let ciphertext = b"tiny".to_vec();
-    let mut reader: snapshot_to_s3::model::Reader =
-        Box::new(std::io::Cursor::new(ciphertext.clone()));
+    let mut reader = std::io::Cursor::new(ciphertext.clone());
     let result = upload_parts(
         &store,
         "stream",
@@ -916,6 +914,7 @@ async fn upload_parts_retries_identical_bytes_and_returns_only_final_etag() -> R
     )
     .await?;
     assert_eq!(result.bytes, ciphertext.len() as u64);
+    assert!(result.ended);
     assert_eq!(result.parts.len(), 1);
     assert_eq!(result.parts[0].number, 1);
     assert_eq!(result.parts[0].etag, "\"final-etag\"");
@@ -980,17 +979,14 @@ async fn conditional_capability_probe_rejects_ignored_metadata_and_cleans_lock_k
     let (endpoint, server) = fixture_sequence(responses).await?;
     let store = HttpStore::new(config(endpoint)).await?;
     let error = store
-        .validate_conditional_put("backups/snapshot")
+        .probe_capabilities("backups/snapshot")
         .await
         .expect_err("a provider ignoring metadata must fail its capability probe");
     assert!(format!("{error:#}").contains("metadata prefix"));
     let requests = String::from_utf8(server.await?).expect("fixture requests are UTF-8");
-    assert!(
-        requests.contains("/fixture-bucket/backups/snapshot/.__snapshot-to-s3-condition-check/")
-    );
+    assert!(requests.contains("/fixture-bucket/backups/snapshot/.snapshot-to-s3-probes/"));
     assert!(requests.contains("/.lock HTTP/1.1"));
     assert!(requests.contains("x-fixture-meta-http-store-capability:"));
-    assert!(requests
-        .contains("DELETE /fixture-bucket/backups/snapshot/.__snapshot-to-s3-condition-check/"));
+    assert!(requests.contains("DELETE /fixture-bucket/backups/snapshot/.snapshot-to-s3-probes/"));
     Ok(())
 }

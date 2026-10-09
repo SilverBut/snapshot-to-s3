@@ -200,6 +200,16 @@ cli restore "$prefix" "stdout:$namespace/source@s1" | sudo -n zfs receive -u "$n
 exported_guid="$(property_value zfs "$namespace/exported@s1" guid)"
 source_guid="$(property_value zfs "$namespace/source@s1" guid)"
 [[ "$exported_guid" == "$source_guid" ]]
+# A stream larger than --max-object-size continues in further objects.
+chunked="$prefix/chunked"
+if ! cli backup "zfs:$namespace/source@s1" "$chunked" --gpg-key-id "$fingerprint" --force-full-snapshot \
+    --max-object-size 8388608 --part-buffer-size 8388608 2>"$runtime/chunked.log" ||
+    ! grep -q ' in 2 objects)' "$runtime/chunked.log"; then
+    cat "$runtime/chunked.log" >&2
+    exit 1
+fi
+cli restore "$chunked" "stdout:$namespace/source@s1" | sudo -n zfs receive -u "$namespace/chunked"
+[[ "$(property_value zfs "$namespace/chunked@s1" guid)" == "$source_guid" ]]
 python3 tests/support/s3_probe.py --region us-east-1 --delete-test-object "$id/$namespace/source/s1/stream.encrypted"
 if cli restore "$prefix" "zfs:$namespace/source@s3" --target-dataset "$id/incomplete"; then
     echo "incomplete remote chain unexpectedly recovered an empty target" >&2
@@ -230,5 +240,5 @@ encryption="$(property_value zfs "$namespace/native-recovered" encryption)"
 mounted="$(property_value zfs "$namespace/native-recovered" mounted)"
 [[ "$encryption" == aes-256-gcm ]]
 [[ "$mounted" == no ]]
-echo "PASS: full + incrementals + GUID/data + existing base + no-op + dirty rejection + single stdout export + native raw encryption" >&2
+echo "PASS: full + incrementals + GUID/data + multi-object stream + existing base + no-op + dirty rejection + stdout export + native raw encryption" >&2
 echo "remote test objects retained under $prefix; use the dedicated local service cleanup" >&2
