@@ -45,3 +45,29 @@ async fn retry_classifier_only_marks_transient_statuses() -> Result<()> {
     )));
     Ok(())
 }
+
+#[tokio::test]
+async fn store_retry_and_rejection_methods_delegate_to_http_classification() -> Result<()> {
+    let _env = EnvGuard::new();
+    for (status, expected_retryable, expected_rejection) in [
+        ("503 Service Unavailable", true, false),
+        ("403 Forbidden", false, true),
+    ] {
+        let response =
+            format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        let (endpoint, server) = fixture(Box::leak(response.into_boxed_str())).await?;
+        let store = HttpStore::new(config(endpoint)).await?;
+        let error = store
+            .upload_part("stream", "id", 1, Bytes::from_static(b"part"))
+            .await
+            .unwrap_err();
+        assert_eq!(store.is_retryable(&error), expected_retryable, "{status}");
+        assert_eq!(
+            store.is_definite_rejection(&error),
+            expected_rejection,
+            "{status}"
+        );
+        let _ = server.await?;
+    }
+    Ok(())
+}

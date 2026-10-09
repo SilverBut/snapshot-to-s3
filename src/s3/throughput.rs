@@ -229,4 +229,25 @@ mod tests {
             .await
             .is_err());
     }
+
+    #[test]
+    fn exact_minimum_progress_is_accepted() {
+        let mut guard = ThroughputGuard::new(&HttpPolicy {
+            throughput_window: Duration::from_millis(640),
+            minimum_bytes_per_window: 8,
+            ..HttpPolicy::default()
+        });
+        guard.elapsed = guard.window;
+        guard.add(8);
+        assert!(
+            guard.check().is_ok(),
+            "the exact byte threshold is sufficient"
+        );
+        guard.samples[64].1 = 7;
+        guard.bytes = 7;
+        assert!(
+            guard.check().is_err(),
+            "one byte below the threshold must fail"
+        );
+    }
 }

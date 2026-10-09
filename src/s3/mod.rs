@@ -317,3 +317,61 @@ fn put_header(headers: &mut HeaderMap, name: &str, value: &str) -> Result<()> {
     );
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config(endpoint: Option<&str>, region: &str) -> HttpConfig {
+        HttpConfig {
+            bucket: "bucket".into(),
+            endpoint: endpoint.map(str::to_owned),
+            region: region.into(),
+            metadata_prefix: "X-Test-Meta---".into(),
+            signing_service: "s3".into(),
+            path_style: true,
+        }
+    }
+
+    #[test]
+    fn endpoint_defaults_and_rejects_each_unsupported_component() {
+        assert_eq!(
+            endpoint_url(&config(None, "us-east-1")).unwrap().as_str(),
+            "https://s3.amazonaws.com/"
+        );
+        assert_eq!(
+            endpoint_url(&config(None, "eu-west-2")).unwrap().as_str(),
+            "https://s3.eu-west-2.amazonaws.com/"
+        );
+        for endpoint in [
+            "ftp://example.test",
+            "file:///tmp",
+            "http://user@example.test",
+            "http://user:pass@example.test",
+            "http://:pass@example.test",
+            "http://example.test/path?query=1",
+            "http://example.test/path#fragment",
+        ] {
+            let error = endpoint_url(&config(Some(endpoint), "us-east-1")).unwrap_err();
+            assert!(
+                error.to_string().contains("S3 endpoint"),
+                "{endpoint}: {error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn metadata_prefix_is_normalized_and_rejects_empty_or_invalid_names() {
+        assert_eq!(
+            normalize_metadata_prefix("X-Test-Meta---").unwrap(),
+            "x-test-meta"
+        );
+        for prefix in ["", "---", "bad_prefix", "bad prefix"] {
+            let error = normalize_metadata_prefix(prefix).unwrap_err().to_string();
+            assert_eq!(
+                error,
+                "metadata_prefix must be a valid HTTP header-name prefix"
+            );
+        }
+    }
+}

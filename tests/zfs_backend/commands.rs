@@ -15,6 +15,8 @@ async fn candidate_invalid_returns_none() {
 
     assert_eq!(z.written(&s1, &s2).await.unwrap(), None);
     assert_eq!(z.estimate(&s2, Some(&s1)).await.unwrap(), None);
+    let full_error = z.estimate(&s2, None).await.unwrap_err().to_string();
+    assert!(full_error.contains("zfs send estimate failed: incremental source invalid"));
 }
 
 #[tokio::test]
@@ -76,4 +78,18 @@ async fn absent_dataset_requires_nonzero_missing_error_and_permission_errors_pro
         commands,
         "zpool list -j -p -o name pool\nget -j -p type pool/missing\n"
     );
+}
+
+#[tokio::test]
+async fn volume_is_rejected_as_filesystem_and_restore_target() {
+    let _lock = env_lock().await;
+    let base = fixture_dir("volume-type").unwrap();
+    configure_bins(&base);
+    let zfs = SystemZfs::new();
+    let snapshot = SnapshotName::parse("pool/vol@s1").unwrap();
+    let error = zfs.snapshot(&snapshot).await.unwrap_err().to_string();
+    assert!(error.contains("dataset is not a filesystem: pool/vol (volume)"));
+
+    let error = zfs.target("pool/vol").await.unwrap_err().to_string();
+    assert!(error.contains("target dataset is not a filesystem: pool/vol (volume)"));
 }

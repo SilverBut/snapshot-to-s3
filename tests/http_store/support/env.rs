@@ -9,6 +9,7 @@ pub(crate) struct EnvGuard {
     secret: Option<String>,
     token: Option<String>,
     disabled: Option<String>,
+    proxies: Vec<(&'static str, Option<String>)>,
 }
 
 impl EnvGuard {
@@ -25,12 +26,30 @@ impl EnvGuard {
         std::env::set_var("AWS_SECRET_ACCESS_KEY", "fixture-secret");
         std::env::set_var("AWS_SESSION_TOKEN", "fixture-token");
         std::env::remove_var("AWS_EC2_METADATA_DISABLED");
+        let proxies = [
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "all_proxy",
+            "NO_PROXY",
+            "no_proxy",
+        ]
+        .into_iter()
+        .map(|name| {
+            let previous = std::env::var(name).ok();
+            std::env::remove_var(name);
+            (name, previous)
+        })
+        .collect();
         Self {
             _lock: lock,
             access,
             secret,
             token,
             disabled,
+            proxies,
         }
     }
 }
@@ -41,6 +60,9 @@ impl Drop for EnvGuard {
         restore_env("AWS_SECRET_ACCESS_KEY", self.secret.take());
         restore_env("AWS_SESSION_TOKEN", self.token.take());
         restore_env("AWS_EC2_METADATA_DISABLED", self.disabled.take());
+        for (name, value) in self.proxies.drain(..) {
+            restore_env(name, value);
+        }
     }
 }
 
