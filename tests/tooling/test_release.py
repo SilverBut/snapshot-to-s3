@@ -8,8 +8,8 @@ import tomllib
 import unittest
 from unittest.mock import patch
 
-import publish_release
-import release
+from scripts.release import publish as publish_release
+from scripts.release import prepare as release
 
 
 MANIFEST = '[package]\nname = "fixture"\nversion = "0.1.0" # preserve comment\n\n[dependencies]\nbytes = "1"\n'

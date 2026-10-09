@@ -51,7 +51,7 @@ sudo -n true
 
 The cloud setup job prepares a labeled pool before the agent starts. If
 `target/copilot-dev/env.sh` exists, source it for the prepared tool paths and
-test budgets; `bash tests/support/copilot_setup.sh --verify` tests that
+test budgets; `bash tests/provision/copilot_setup.sh --verify` tests that
 existing pool without replacing it. Do not run the setup bootstrap or
 `ci_e2e.sh` from the agent: the latter owns and destroys its separate CI pool.
 If the handoff is missing or its pool/GUID check fails, report setup failure

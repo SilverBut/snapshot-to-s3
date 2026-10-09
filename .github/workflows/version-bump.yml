@@ -49,4 +49,4 @@ jobs:
           if [[ "$DRY_RUN" == true ]]; then
             args+=(--dry-run)
           fi
-          python3 tests/support/release.py "${args[@]}"
+          python3 -m scripts.release.prepare "${args[@]}"

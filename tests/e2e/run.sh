@@ -210,7 +210,7 @@ if ! cli backup "zfs:$namespace/source@s1" "$chunked" --gpg-key-id "$fingerprint
 fi
 cli restore "$chunked" "stdout:$namespace/source@s1" | sudo -n zfs receive -u "$namespace/chunked"
 [[ "$(property_value zfs "$namespace/chunked@s1" guid)" == "$source_guid" ]]
-python3 tests/support/s3_probe.py --region us-east-1 --delete-test-object "$id/$namespace/source/s1/stream.encrypted"
+python3 tests/tooling/s3_probe.py --region us-east-1 --delete-test-object "$id/$namespace/source/s1/stream.encrypted"
 if cli restore "$prefix" "zfs:$namespace/source@s3" --target-dataset "$id/incomplete"; then
     echo "incomplete remote chain unexpectedly recovered an empty target" >&2
     exit 1
