@@ -89,8 +89,8 @@ Local results do not replace this remote check.
 
 ## Release automation
 
-The steps are in [CONTRIBUTING.md](CONTRIBUTING.md#releases). The release controller publishes only from
-a merged release PR whose exact merge commit passed `CI Gate` on `main`. The tag must be unchanged and
+The steps are in [CONTRIBUTING.md](CONTRIBUTING.md#releases). Release workflows are `workflow_dispatch`
+only. In publish mode the controller publishes only from a merged release PR whose exact merge commit passed `CI Gate` on `main`. The tag must be unchanged and
 the artifact digests must verify. Privileged jobs check out controller code from `main`. The helpers are
 tested by `tests/support/test_ci_release.py`, including recovery of an existing release branch without
 force-pushing.

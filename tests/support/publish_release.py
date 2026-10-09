@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import re
+import subprocess
 import sys
 import tempfile
 import tomllib
@@ -84,60 +85,17 @@ def select(root, mode, build_ref):
         return
     if os.environ.get("GITHUB_REF") != f"refs/heads/{main}":
         raise ValueError("publication and draft updates are restricted to trusted main")
-    if mode == "auto":
-        event = json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text())
-        workflow = event["workflow_run"]
-        if (workflow["head_repository"]["full_name"] != repo
-                or workflow["conclusion"] != "success"):
-            output({"action": "none"})
-            return
-        branch = workflow["head_branch"]
-        sha = workflow["head_sha"]
-        if branch.startswith(BRANCH_PREFIX):
-            if workflow["event"] not in ("workflow_dispatch", "pull_request", "push"):
-                output({"action": "none"})
-                return
-            prs = json.loads(run(
-                ["gh", "pr", "list", "--head", branch, "--base", main,
-                 "--json", "number,headRefOid,isDraft,labels"], root, capture=True,
-            ))
-            for pr in prs:
-                if (pr["headRefOid"] == sha and pr["isDraft"]
-                        and any(label["name"] == "release" for label in pr["labels"])):
-                    snapshot(root, sha)
-                    require_green(repo, root, sha)
-                    run(["gh", "pr", "ready", str(pr["number"])], root)
-                    print(f"Release PR #{pr['number']} is ready after complete CI")
-            output({"action": "none"})
-            return
-        if branch != main or workflow["event"] != "push":
-            output({"action": "none"})
-            return
-        associated = api(f"repos/{repo}/commits/{sha}/pulls", root)
-        prs = [
-            p for p in associated
-            if p["merged_at"] and p["merge_commit_sha"] == sha
-            and p["base"]["ref"] == main and p["head"]["ref"].startswith(BRANCH_PREFIX)
-            and any(label["name"] == "release" for label in p["labels"])
-        ]
-        if not prs:
-            print("Successful CI is not a release merge; no publication requested")
-            output({"action": "none"})
-            return
-        if len(prs) != 1:
-            raise ValueError("ambiguous release merge")
-    else:
-        plan = check_plan(root)
-        if plan is None:
-            raise ValueError("no release plan exists on main")
-        branch = f"{BRANCH_PREFIX}{plan['version']}"
-        prs = json.loads(run(
-            ["gh", "pr", "list", "--state", "merged", "--base", main,
-             "--head", branch, "--json", "number,mergeCommit"], root, capture=True,
-        ))
-        if len(prs) != 1:
-            raise ValueError("cannot identify exactly one accepted release PR")
-        sha = prs[0]["mergeCommit"]["oid"]
+    plan = check_plan(root)
+    if plan is None:
+        raise ValueError("no release plan exists on main")
+    branch = f"{BRANCH_PREFIX}{plan['version']}"
+    prs = json.loads(run(
+        ["gh", "pr", "list", "--state", "merged", "--base", main,
+         "--head", branch, "--json", "number,mergeCommit"], root, capture=True,
+    ))
+    if len(prs) != 1:
+        raise ValueError("cannot identify exactly one accepted release PR")
+    sha = prs[0]["mergeCommit"]["oid"]
     run(["git", "merge-base", "--is-ancestor", sha, f"origin/{main}"], root)
     version, _ = snapshot(root, sha)
     require_green(repo, root, sha)
@@ -217,7 +175,7 @@ def main():
     parser = argparse.ArgumentParser()
     commands = parser.add_subparsers(dest="command", required=True)
     choose = commands.add_parser("select")
-    choose.add_argument("--mode", choices=["auto", "build-only", "retry"], required=True)
+    choose.add_argument("--mode", choices=["build-only", "publish"], required=True)
     choose.add_argument("--build-ref", default="")
     send = commands.add_parser("publish")
     send.add_argument("--sha", required=True)

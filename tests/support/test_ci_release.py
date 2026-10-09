@@ -130,19 +130,21 @@ class ReleaseTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 publish_release.verify_assets(root)
 
-    def test_untrusted_workflow_run_cannot_publish(self):
-        with tempfile.TemporaryDirectory() as directory:
-            event = Path(directory) / "event.json"
-            event.write_text(json.dumps({"workflow_run": {
-                "head_repository": {"full_name": "foreign/repo"}, "conclusion": "success",
-            }}))
-            env = {"GITHUB_REPOSITORY": "fixture/repo", "GITHUB_REF": "refs/heads/main",
-                   "GITHUB_EVENT_PATH": str(event)}
-            with patch.dict(os.environ, env), patch.object(
-                publish_release, "api", return_value={"default_branch": "main"}
-            ), patch.object(publish_release, "output") as output:
-                publish_release.select(Path(directory), "auto", "")
-                output.assert_called_once_with({"action": "none"})
+    def test_publish_is_manual_and_main_only(self):
+        with self.assertRaises(SystemExit), patch("sys.argv", ["x", "select", "--mode", "auto"]):
+            publish_release.main()
+        workflow = (Path(__file__).resolve().parents[2] / ".github/workflows/release.yml").read_text()
+        triggers = workflow.split("\non:\n", 1)[1].split("\npermissions:", 1)[0]
+        self.assertIn("workflow_dispatch", triggers)
+        for automatic in ("workflow_run", "push", "pull_request", "schedule"):
+            self.assertNotIn(automatic, triggers)
+        env = {"GITHUB_REPOSITORY": "fixture/repo", "GITHUB_REF": "refs/heads/feature"}
+        with patch.dict(os.environ, env), patch.object(
+            publish_release, "api", return_value={"default_branch": "main"}
+        ), patch.object(publish_release, "output") as output:
+            with self.assertRaises(ValueError):
+                publish_release.select(Path.cwd(), "publish", "")
+            output.assert_not_called()
 
     def test_draft_upload_verification_precedes_publication(self):
         for damaged in (False, True):
