@@ -138,13 +138,12 @@ mod tests {
         assert_eq!(credentials.session_token.as_deref(), Some("t]"));
     }
 
-    const ENV: [&str; 6] = [
+    const ENV: [&str; 5] = [
         "AWS_ACCESS_KEY_ID",
         "AWS_SECRET_ACCESS_KEY",
         "AWS_SESSION_TOKEN",
         "AWS_PROFILE",
         "AWS_SHARED_CREDENTIALS_FILE",
-        "AWS_EC2_METADATA_DISABLED",
     ];
 
     /// Holds the environment lock; take only one per test.
@@ -206,45 +205,32 @@ mod tests {
     }
 
     #[test]
-    fn provider_requires_a_credential_source() {
+    fn credentials_require_an_environment_or_file_source() {
         let dir = tempfile::tempdir().unwrap();
-        let mut env = scoped_env(&dir.path().join("absent"));
-        env.set("AWS_EC2_METADATA_DISABLED", Some("TRUE"));
-        assert!(CredentialProvider::from_env(reqwest::Client::new()).is_err());
+        let path = dir.path().join("credentials");
+        let mut env = scoped_env(&path);
+        assert_eq!(
+            Credentials::from_env().err().unwrap().to_string(),
+            "no AWS credentials found; set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY or configure a shared credentials file"
+        );
+        std::fs::write(
+            &path,
+            "[backup]\naws_access_key_id=file\naws_secret_access_key=file-secret\naws_session_token=file-token\n",
+        )
+        .unwrap();
+        assert!(Credentials::from_env().is_err(), "default profile absent");
+        env.set("AWS_PROFILE", Some("backup"));
+        let file = Credentials::from_env().unwrap();
+        assert_eq!(file.access_key, "file");
+        assert_eq!(file.secret_key, "file-secret");
+        assert_eq!(file.session_token.as_deref(), Some("file-token"));
+
         env.set("AWS_ACCESS_KEY_ID", Some("a"));
         env.set("AWS_SECRET_ACCESS_KEY", Some("s"));
-        assert!(CredentialProvider::from_env(reqwest::Client::new()).is_ok());
-    }
-
-    /// Serves one HTTP response with `body` and returns its URL.
-    async fn serve_once(body: Vec<u8>) -> String {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}/", listener.local_addr().unwrap());
-        tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            let mut request = [0u8; 1024];
-            let _ = socket.read(&mut request).await;
-            let head = format!("HTTP/1.1 200 OK\r\ncontent-length: {}\r\n\r\n", body.len());
-            socket.write_all(head.as_bytes()).await.unwrap();
-            socket.write_all(&body).await.unwrap();
-        });
-        url
-    }
-
-    async fn read_served(body: Vec<u8>) -> Result<Vec<u8>> {
-        let url = serve_once(body).await;
-        let client = reqwest::Client::builder().no_proxy().build().unwrap();
-        read_limited(client.get(url).send().await.unwrap()).await
-    }
-
-    #[tokio::test]
-    async fn metadata_responses_are_bounded() {
-        let full: Vec<u8> = (0..MAX_IMDS_RESPONSE_BYTES).map(|i| i as u8).collect();
-        assert_eq!(read_served(full.clone()).await.unwrap(), full);
-        let mut over = full;
-        over.push(0);
-        let error = read_served(over).await.unwrap_err().to_string();
-        assert!(error.contains("exceeds 16384-byte limit"), "{error}");
+        env.set("AWS_SESSION_TOKEN", Some("env-token"));
+        let credentials = Credentials::from_env().unwrap();
+        assert_eq!(credentials.access_key, "a");
+        assert_eq!(credentials.secret_key, "s");
+        assert_eq!(credentials.session_token.as_deref(), Some("env-token"));
     }
 }

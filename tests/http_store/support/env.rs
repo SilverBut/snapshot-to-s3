@@ -8,7 +8,6 @@ pub(crate) struct EnvGuard {
     access: Option<String>,
     secret: Option<String>,
     token: Option<String>,
-    disabled: Option<String>,
     proxies: Vec<(&'static str, Option<String>)>,
 }
 
@@ -21,11 +20,9 @@ impl EnvGuard {
         let access = std::env::var("AWS_ACCESS_KEY_ID").ok();
         let secret = std::env::var("AWS_SECRET_ACCESS_KEY").ok();
         let token = std::env::var("AWS_SESSION_TOKEN").ok();
-        let disabled = std::env::var("AWS_EC2_METADATA_DISABLED").ok();
         std::env::set_var("AWS_ACCESS_KEY_ID", "fixture-access");
         std::env::set_var("AWS_SECRET_ACCESS_KEY", "fixture-secret");
         std::env::set_var("AWS_SESSION_TOKEN", "fixture-token");
-        std::env::remove_var("AWS_EC2_METADATA_DISABLED");
         let proxies = [
             "HTTP_PROXY",
             "HTTPS_PROXY",
@@ -48,7 +45,6 @@ impl EnvGuard {
             access,
             secret,
             token,
-            disabled,
             proxies,
         }
     }
@@ -59,7 +55,6 @@ impl Drop for EnvGuard {
         restore_env("AWS_ACCESS_KEY_ID", self.access.take());
         restore_env("AWS_SECRET_ACCESS_KEY", self.secret.take());
         restore_env("AWS_SESSION_TOKEN", self.token.take());
-        restore_env("AWS_EC2_METADATA_DISABLED", self.disabled.take());
         for (name, value) in self.proxies.drain(..) {
             restore_env(name, value);
         }

@@ -14,7 +14,6 @@ mkdir -m 700 -- "$root"
 mkdir "$root/logs" "$root/download" "$root/bin" "$root/scratch"
 export TMPDIR="$root/scratch"
 export PIP_CACHE_DIR="$root/scratch/pip-cache"
-export AWS_EC2_METADATA_DISABLED=true
 export E2E_RUNTIME_DIR="$root/zfs"
 export E2E_GPG_DIR="$root/g"
 export E2E_MIN_FREE_BYTES=4294967296
