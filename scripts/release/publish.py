@@ -218,7 +218,14 @@ def publish(root: Path, sha: str, directory: Path) -> None:
         else:
             run(["gh", "release", "edit", tag, "--notes-file", notes_file.name], root)
     run(["gh", "release", "upload", tag, str(archive), str(checksums), "--clobber"], root)
-    assets = api(f"repos/{repo}/releases/tags/{tag}", root)["assets"]
+    records = [r for r in release_records(repo, root) if r["tag_name"] == tag]
+    if len(records) != 1:
+        raise ValueError("cannot identify exactly one draft release after asset upload")
+    release_path = f"repos/{repo}/releases/{records[0]['id']}"
+    release = api(release_path, root)
+    if not release["draft"]:
+        raise ValueError("release is no longer a draft; publication stopped")
+    assets = release["assets"]
     expected = {p.name: p for p in (archive, checksums)}
     if {a["name"] for a in assets} != set(expected):
         raise ValueError("draft contains missing or unexpected release assets")
@@ -242,7 +249,7 @@ def publish(root: Path, sha: str, directory: Path) -> None:
         ],
         root,
     )
-    release = api(f"repos/{repo}/releases/tags/{tag}", root)
+    release = api(release_path, root)
     if release["draft"]:
         raise ValueError("release publication was not confirmed")
     print(f"Published {tag} from frozen commit {sha}: {release['html_url']}")

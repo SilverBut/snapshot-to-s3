@@ -242,8 +242,15 @@ class ReleaseTests(unittest.TestCase):
             output.assert_not_called()
 
     def test_draft_upload_verification_precedes_publication(self):
-        for damaged in (False, True):
-            with self.subTest(damaged=damaged), tempfile.TemporaryDirectory() as directory:
+        for existing, damage in (
+            (existing, damage)
+            for existing in (False, True)
+            for damage in (None, "digest", "size", "missing", "unexpected")
+        ):
+            with (
+                self.subTest(existing=existing, damage=damage),
+                tempfile.TemporaryDirectory() as directory,
+            ):
                 root = Path(directory)
                 archive = root / "snapshot-to-s3-linux-x86_64.tar.gz"
                 archive.write_bytes(b"verified fixture")
@@ -259,47 +266,108 @@ class ReleaseTests(unittest.TestCase):
                     }
                     for p in (archive, sums)
                 ]
-                if damaged:
+                if damage == "digest":
                     assets[0]["digest"] = "sha256:" + "0" * 64
+                elif damage == "size":
+                    assets[0]["size"] += 1
+                elif damage == "missing":
+                    assets.pop()
+                elif damage == "unexpected":
+                    assets.append({**assets[0], "name": "unexpected"})
                 calls = []
-                replies = iter(
-                    [
-                        {"default_branch": "main"},
-                        {"assets": assets, "draft": True},
-                        {"draft": False, "html_url": "https://example.invalid/release"},
-                    ]
-                )
+                draft = {"id": 123, "tag_name": "v0.1.0", "draft": True}
+
+                def api_reply(path, _root, calls=calls, draft=draft, assets=assets):
+                    if path == "repos/fixture/repo":
+                        return {"default_branch": "main"}
+                    if path == "repos/fixture/repo/releases/tags/v0.1.0":
+                        raise subprocess.CalledProcessError(1, ["gh", "api", path])
+                    self.assertEqual(path, "repos/fixture/repo/releases/123")
+                    if any("--draft=false" in command for command in calls):
+                        return {"draft": False, "html_url": "https://example.invalid/release"}
+                    return {**draft, "assets": assets}
+
                 env = {"GITHUB_REPOSITORY": "fixture/repo", "GITHUB_REF": "refs/heads/main"}
                 with (
                     patch.dict(os.environ, env),
-                    patch.object(publish_release, "api", side_effect=replies),
+                    patch.object(publish_release, "api", side_effect=api_reply) as api,
                     patch.object(
                         publish_release, "snapshot", return_value=("0.1.0", "- Approved.")
                     ),
                     patch.object(publish_release, "require_green"),
                     patch.object(publish_release, "verify_tag", return_value=True),
-                    patch.object(publish_release, "release_records", return_value=[]),
+                    patch.object(
+                        publish_release,
+                        "release_records",
+                        side_effect=[[draft] if existing else [], [draft]],
+                    ),
                     patch.object(
                         publish_release,
                         "run",
                         side_effect=lambda command, *_, calls=calls: calls.append(command),
                     ),
                 ):
-                    if damaged:
+                    if damage:
                         with self.assertRaises(ValueError):
                             publish_release.publish(root, "a" * 40, root)
                     else:
                         publish_release.publish(root, "a" * 40, root)
-                create = next(
-                    i for i, c in enumerate(calls) if c[:3] == ["gh", "release", "create"]
-                )
+                created = [c for c in calls if c[:3] == ["gh", "release", "create"]]
                 upload = next(
                     i for i, c in enumerate(calls) if c[:3] == ["gh", "release", "upload"]
                 )
-                self.assertIn("--draft", calls[create])
-                self.assertLess(create, upload)
+                if existing:
+                    self.assertEqual(created, [])
+                    edit = next(
+                        i
+                        for i, c in enumerate(calls)
+                        if c[:3] == ["gh", "release", "edit"] and "--notes-file" in c
+                    )
+                    self.assertLess(edit, upload)
+                else:
+                    self.assertEqual(len(created), 1)
+                    self.assertIn("--draft", created[0])
+                    self.assertLess(calls.index(created[0]), upload)
                 published = [c for c in calls if "--draft=false" in c]
-                self.assertEqual(len(published), 0 if damaged else 1)
+                self.assertEqual(len(published), 0 if damage else 1)
+                self.assertEqual(
+                    [call.args[0] for call in api.call_args_list],
+                    ["repos/fixture/repo"]
+                    + ["repos/fixture/repo/releases/123"] * (1 if damage else 2),
+                )
+
+    def test_missing_ambiguous_or_promoted_draft_stops_publication(self):
+        draft = {"id": 123, "tag_name": "v0.1.0", "draft": True}
+        for records, response, message in (
+            ([], None, "cannot identify exactly one draft release"),
+            ([draft, {**draft, "id": 456}], None, "cannot identify exactly one draft release"),
+            ([draft], {"draft": False}, "release is no longer a draft"),
+        ):
+            with self.subTest(records=records, response=response):
+                env = {"GITHUB_REPOSITORY": "fixture/repo", "GITHUB_REF": "refs/heads/main"}
+                with (
+                    patch.dict(os.environ, env),
+                    patch.object(
+                        publish_release,
+                        "api",
+                        side_effect=[{"default_branch": "main"}, response],
+                    ),
+                    patch.object(publish_release, "snapshot", return_value=("0.1.0", "Notes")),
+                    patch.object(publish_release, "require_green"),
+                    patch.object(publish_release, "verify_tag", return_value=True),
+                    patch.object(
+                        publish_release,
+                        "verify_assets",
+                        return_value=(Path("archive"), Path("SHA256SUMS")),
+                    ),
+                    patch.object(publish_release, "release_records", side_effect=[[], records]),
+                    patch.object(publish_release, "run") as run,
+                ):
+                    with self.assertRaisesRegex(ValueError, message):
+                        publish_release.publish(Path.cwd(), "a" * 40, Path.cwd())
+                    self.assertFalse(
+                        any("--draft=false" in call.args[0] for call in run.call_args_list)
+                    )
 
     def test_published_release_is_never_overwritten(self):
         with tempfile.TemporaryDirectory() as directory:
