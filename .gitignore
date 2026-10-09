@@ -6,3 +6,7 @@
 
 # Default GnuPG runtime directories of tests/support/zfs_s3_e2e.sh
 /.gpg_*/
+
+# Python bytecode
+__pycache__/
+*.pyc
