@@ -118,6 +118,52 @@ async fn conditional_capability_probe_rejects_ignored_metadata_and_cleans_lock_k
     assert!(requests.contains("/.lock HTTP/1.1"));
     assert!(requests.contains("x-fixture-meta-http-store-capability:"));
     assert!(requests.contains("DELETE /fixture-bucket/backups/snapshot/.snapshot-to-s3-probes/"));
+    for (head, body) in split_captured_requests(requests.as_bytes())
+        .into_iter()
+        .take(2)
+    {
+        assert!(head.starts_with("PUT "));
+        assert!(head.lines().any(|line| line == "content-length: 0"));
+        assert!(!head.to_ascii_lowercase().contains("transfer-encoding:"));
+        assert!(body.is_empty());
+        assert!(head.contains("if-none-match: *"));
+        verify_wire_signature(&format!("{head}\r\n\r\n"), "fixture-secret");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn empty_put_and_multipart_post_send_explicit_zero_content_length() -> Result<()> {
+    let _env = EnvGuard::new();
+    let xml = "<InitiateMultipartUploadResult><UploadId>upload-id</UploadId></InitiateMultipartUploadResult>";
+    let (endpoint, server) = fixture_sequence(vec![
+        "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into(),
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{xml}",
+            xml.len()
+        ),
+    ])
+    .await?;
+    let store = HttpStore::new(config(endpoint)).await?;
+    store
+        .put("empty", Bytes::new(), &MetadataMap::new())
+        .await?;
+    assert_eq!(
+        store.create_upload("stream", &MetadataMap::new()).await?,
+        "upload-id"
+    );
+    let requests = split_captured_requests(&server.await?);
+    assert_eq!(requests.len(), 2);
+    assert!(requests[0].0.starts_with("PUT /fixture-bucket/empty "));
+    assert!(requests[1]
+        .0
+        .starts_with("POST /fixture-bucket/stream?uploads= "));
+    for (head, body) in requests {
+        assert!(head.lines().any(|line| line == "content-length: 0"));
+        assert!(!head.to_ascii_lowercase().contains("transfer-encoding:"));
+        assert!(body.is_empty());
+        verify_wire_signature(&format!("{head}\r\n\r\n"), "fixture-secret");
+    }
     Ok(())
 }
 
