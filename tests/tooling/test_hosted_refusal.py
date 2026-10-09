@@ -24,7 +24,7 @@ class HostedGuardTests(unittest.TestCase):
             "RUNNER_OS": runner_os,
         }
         result = subprocess.run(
-            ["bash", str(Path(__file__).with_name(script))],
+            ["bash", str(Path(__file__).resolve().parents[1] / "provision" / script)],
             env=env,
             capture_output=True,
             text=True,

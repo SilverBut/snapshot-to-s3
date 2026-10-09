@@ -10,7 +10,7 @@ import sys
 import tempfile
 import tomllib
 
-from release import (
+from scripts.release.prepare import (
     BRANCH_PREFIX, PLAN_PATH, NOTES_PATH, api, check_plan,
     parse_version, release_records, run, validate_proposal,
 )

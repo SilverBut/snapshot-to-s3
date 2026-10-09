@@ -8,9 +8,9 @@ Requires stable Rust. Run these before opening a pull request; CI runs them too:
 cargo fmt --all -- --check
 cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo test --locked
-python3 -m unittest discover -s tests/support -p 'test_ci_*.py'
-python3 tests/support/release.py check
-shellcheck tests/support/*.sh
+python3 -m unittest discover -s tests/tooling -p 'test_*.py'
+python3 -m scripts.release.prepare check
+shellcheck tests/e2e/*.sh tests/provision/*.sh tests/provision/lib/*.sh
 ```
 
 Tests that need ZFS, a local S3 service or the official Tink runtime are opt-in. See
@@ -23,7 +23,7 @@ See the [architecture](docs/design.md#architecture). In short:
 * Unit tests sit next to the code. Workflow tests against in-memory fakes are in
   `src/workflow_tests.rs`, and the fakes are in `src/testing.rs`.
 * Integration tests are in `tests/`, with static fixtures in `tests/fixtures/` and scripts in
-  `tests/support/`.
+  `tests/e2e/`, `tests/provision/` and `tests/tooling/`; release and CI tools are in `scripts/`.
 * Keep `backup`/`restore` independent of HTTP and ZFS details; they use the `ObjectStore` and `Zfs`
   traits.
 * Every buffer must have a fixed bound. Never read a stream, or anything whose size the user controls,

@@ -11,7 +11,7 @@ LOCAL_S3_MIN_FREE_BYTES="${LOCAL_S3_MIN_FREE_BYTES:-}"
 
 usage() {
   cat <<'EOF'
-Usage: tests/support/local_s3.sh RUNTIME_DIR
+Usage: tests/e2e/local_s3.sh RUNTIME_DIR
 
 Starts a single-node SeaweedFS S3 endpoint on loopback in attached foreground mode.
 

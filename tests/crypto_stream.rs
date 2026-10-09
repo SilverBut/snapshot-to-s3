@@ -159,7 +159,7 @@ async fn official_tink_runtime_bidirectional() {
     let mut child = tokio::process::Command::new(python)
         .arg(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/tests/support/tink_interop.py"
+            "/tests/tooling/tink_interop.py"
         ))
         .arg("--round-trip")
         .stdin(Stdio::piped())

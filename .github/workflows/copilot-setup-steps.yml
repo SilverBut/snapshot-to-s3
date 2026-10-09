@@ -16,8 +16,8 @@ on:
     branches: [main]
     paths:
       - .github/workflows/copilot-setup-steps.yml
-      - tests/support/copilot_setup.sh
-      - tests/support/hosted_environment.sh
+      - tests/provision/copilot_setup.sh
+      - tests/provision/lib/hosted.sh
 
 jobs:
   copilot-setup-steps:
@@ -49,8 +49,8 @@ jobs:
           cargo fetch --locked
       - name: Prepare the retained development pool and pinned test tools
         shell: bash
-        run: bash tests/support/copilot_setup.sh
+        run: bash tests/provision/copilot_setup.sh
       - name: Verify handoff using only the already prepared pool
         if: inputs.verify_e2e
         shell: bash
-        run: bash tests/support/copilot_setup.sh --verify
+        run: bash tests/provision/copilot_setup.sh --verify

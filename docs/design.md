@@ -74,7 +74,7 @@ Mutating commands are checked by exit status. Test harnesses can point `SNAPSHOT
 
 | Scenario | Tests |
 | --- | --- |
-| Full and incremental recovery, data and GUIDs | `tests/support/zfs_s3_e2e.sh`; `src/workflow_tests.rs` |
+| Full and incremental recovery, data and GUIDs | `tests/e2e/run.sh`; `src/workflow_tests.rs` |
 | Multi-object streams | `src/workflow_tests.rs::multi_object_stream_round_trip`; `store::multipart` and `store::chain` tests; E2E with `--max-object-size` |
 | Incomplete remote chain | E2E (deleted `s1`); `restore::prepare::local_declared_base_needs_no_remote_parent` |
 | Changed target or failing `zfs diff` stops before downloads | `restore::prepare::{dirty_target_stops_before_any_verification_download, diff_command_failure_stops_before_verification}`; E2E |

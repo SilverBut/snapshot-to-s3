@@ -2,8 +2,8 @@
 set -euo pipefail
 umask 077
 
-# shellcheck source=tests/support/hosted_environment.sh
-source "$(dirname "$0")/hosted_environment.sh"
+# shellcheck source=tests/provision/lib/hosted.sh
+source "$(dirname "$0")/lib/hosted.sh"
 require_hosted_environment
 
 cd "$(dirname "$0")/../.."
@@ -100,7 +100,7 @@ trap 'exit 143' TERM
 
 create_hosted_pool "$root" "$pool" 2G "$E2E_MIN_FREE_BYTES"
 install_test_tools "$root"
-"$root/venv/bin/python" tests/support/tink_interop.py \
+"$root/venv/bin/python" tests/tooling/tink_interop.py \
     2>&1 | tee "$root/logs/tink-interop.log"
 TINK_PYTHON="$root/venv/bin/python" \
     cargo test --locked --test crypto_stream official_tink_runtime_bidirectional -- --ignored \
@@ -111,7 +111,7 @@ cargo build --locked 2>&1 | tee "$root/logs/build.log"
 
 export DOWNLOAD_DIR="$root/download"
 export BUILD_ARTIFACT_DIR="$PWD/target"
-bash tests/support/local_s3.sh "$root/s3" > "$root/logs/local-s3.log" 2>&1 &
+bash tests/e2e/local_s3.sh "$root/s3" > "$root/logs/local-s3.log" 2>&1 &
 service_pid=$!
 service_stopped=false
 ready=false
@@ -135,8 +135,8 @@ source "$root/s3/local_s3.env"
 export TEST_S3_ENDPOINT="$LOCAL_S3_ENDPOINT"
 export TEST_S3_BUCKET="$LOCAL_S3_BUCKET"
 curl --silent --show-error --max-time 10 "$TEST_S3_ENDPOINT/" --output /dev/null
-python3 tests/support/s3_probe.py --region us-east-1 \
+python3 tests/tooling/s3_probe.py --region us-east-1 \
     2>&1 | tee "$root/logs/s3-probe.log"
 cargo test --locked --test live_http -- --ignored --nocapture \
     2>&1 | tee "$root/logs/live-http.log"
-bash tests/support/zfs_s3_e2e.sh 2>&1 | tee "$root/logs/zfs-s3-e2e.log"
+bash tests/e2e/run.sh 2>&1 | tee "$root/logs/zfs-s3-e2e.log"

@@ -1,7 +1,7 @@
 import json
 import unittest
 
-from ci_gate import REQUIRED_JOBS, failures
+from scripts.ci.gate import REQUIRED_JOBS, failures
 
 
 class GateTests(unittest.TestCase):
