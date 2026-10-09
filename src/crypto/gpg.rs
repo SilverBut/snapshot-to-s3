@@ -222,7 +222,9 @@ async fn run_gpg(
     let stderr = child.stderr.take().expect("piped GPG stderr");
     let input_task = async move {
         match (stdin, input) {
-            (Some(mut stdin), Some(bytes)) => stdin.write_all(bytes).await.context("write GPG input"),
+            (Some(mut stdin), Some(bytes)) => {
+                stdin.write_all(bytes).await.context("write GPG input")
+            }
             (None, Some(_)) => bail!("GPG stdin pipe was not created"),
             (Some(mut stdin), None) => stdin.shutdown().await.context("close GPG stdin"),
             (None, None) => Ok(()),

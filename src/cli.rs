@@ -173,7 +173,11 @@ pub async fn run(cli: Cli) -> Result<()> {
     result
 }
 
-async fn run_backup(args: BackupArgs, zfs: Arc<SystemZfs>, cancel: CancellationToken) -> Result<()> {
+async fn run_backup(
+    args: BackupArgs,
+    zfs: Arc<SystemZfs>,
+    cancel: CancellationToken,
+) -> Result<()> {
     let limits = args.parts.limits();
     limits.validate()?;
     let location = args.destination;
@@ -303,14 +307,25 @@ mod tests {
         Cli::command().debug_assert();
         let backup = ["backup", "zfs:pool/data@s1", "s3://bucket/backups"];
         assert!(parses(
-            &[&backup[..], &["--gpg-key-id", "recipient", "--force-full-snapshot"]].concat()
+            &[
+                &backup[..],
+                &["--gpg-key-id", "recipient", "--force-full-snapshot"]
+            ]
+            .concat()
         ));
         assert!(!parses(
-            &[&backup[..], &["--gpg-key-id", "recipient", "--secret-access-key", "secret"]]
-                .concat()
+            &[
+                &backup[..],
+                &["--gpg-key-id", "recipient", "--secret-access-key", "secret"]
+            ]
+            .concat()
         ));
         assert!(!parses(
-            &[&backup[..], &["--gpg-key-id", "recipient", "--rate-limit", "0"]].concat()
+            &[
+                &backup[..],
+                &["--gpg-key-id", "recipient", "--rate-limit", "0"]
+            ]
+            .concat()
         ));
         assert!(!parses(&[
             "backup",
@@ -319,8 +334,16 @@ mod tests {
             "--gpg-key-id",
             "recipient"
         ]));
-        assert!(parses(&["restore", "s3://bucket/backups", "stdout:pool/data@s1"]));
-        assert!(parses(&["restore", "s3://bucket/backups", "zfs:pool/data@s1"]));
+        assert!(parses(&[
+            "restore",
+            "s3://bucket/backups",
+            "stdout:pool/data@s1"
+        ]));
+        assert!(parses(&[
+            "restore",
+            "s3://bucket/backups",
+            "zfs:pool/data@s1"
+        ]));
         assert!(!parses(&["restore", "s3://bucket/backups", "pool/data@s1"]));
     }
 

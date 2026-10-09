@@ -80,7 +80,9 @@ fn with_cleanup(result: Result<()>, cleanup: Result<()>, probe: &str) -> Result<
     match (result, cleanup) {
         (Ok(()), Ok(())) => Ok(()),
         (Err(error), Ok(())) => Err(error),
-        (Ok(()), Err(error)) => Err(error.context(format!("{probe} capability probe cleanup failed"))),
+        (Ok(()), Err(error)) => {
+            Err(error.context(format!("{probe} capability probe cleanup failed")))
+        }
         (Err(error), Err(cleanup)) => Err(error.context(format!(
             "{probe} capability probe cleanup also failed: {cleanup:#}"
         ))),

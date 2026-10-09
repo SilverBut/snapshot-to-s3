@@ -238,7 +238,9 @@ impl ObjectStore for HttpStore {
         };
         match root.as_str() {
             "CompleteMultipartUploadResult" => Ok(()),
-            "Error" => Err(HttpStatusFailure::from_error_document(operation, status, &bytes).into()),
+            "Error" => {
+                Err(HttpStatusFailure::from_error_document(operation, status, &bytes).into())
+            }
             root => bail!("unexpected CompleteMultipartUpload XML root: {root}"),
         }
     }

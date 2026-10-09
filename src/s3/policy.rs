@@ -50,9 +50,12 @@ impl HttpPolicy {
                 "SNAPSHOT_TO_S3_HTTP_CONTROL_TIMEOUT_SECS",
                 default.control_timeout.as_secs(),
             )?),
-            get_retries: env_u64("SNAPSHOT_TO_S3_HTTP_GET_RETRIES", default.get_retries as u64)?
-                .try_into()
-                .context("HTTP GET retry count exceeds platform limit")?,
+            get_retries: env_u64(
+                "SNAPSHOT_TO_S3_HTTP_GET_RETRIES",
+                default.get_retries as u64,
+            )?
+            .try_into()
+            .context("HTTP GET retry count exceeds platform limit")?,
             retry_backoff: Duration::from_millis(env_u64(
                 "SNAPSHOT_TO_S3_HTTP_BACKOFF_MILLIS",
                 default.retry_backoff.as_millis() as u64,

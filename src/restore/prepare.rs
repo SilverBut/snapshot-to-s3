@@ -92,7 +92,8 @@ pub async fn prepare(
                     break;
                 }
                 common_older |= target_info.snapshots.iter().any(|s| s.guid == base);
-                let parent_source = location.snapshot_of_stream_key(&selected.dataset, &parent_key)?;
+                let parent_source =
+                    location.snapshot_of_stream_key(&selected.dataset, &parent_key)?;
                 let Some(head) = store.head(&parent_key).await? else {
                     eprintln!(
                         "warning: remote chain cannot recover an empty target; \

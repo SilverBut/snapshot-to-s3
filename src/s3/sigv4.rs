@@ -77,7 +77,11 @@ pub(super) fn uri_encode(input: &str) -> String {
 
 /// Encodes an object key as path segments, keeping `/`.
 pub(super) fn encode_key(input: &str) -> String {
-    input.split('/').map(uri_encode).collect::<Vec<_>>().join("/")
+    input
+        .split('/')
+        .map(uri_encode)
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 fn hmac(key: &[u8], value: &[u8]) -> Vec<u8> {
