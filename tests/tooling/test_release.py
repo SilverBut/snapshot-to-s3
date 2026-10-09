@@ -85,6 +85,17 @@ class ReleaseTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             release.notes_section(reviewed + "\n## [0.1.0]\n- Duplicate", "0.1.0")
 
+    def test_generated_notes_are_added_to_marked_release_draft(self):
+        text = release.prepare_notes("", "0.1.0", "- Generated user-facing change.")
+        self.assertIn(release.NOTES_MARKER, text)
+        with self.assertRaises(ValueError):
+            release.notes_section(text, "0.1.0")
+        reviewed = text.replace(release.NOTES_MARKER, "")
+        self.assertEqual(
+            release.notes_section(reviewed, "0.1.0"),
+            "- Generated user-facing change.",
+        )
+
     def test_plan_checks_all_three_version_sources(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

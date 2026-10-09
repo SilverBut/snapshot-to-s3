@@ -123,7 +123,9 @@ def _plan_release(root: Path, repo: str, bump: str, channel: str, source_sha: st
     }
 
 
-def _commit_release_branch(root: Path, plan: dict, branch: str) -> None:
+def _commit_release_branch(
+    root: Path, plan: dict, branch: str, generated_notes: str | None = None
+) -> None:
     """Create or resume the release branch and push the proposal commit.
 
     A resumed branch keeps its maintainer-edited notes and only merges main.
@@ -141,7 +143,9 @@ def _commit_release_branch(root: Path, plan: dict, branch: str) -> None:
         run(["git", "merge", "--no-edit", plan["prepared_from"]], root)
     else:
         run(["git", "switch", "-c", branch], root)
-        (root / NOTES_PATH).write_text(prepare_notes(read_notes(root), target))
+        (root / NOTES_PATH).write_text(
+            prepare_notes(read_notes(root), target, generated_notes)
+        )
         update_versions(root, target)
     (root / PLAN_PATH).parent.mkdir(exist_ok=True)
     (root / PLAN_PATH).write_text(json.dumps(plan, indent=2) + "\n")
@@ -164,7 +168,8 @@ def _open_release_pr(root: Path, plan: dict, branch: str, main: str) -> None:
     )
     body = (
         f"Prepare **v{target}** from `{source_sha}`.\n\n"
-        "Edit this PR's CHANGELOG version section and remove the review marker. "
+        "Review the generated draft in this PR's CHANGELOG version section and remove "
+        "the review marker. "
         "CI validates the version, notes and all infrastructure tests. "
         "After CI passes, merge with a merge commit, then run Actions → Release "
         "in publish mode. Nothing is published automatically.\n\n"
@@ -233,7 +238,13 @@ def _write_step_summary(plan: dict, branch: str) -> None:
             )
 
 
-def prepare(root: Path, bump: str, channel: str, dry_run: bool) -> None:
+def prepare(
+    root: Path,
+    bump: str,
+    channel: str,
+    dry_run: bool,
+    generated_notes: str | None = None,
+) -> None:
     repo = os.environ["GITHUB_REPOSITORY"]
     main = api(f"repos/{repo}", root)["default_branch"]
     if not dry_run and (
@@ -247,7 +258,7 @@ def prepare(root: Path, bump: str, channel: str, dry_run: bool) -> None:
     branch = f"{BRANCH_PREFIX}{target}"
     if dry_run:
         print(json.dumps(plan, indent=2))
-        print(prepare_notes(read_notes(root), target))
+        print(prepare_notes(read_notes(root), target, generated_notes))
         return
     prs = json.loads(
         run(
@@ -270,7 +281,7 @@ def prepare(root: Path, bump: str, channel: str, dry_run: bool) -> None:
     )
     if any(p["headRefName"] != branch for p in prs):
         raise ValueError("another release PR is open; finish or close it first")
-    _commit_release_branch(root, plan, branch)
+    _commit_release_branch(root, plan, branch, generated_notes)
     if prs:
         print(f"Preserved existing notes and release PR: {prs[0]['url']}")
     else:
@@ -289,13 +300,19 @@ def main() -> int:
         "--channel", choices=["stable", "alpha", "beta", "pre", "rc"], default="stable"
     )
     create.add_argument("--dry-run", action="store_true")
+    create.add_argument("--generated-notes-file", type=Path)
     args = parser.parse_args()
     root = Path.cwd()
     try:
         if args.command == "check":
             check_plan(root)
         else:
-            prepare(root, args.bump, args.channel, args.dry_run)
+            generated_notes = (
+                args.generated_notes_file.read_text()
+                if args.generated_notes_file
+                else None
+            )
+            prepare(root, args.bump, args.channel, args.dry_run, generated_notes)
     except (ValueError, KeyError, OSError, subprocess.CalledProcessError) as error:
         print(f"Release preparation failed: {error}", file=sys.stderr)
         return 1
