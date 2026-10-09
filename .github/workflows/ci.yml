@@ -60,9 +60,14 @@ jobs:
           key: rust-${{ runner.os }}-${{ runner.arch }}-lint-${{ hashFiles('Cargo.lock') }}
       - run: cargo fmt --all -- --check
       - run: cargo clippy --locked --all-targets --all-features -- -D warnings
-      - name: Validate CI scripts and failure gate
+      - name: Lint shell scripts
+        run: git ls-files -z '*.sh' | xargs -0 shellcheck -x
+      - name: Lint and format-check Python tooling
         run: |
-          shellcheck tests/provision/ci_e2e.sh tests/e2e/local_s3.sh tests/e2e/run.sh tests/provision/lib/hosted.sh tests/provision/copilot_setup.sh
+          pipx run ruff==0.16.10 check .
+          pipx run ruff==0.16.10 format --check .
+      - name: Test Python tooling and the release controller
+        run: |
           python3 -m unittest discover -s tests/tooling -p 'test_*.py' -v
           python3 -m scripts.release.prepare check
 
