@@ -21,7 +21,7 @@ use crate::model::MetadataMap;
 use anyhow::{bail, Context, Result};
 use bytes::Bytes;
 use chrono::Utc;
-use credentials::CredentialProvider;
+use credentials::Credentials;
 use error::HttpStatusFailure;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use reqwest::{Method, Response, Url};
@@ -52,7 +52,7 @@ pub struct HttpConfig {
 pub struct HttpStore {
     config: HttpConfig,
     client: reqwest::Client,
-    credentials: Arc<CredentialProvider>,
+    credentials: Arc<Credentials>,
     metadata_header_prefix: String,
     endpoint: Url,
     policy: HttpPolicy,
@@ -79,7 +79,7 @@ impl HttpStore {
             .connect_timeout(Duration::from_secs(10))
             .build()
             .context("create S3 HTTP client")?;
-        let credentials = Arc::new(CredentialProvider::from_env(client.clone())?);
+        let credentials = Arc::new(Credentials::from_env()?);
         Ok(Self {
             config,
             client,
@@ -142,7 +142,6 @@ impl HttpStore {
         mut headers: HeaderMap,
         body: Bytes,
     ) -> Result<Response> {
-        let credentials = self.credentials.get().await?;
         let url = self.object_url(key, query)?;
         let scope = sigv4::Scope {
             region: &self.config.region,
@@ -153,7 +152,7 @@ impl HttpStore {
             &method,
             &url,
             &body,
-            &credentials,
+            &self.credentials,
             &scope,
             Utc::now(),
         )?;
