@@ -10,7 +10,7 @@ mod verify;
 
 use crate::crypto;
 use crate::model::{Reader, S3Location, SnapshotName};
-use crate::store::ObjectStore;
+use crate::store::{read_chain, ObjectStore};
 use crate::zfs::Zfs;
 use anyhow::{bail, Context, Result};
 use std::sync::Arc;
@@ -78,7 +78,7 @@ pub async fn restore<W: AsyncWrite + Unpin>(
         }
         let name = node.key.clone();
         verified.push(
-            verify(store.as_ref(), node)
+            verify(&store, node)
                 .await
                 .with_context(|| format!("verification failed for {name}; no replay started"))?,
         );
@@ -88,7 +88,7 @@ pub async fn restore<W: AsyncWrite + Unpin>(
     for backup in verified {
         let stream_key = backup.node.key.clone();
         let snapshot_guid = backup.node.index.current_snapshot_id.clone();
-        if let Err(error) = replay(store.as_ref(), zfs.as_ref(), &options, backup, stdout).await {
+        if let Err(error) = replay(&store, zfs.as_ref(), &options, backup, stdout).await {
             if options.target.is_none() {
                 bail!(
                     "incomplete stdout export of {stream_key}; partial authenticated output \
@@ -113,14 +113,19 @@ pub async fn restore<W: AsyncWrite + Unpin>(
 /// Decrypts one stream into the target or stdout. For a target, checks that
 /// the received snapshot has the authenticated GUID.
 async fn replay<W: AsyncWrite + Unpin>(
-    store: &dyn ObjectStore,
+    store: &Arc<dyn ObjectStore>,
     zfs: &dyn Zfs,
     options: &RestoreOptions,
     backup: VerifiedBackup,
     stdout: &mut W,
 ) -> Result<()> {
-    let VerifiedBackup { node, key, aad } = backup;
-    let mut ciphertext = store.get(&node.key, Some(&node.head.etag), None).await?;
+    let VerifiedBackup {
+        node,
+        key,
+        aad,
+        objects,
+    } = backup;
+    let mut ciphertext = read_chain(store.clone(), objects);
     let (reader, mut writer) = tokio::io::duplex(DECRYPTED_PIPE_BYTES);
     let cancel = options.cancel.clone();
     let decryption = tokio::spawn(async move {
@@ -144,7 +149,14 @@ async fn replay<W: AsyncWrite + Unpin>(
         decryption.abort();
     }
     let authenticated = decryption.await;
-    result?;
+    if let Err(error) = result {
+        // A download or authentication failure usually causes the consumer
+        // failure; report both.
+        if let Ok(Err(cause)) = authenticated {
+            bail!("{error:#}; stream input failed: {cause:#}");
+        }
+        return Err(error);
+    }
     authenticated.context("decryption task failed")??;
     if let Some(target) = &options.target {
         let received = zfs

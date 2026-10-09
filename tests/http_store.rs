@@ -896,8 +896,7 @@ async fn upload_parts_retries_identical_bytes_and_returns_only_final_etag() -> R
     let (endpoint, server) = fixture_sequence(responses).await?;
     let store = HttpStore::new(config(endpoint)).await?;
     let ciphertext = b"tiny".to_vec();
-    let mut reader: snapshot_to_s3::model::Reader =
-        Box::new(std::io::Cursor::new(ciphertext.clone()));
+    let mut reader = std::io::Cursor::new(ciphertext.clone());
     let result = upload_parts(
         &store,
         "stream",
@@ -915,6 +914,7 @@ async fn upload_parts_retries_identical_bytes_and_returns_only_final_etag() -> R
     )
     .await?;
     assert_eq!(result.bytes, ciphertext.len() as u64);
+    assert!(result.ended);
     assert_eq!(result.parts.len(), 1);
     assert_eq!(result.parts[0].number, 1);
     assert_eq!(result.parts[0].etag, "\"final-etag\"");

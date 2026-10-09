@@ -19,10 +19,20 @@ pub mod object {
     pub const KEY_CHECKSUM: &str = "key.sha256sum";
     /// Authenticated [`BackupMetadata`](super::BackupMetadata) JSON.
     pub const METADATA: &str = "meta.json.encrypted";
-    /// Encrypted `zfs send` stream; its existence is the commit point.
+    /// First object of the encrypted `zfs send` stream; its existence is the
+    /// commit point.
     pub const STREAM: &str = "stream.encrypted";
     /// Encrypted, bounded backup diagnostics.
     pub const LOG: &str = "backup.log.encrypted";
+    /// Most continuation objects of one stream.
+    pub const MAX_CONTINUATIONS: u32 = 999_999;
+
+    /// Key of continuation `n` (from 1) of the stream at `stream_key`. A
+    /// stream larger than one object continues in `stream.encrypted.000001`,
+    /// `.000002`, … up to the first absent key.
+    pub fn continuation(stream_key: &str, n: u32) -> String {
+        format!("{stream_key}.{n:06}")
+    }
 }
 
 /// Largest small object (key, metadata, log) that is read into memory.

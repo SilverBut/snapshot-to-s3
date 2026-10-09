@@ -76,12 +76,16 @@ struct RestoreArgs {
 
 #[derive(Args)]
 struct PartArgs {
+    /// Provider minimum size of every part but the last
     #[arg(long, default_value_t = 5 * 1024 * 1024)]
     min_part_size: u64,
+    /// Provider maximum part size
     #[arg(long, default_value_t = 5 * 1024 * 1024 * 1024)]
     max_part_size: u64,
+    /// Provider maximum parts per object
     #[arg(long, default_value_t = 10_000)]
     max_parts: u32,
+    /// Largest object; longer streams continue in further objects
     #[arg(long, default_value_t = 5 * 1024 * 1024 * 1024 * 1024)]
     max_object_size: u64,
     /// Largest part held in memory
@@ -194,8 +198,8 @@ async fn run_backup(
     };
     let result = backup(store, zfs, options).await?;
     eprintln!(
-        "backup committed: {} (snapshot GUID {}, {} ciphertext bytes)",
-        result.stream_key, result.snapshot_guid, result.ciphertext_bytes
+        "backup committed: {} (snapshot GUID {}, {} ciphertext bytes in {} objects)",
+        result.stream_key, result.snapshot_guid, result.ciphertext_bytes, result.stream_objects
     );
     Ok(())
 }
