@@ -81,3 +81,52 @@ pub async fn read_small(reader: Reader, limit: usize) -> Result<Vec<u8>> {
 pub async fn get_small(store: &dyn ObjectStore, key: &str, limit: usize) -> Result<Vec<u8>> {
     read_small(store.get(key, None, None).await?, limit).await
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Implements only the required methods, so the trait defaults apply.
+    struct DefaultPolicy;
+
+    #[async_trait]
+    impl ObjectStore for DefaultPolicy {
+        async fn head(&self, _: &str) -> Result<Option<ObjectHead>> {
+            unreachable!()
+        }
+        async fn get(&self, _: &str, _: Option<&str>, _: Option<(u64, u64)>) -> Result<Reader> {
+            unreachable!()
+        }
+        async fn put(&self, _: &str, _: Bytes, _: &MetadataMap) -> Result<()> {
+            unreachable!()
+        }
+        async fn put_if_absent(&self, _: &str, _: Bytes) -> Result<bool> {
+            unreachable!()
+        }
+        async fn delete(&self, _: &str) -> Result<()> {
+            unreachable!()
+        }
+        async fn list(&self, _: &str) -> Result<Vec<String>> {
+            unreachable!()
+        }
+        async fn create_upload(&self, _: &str, _: &MetadataMap) -> Result<String> {
+            unreachable!()
+        }
+        async fn upload_part(&self, _: &str, _: &str, _: u32, _: Bytes) -> Result<String> {
+            unreachable!()
+        }
+        async fn complete_upload(&self, _: &str, _: &str, _: &[Part]) -> Result<()> {
+            unreachable!()
+        }
+        async fn abort_upload(&self, _: &str, _: &str) -> Result<()> {
+            unreachable!()
+        }
+    }
+
+    #[test]
+    fn errors_are_neither_retryable_nor_definite_rejections_by_default() {
+        let error = anyhow::anyhow!("any failure");
+        assert!(!DefaultPolicy.is_retryable(&error));
+        assert!(!DefaultPolicy.is_definite_rejection(&error));
+    }
+}
