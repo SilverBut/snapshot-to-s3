@@ -56,7 +56,8 @@ def prepare_notes(text: str, target: str, generated_notes: str | None = None) ->
     if remaining.startswith("# Changelog"):
         remaining = remaining[len("# Changelog") :].lstrip()
     if generated_notes and generated_notes.strip():
-        content = f"{content}\n\n{generated_notes.strip()}".strip() if content else generated_notes.strip()
+        generated = generated_notes.strip()
+        content = f"{content}\n\n{generated}".strip() if content else generated
     if not content:
         content = NOTES_TEMPLATE
     return (

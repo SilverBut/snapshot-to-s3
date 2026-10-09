@@ -26,18 +26,29 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  prepare:
-    name: Calculate version and prepare reviewed release notes
+  generate-notes:
+    name: Generate release-note draft
     runs-on: ubuntu-26.04
     timeout-minutes: 10
     permissions:
-      contents: write
-      pull-requests: write
-      actions: write
+      contents: read
+      pull-requests: read
+    outputs:
+      release_notes: ${{ steps.notes.outputs.release-notes }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
+          ref: ${{ github.sha }}
           fetch-depth: 0
+      - name: Verify trusted default branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          default_branch="$(gh api "repos/$GITHUB_REPOSITORY" --jq .default_branch)"
+          if [[ "$GITHUB_REF" != "refs/heads/$default_branch" ]]; then
+            echo "Release preparation must run from the default branch." >&2
+            exit 1
+          fi
       - name: Find previous stable release
         id: release-base
         run: |
@@ -59,9 +70,24 @@ jobs:
         env:
           COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_GITHUB_TOKEN }}
           GITHUB_TOKEN: ${{ github.token }}
+
+  prepare:
+    name: Calculate version and prepare release proposal
+    needs: generate-notes
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+      actions: write
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
       - name: Save generated draft
         env:
-          RELEASE_NOTES: ${{ steps.notes.outputs.release-notes }}
+          RELEASE_NOTES: ${{ needs.generate-notes.outputs.release_notes }}
         run: printf '%s\n' "$RELEASE_NOTES" > "$RUNNER_TEMP/copilot-release-notes.md"
       - name: Prepare release proposal or show preview
         env:
