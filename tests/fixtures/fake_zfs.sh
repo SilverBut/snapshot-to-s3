@@ -149,6 +149,11 @@ case "$cmd" in
           sleep 0.01
         done
         ;;
+      send-stall)
+        # Writes once, then stays silent, so only cancellation can end it.
+        printf 'chunk-0\n'
+        exec sleep 30
+        ;;
       *)
         printf 'stream-data\n'
         ;;
