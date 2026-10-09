@@ -81,6 +81,22 @@ async fn absent_dataset_requires_nonzero_missing_error_and_permission_errors_pro
 }
 
 #[tokio::test]
+async fn filesystem_target_lists_its_snapshots() {
+    let _lock = env_lock().await;
+    let base = fixture_dir("filesystem-target").unwrap();
+    configure_bins(&base);
+
+    let target = SystemZfs::new().target("pool/fs").await.unwrap();
+    assert!(target.exists);
+    let names: Vec<_> = target
+        .snapshots
+        .iter()
+        .map(|snapshot| snapshot.name.full_name())
+        .collect();
+    assert_eq!(names, ["pool/fs@s1", "pool/fs@s2"]);
+}
+
+#[tokio::test]
 async fn volume_is_rejected_as_filesystem_and_restore_target() {
     let _lock = env_lock().await;
     let base = fixture_dir("volume-type").unwrap();

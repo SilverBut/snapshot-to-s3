@@ -45,6 +45,30 @@ async fn dropping_send_reader_cancels_process_after_output_started() {
 }
 
 #[tokio::test]
+async fn dropping_send_reader_kills_a_silent_process() {
+    let _lock = env_lock().await;
+    let base = fixture_dir("send-stall").unwrap();
+    configure_bins(&base);
+
+    let z = SystemZfs::new();
+    let s2 = SnapshotName::parse("pool/fs@s2").unwrap();
+    let mut stream = z.send(&s2, None).await.unwrap();
+    let mut buf = [0u8; 32];
+    assert!(stream.reader.read(&mut buf).await.unwrap() > 0);
+
+    // The fake never writes again, so no broken pipe can end it: only the
+    // cancellation triggered by dropping the reader stops it before 30 s.
+    drop(stream.reader);
+    let err = tokio::time::timeout(std::time::Duration::from_secs(10), stream.completion)
+        .await
+        .expect("dropping the reader should cancel zfs send")
+        .unwrap()
+        .unwrap_err()
+        .to_string();
+    assert_eq!(err, "zfs send cancelled");
+}
+
+#[tokio::test]
 async fn receive_exit_failure_propagates() {
     let _lock = env_lock().await;
     let base = fixture_dir("receive-exit-fail").unwrap();
