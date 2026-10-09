@@ -4,6 +4,8 @@ umask 077
 
 # shellcheck source=tests/provision/lib/hosted.sh
 source "$(dirname "$0")/lib/hosted.sh"
+# shellcheck source=tests/provision/lib/seaweedfs.sh
+source "$(dirname "$0")/lib/seaweedfs.sh"
 require_hosted_environment
 
 cd "$(dirname "$0")/../.."
@@ -24,34 +26,12 @@ backing="$root/pool.vdev"
 backing_identity=""
 pool_guid=""
 pool_created=false
-service_pid=""
-weed_pid=""
-service_stopped=true
 
 cleanup() {
     local status=$?
     trap - EXIT INT TERM
-    if [[ -n "$service_pid" ]]; then
-        if kill -0 "$service_pid" 2>/dev/null; then
-            kill -TERM "$service_pid" || status=1
-            wait "$service_pid" || true
-        else
-            echo "local S3 wrapper exited unexpectedly" >&2
-            wait "$service_pid" || true
-            status=1
-        fi
-        if [[ -f "$root/s3/weed.pid" ]] ||
-           { [[ -n "$weed_pid" ]] && kill -0 "$weed_pid" 2>/dev/null; }; then
-            echo "local S3 cleanup did not stop its owned service; retaining runtime" >&2
-            status=1
-        else
-            service_stopped=true
-        fi
-    fi
-    if [[ -f "$root/s3/disk-budget-failure.txt" ]]; then
-        cat "$root/s3/disk-budget-failure.txt" >&2
-        status=1
-    fi
+    local_s3_stop "$root/s3" || status=1
+    local_s3_budget_ok "$root/s3" || status=1
     if "$pool_created"; then
         if [[ -z "$pool_guid" ]] ||
            ! verify_pool_ownership "$root" "$pool" "$pool_guid"
@@ -72,7 +52,7 @@ cleanup() {
             status=1
         fi
     fi
-    if ! "$pool_created" && "$service_stopped"; then
+    if ! "$pool_created" && "$LOCAL_S3_STOPPED"; then
         local mounts
         if ! mounts="$(findmnt -rn -o TARGET)"; then
             echo "cannot verify remaining mounts; retaining runtime" >&2
@@ -91,7 +71,7 @@ cleanup() {
         fi
     fi
     printf 'exit_status=%s\npool_remaining=%s\nservice_stopped=%s\n' \
-        "$status" "$pool_created" "$service_stopped" > "$root/logs/result.txt"
+        "$status" "$pool_created" "$LOCAL_S3_STOPPED" > "$root/logs/result.txt"
     exit "$status"
 }
 trap cleanup EXIT
@@ -111,29 +91,7 @@ cargo build --locked 2>&1 | tee "$root/logs/build.log"
 
 export DOWNLOAD_DIR="$root/download"
 export BUILD_ARTIFACT_DIR="$PWD/target"
-bash tests/e2e/local_s3.sh "$root/s3" > "$root/logs/local-s3.log" 2>&1 &
-service_pid=$!
-service_stopped=false
-ready=false
-for ((attempt = 0; attempt < 120; attempt++)); do
-    if ! kill -0 "$service_pid" 2>/dev/null; then
-        cat "$root/logs/local-s3.log" >&2
-        echo "local S3 wrapper exited before readiness" >&2
-        exit 1
-    fi
-    if grep -q '^ready endpoint=' "$root/logs/local-s3.log"; then
-        ready=true
-        break
-    fi
-    sleep 1
-done
-"$ready" || { echo "local S3 readiness timed out" >&2; exit 1; }
-weed_pid="$(cat "$root/s3/weed.pid")"
-[[ "$weed_pid" =~ ^[1-9][0-9]*$ ]]
-# shellcheck disable=SC1091
-source "$root/s3/local_s3.env"
-export TEST_S3_ENDPOINT="$LOCAL_S3_ENDPOINT"
-export TEST_S3_BUCKET="$LOCAL_S3_BUCKET"
+local_s3_start "$root/s3" "$root/logs/local-s3.log"
 curl --silent --show-error --max-time 10 "$TEST_S3_ENDPOINT/" --output /dev/null
 python3 tests/tooling/s3_probe.py --region us-east-1 \
     2>&1 | tee "$root/logs/s3-probe.log"
