@@ -240,6 +240,7 @@ async fn read_limited(mut response: Response) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testing::ScopedEnv;
 
     #[test]
     fn shared_credentials_select_profile_and_session_token() {
@@ -255,5 +256,134 @@ mod tests {
         assert_eq!(credentials.secret_key, "selected-secret");
         assert_eq!(credentials.session_token.as_deref(), Some("session-token"));
         assert!(parse_credentials_file("[partial]\naws_access_key_id=only\n", "partial").is_err());
+    }
+
+    #[test]
+    fn shared_credentials_reject_empty_keys_and_skip_absent_profiles() {
+        assert!(
+            parse_credentials_file("[other]\naws_access_key_id=a\n", "backup")
+                .unwrap()
+                .is_none()
+        );
+        for file in [
+            "[p]\naws_access_key_id=\naws_secret_access_key=secret\n",
+            "[p]\naws_access_key_id=access\naws_secret_access_key=\n",
+        ] {
+            assert!(parse_credentials_file(file, "p").is_err(), "{file:?}");
+        }
+        // Only a whole bracketed line starts a profile.
+        let file = "[p]\naws_access_key_id=a\naws_secret_access_key=s\naws_session_token=t]\n";
+        let credentials = parse_credentials_file(file, "p").unwrap().unwrap();
+        assert_eq!(credentials.session_token.as_deref(), Some("t]"));
+    }
+
+    const ENV: [&str; 6] = [
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_SESSION_TOKEN",
+        "AWS_PROFILE",
+        "AWS_SHARED_CREDENTIALS_FILE",
+        "AWS_EC2_METADATA_DISABLED",
+    ];
+
+    /// Holds the environment lock; take only one per test.
+    fn scoped_env(file: &std::path::Path) -> ScopedEnv {
+        let mut env = ScopedEnv::new(&ENV.map(|name| (name, None)));
+        env.set("AWS_SHARED_CREDENTIALS_FILE", file.to_str());
+        env
+    }
+
+    #[test]
+    fn static_credentials_come_from_environment_then_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("credentials");
+        let mut env = scoped_env(&path);
+
+        assert!(load_static_credentials().unwrap().is_none());
+
+        std::fs::write(
+            &path,
+            "[default]\naws_access_key_id=file\naws_secret_access_key=file-secret\n",
+        )
+        .unwrap();
+        let from_file = load_static_credentials().unwrap().unwrap();
+        assert_eq!(from_file.access_key, "file");
+
+        env.set("AWS_ACCESS_KEY_ID", Some("env"));
+        assert!(load_static_credentials().is_err(), "secret missing");
+        env.set("AWS_SECRET_ACCESS_KEY", Some("env-secret"));
+        env.set("AWS_SESSION_TOKEN", Some(""));
+        let from_env = load_static_credentials().unwrap().unwrap();
+        assert_eq!(from_env.access_key, "env");
+        assert_eq!(from_env.secret_key, "env-secret");
+        assert_eq!(from_env.session_token, None);
+        env.set("AWS_ACCESS_KEY_ID", Some(""));
+        assert!(load_static_credentials().is_err(), "access key empty");
+
+        env.set("AWS_ACCESS_KEY_ID", None);
+        env.set("AWS_SECRET_ACCESS_KEY", None);
+        let not_a_dir = dir.path().join("credentials/nested");
+        env.set("AWS_SHARED_CREDENTIALS_FILE", not_a_dir.to_str());
+        let error = format!("{:#}", load_static_credentials().err().unwrap());
+        assert!(error.starts_with("open AWS credentials file"), "{error}");
+    }
+
+    #[test]
+    fn credentials_file_size_limit_is_exact() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("credentials");
+        let _env = scoped_env(&path);
+        let entry = "[default]\naws_access_key_id=a\naws_secret_access_key=last-byte\n";
+        let padding = "#".repeat(MAX_CREDENTIALS_FILE_BYTES - entry.len() - 1) + "\n";
+        std::fs::write(&path, padding.clone() + entry).unwrap();
+        let credentials = load_static_credentials().unwrap().unwrap();
+        assert_eq!(credentials.secret_key, "last-byte");
+
+        std::fs::write(&path, padding + "#" + entry).unwrap();
+        let error = load_static_credentials().err().unwrap().to_string();
+        assert!(error.contains("exceeds 1048576-byte limit"), "{error}");
+    }
+
+    #[test]
+    fn provider_requires_a_credential_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut env = scoped_env(&dir.path().join("absent"));
+        env.set("AWS_EC2_METADATA_DISABLED", Some("TRUE"));
+        assert!(CredentialProvider::from_env(reqwest::Client::new()).is_err());
+        env.set("AWS_ACCESS_KEY_ID", Some("a"));
+        env.set("AWS_SECRET_ACCESS_KEY", Some("s"));
+        assert!(CredentialProvider::from_env(reqwest::Client::new()).is_ok());
+    }
+
+    /// Serves one HTTP response with `body` and returns its URL.
+    async fn serve_once(body: Vec<u8>) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 1024];
+            let _ = socket.read(&mut request).await;
+            let head = format!("HTTP/1.1 200 OK\r\ncontent-length: {}\r\n\r\n", body.len());
+            socket.write_all(head.as_bytes()).await.unwrap();
+            socket.write_all(&body).await.unwrap();
+        });
+        url
+    }
+
+    async fn read_served(body: Vec<u8>) -> Result<Vec<u8>> {
+        let url = serve_once(body).await;
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        read_limited(client.get(url).send().await.unwrap()).await
+    }
+
+    #[tokio::test]
+    async fn metadata_responses_are_bounded() {
+        let full: Vec<u8> = (0..MAX_IMDS_RESPONSE_BYTES).map(|i| i as u8).collect();
+        assert_eq!(read_served(full.clone()).await.unwrap(), full);
+        let mut over = full;
+        over.push(0);
+        let error = read_served(over).await.unwrap_err().to_string();
+        assert!(error.contains("exceeds 16384-byte limit"), "{error}");
     }
 }

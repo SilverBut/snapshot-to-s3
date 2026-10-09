@@ -2,6 +2,7 @@
 //!
 //! Both record what they were asked to do (`events`) and expose plain fields
 //! for fault injection, so tests can fail any step and inspect the outcome.
+//! [`ScopedEnv`] serializes tests that change process environment variables.
 
 use crate::model::{MetadataMap, Reader, SnapshotName};
 use crate::store::{ObjectHead, ObjectStore, Part};
@@ -30,6 +31,8 @@ pub struct MemoryStore {
     pub completion_lost: Mutex<bool>,
     /// Store parts as empty buffers to keep large-stream tests cheap.
     pub discard_parts: bool,
+    /// Report injected failures as retryable.
+    pub retryable_failures: bool,
     uploads: Mutex<BTreeMap<String, TestUpload>>,
 }
 
@@ -178,6 +181,9 @@ impl ObjectStore for MemoryStore {
         self.uploads.lock().unwrap().remove(upload);
         Ok(())
     }
+    fn is_retryable(&self, error: &anyhow::Error) -> bool {
+        self.retryable_failures && error.to_string().starts_with("injected failure")
+    }
 }
 
 /// A scripted ZFS: serves `snapshots`/`target`, records calls in `events`
@@ -322,5 +328,51 @@ impl tokio::io::AsyncRead for FailingRead {
         _: &mut tokio::io::ReadBuf<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
         std::task::Poll::Ready(Err(std::io::Error::other("injected stream read failure")))
+    }
+}
+
+static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+/// Sets or removes environment variables for one test and restores them when
+/// dropped. A process-wide lock keeps such tests from overlapping.
+pub struct ScopedEnv {
+    saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+impl ScopedEnv {
+    /// Applies `vars`: `Some(value)` sets a variable, `None` removes it.
+    pub fn new(vars: &[(&'static str, Option<&str>)]) -> Self {
+        let lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut env = Self {
+            saved: Vec::new(),
+            _lock: lock,
+        };
+        for (name, value) in vars {
+            env.set(name, *value);
+        }
+        env
+    }
+
+    /// Changes one more variable; the first value seen is the one restored.
+    pub fn set(&mut self, name: &'static str, value: Option<&str>) {
+        if !self.saved.iter().any(|(saved, _)| *saved == name) {
+            self.saved.push((name, std::env::var_os(name)));
+        }
+        match value {
+            Some(value) => std::env::set_var(name, value),
+            None => std::env::remove_var(name),
+        }
+    }
+}
+
+impl Drop for ScopedEnv {
+    fn drop(&mut self) {
+        for (name, value) in self.saved.drain(..).rev() {
+            match value {
+                Some(value) => std::env::set_var(name, value),
+                None => std::env::remove_var(name),
+            }
+        }
     }
 }
