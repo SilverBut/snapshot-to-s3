@@ -1,248 +1,127 @@
 # snapshot-to-s3
 
-Encrypt ZFS filesystem snapshots and upload to S3-compatible object storage.
+Stream encrypted ZFS filesystem snapshots to S3-compatible object storage, and restore them.
 
-This README and the documents in `docs/` describe the target requirements and design, not a claim that every behavior
-has already been implemented.
+* Raw `zfs send -w` full or incremental streams; the incremental base is chosen automatically.
+* Streaming AEAD (Tink-compatible `AES128_GCM_HKDF_1MB`) with a fresh key per backup, wrapped by GPG.
+* Plaintext and keys stay in memory and pipes: no temporary files, and memory does not grow with the
+  stream size. One backup may be up to about 4 PiB (see [Limits](#limits-and-resource-use)).
+* An atomic per-backup lock; existing or partial backups are never overwritten.
+* Restore authenticates every required backup before replaying the chain into `zfs receive -u`, or
+  exports one stream to stdout.
+* Own S3 client (SigV4, no AWS SDK) for AWS and S3-compatible services.
 
-## Features
+Only ZFS filesystems are supported; volumes (zvols) are rejected. Snapshot creation, scheduling,
+retention, periodic full backups and backup inspection are left to other tools.
 
-* Stream-first pipeline: plaintext remains in memory/pipes, not app-managed temporary files
-* Linux ZFS filesystem snapshots (`zfs:dataset@snapshot`) with raw send/receive
-* Explicit rejection of non-filesystem datasets (for example zvol/block volumes)
-* Streaming AEAD encryption (`AES128_GCM_HKDF_1MB`) with per-backup wrapped keys
-* Backup-chain metadata, lock protocol and authenticated restore/stdout export workflow
-* S3-compatible HTTP + SigV4 implementation with configurable endpoint, metadata prefix and signing service
+## Requirements
+
+* Linux with OpenZFS 2.3+ (`zfs`/`zpool` with JSON output, `-j`)
+* GnuPG (`gpg`)
+* Rust stable to build: `cargo build --release --locked`
 
 ## Usage
 
-Ensure you have:
-
-* GPG CLI
-* OpenZFS `zfs` and `zpool` CLIs with `get`/`list` JSON output (`-j`, usually OpenZFS 2.3+)
-
-Programmatic discovery and property reads use the OpenZFS JSON interface with `-j -p` for raw
-numeric strings and ordinary typed serde decoding. Malformed JSON, missing required data, and command or permission failures are
-explicit errors; there is no fallback to human-readable tables or legacy `-H` property parsing. Snapshot GUIDs
-are validated as exact decimal strings, including values above JavaScript's safe-integer range; `--json-int` is
-not used. See [the JSON command contract](docs/design.md#zfs-json-command-contract).
-
-`zfs diff -H` and `zfs send -nP` use their dedicated machine-readable record/estimate formats, not display
-tables: these subcommands do not support `-j` in OpenZFS 2.4.4. Actual send/receive streams remain binary.
-
-Then install the program by build from source:
+### Backup
 
 ```bash
-cargo build --release --locked
+snapshot-to-s3 backup zfs:pool/dataset@snap s3://bucket/backups --gpg-key-id user@example.com
 ```
 
-**Before** you run any command, ensure you have setup credentials. See next chapter about now to do this.
+The backup is written under `s3://bucket/backups/pool/dataset/snap/`. The snapshot must already exist.
 
-### Backup a Snapshot
+| Option | Meaning |
+| --- | --- |
+| `--gpg-key-id` (or `GPG_KEY_ID`) | Selector resolving to exactly one encryption-capable public key |
+| `--force-full-snapshot` | Send a full stream instead of choosing an incremental base |
+| `--rate-limit BYTES_PER_SEC` | Limit ciphertext throughput |
+| `--part-buffer-size` | Largest part held in memory (default 64 MiB) |
+| `--min-part-size`, `--max-part-size`, `--max-parts`, `--max-object-size` | Service multipart limits (defaults: AWS S3) |
 
-Basic usage with AWS S3 bucket with a prefix:
+An incremental base must be an older local snapshot whose committed backup exists at the same prefix.
+Choosing a base does not check that the base's own chain is complete; keep the backups a chain needs
+when applying lifecycle rules.
+
+### Restore
 
 ```bash
-snapshot-to-s3 backup \
-  zfs:pool/dataset@snapshot-name \
-  s3://my-backup-bucket/backups/dataset-snapshot \
-  --gpg-key-id "user@example.com"
+# Replay the required chain into pool/dataset (or into --target-pool / --target-dataset).
+snapshot-to-s3 restore s3://bucket/backups zfs:pool/dataset@snap --target-dataset restored/dataset
+
+# Write only this backup's decrypted send stream to stdout.
+snapshot-to-s3 restore s3://bucket/backups stdout:pool/dataset@snap > snap.zstream
 ```
 
-Backup is always collected in raw format from ZFS side. The tool will select a base snapshot automatically. See
-document to understand how it works.
+Name the snapshot as it was backed up. `--target-dataset` is relative to `--target-pool`, which defaults
+to the source pool. `--gpg-key-id` optionally requires a specific recipient for the selected backup.
 
-To skip base selection and force a full backup (`force-full` mode):
+For an existing target, its latest snapshot must be in the chain and the target must be unchanged since
+then (`zfs diff`); restore never rolls back. Restore stops at the first failure and reports the last
+received snapshot. It does not load native ZFS keys or mount the result. A stdout export may have written
+authenticated data before a failure; the exit status is then nonzero.
 
-```bash
-snapshot-to-s3 backup \
-  zfs:pool/dataset@snapshot-name \
-  s3://my-backup-bucket/backups/dataset-snapshot \
-  --gpg-key-id "user@example.com" \
-  --force-full-snapshot
-```
+### Exit status
 
-Each backup is a group of separate objects, not a tar archive. Writers acquire an atomic per-snapshot `.lock` and
-refuse to overwrite committed or partial backup content. Snapshot scheduling, retention, periodic full backups and
-backup inspection are external responsibilities. Selecting an incremental base does not prove that its entire remote
-chain is intact; preserve required dependencies when applying external lifecycle rules.
-
-With ciphertext rate limiting:
-
-```bash
-snapshot-to-s3 backup \
-  zfs:pool/dataset@snapshot-name \
-  s3://my-backup-bucket/backups/dataset-snapshot \
-  --gpg-key-id "user@example.com" \
-  --rate-limit 10485760  # 10 MB/s
-```
-
-For S3-compatible services (for example MinIO or Backblaze B2), set endpoint, metadata prefix, region, and optional addressing/signing overrides:
-
-```bash
-snapshot-to-s3 backup \
-  zfs:pool/dataset@snapshot-name \
-  s3://my-bucket/backups/dataset-snapshot \
-  --gpg-key-id "user@example.com" \
-  --endpoint https://s3.us-west-002.backblazeb2.com \
-  --region us-west-002 \
-  --metadata-prefix x-bz-info \
-  --signing-service s3 \
-  --virtual-hosted-style
-```
-
-Addressing defaults to **path-style** when `--endpoint` is set (unless `--virtual-hosted-style` is provided), and to virtual-hosted style for default AWS endpoints. You may force path-style with `--path-style`.
-
-Reusing a snapshot name at the same backup prefix is refused if backup content already exists. Failed uploads may
-leave partial objects or a lock; confirm the writer and upload are stopped before manually cleaning them.
-
-### Restore a Snapshot
-
-If you want to restore a snapshot, give **exactly** same S3 prefix and the backup source info:
-
-```bash
-snapshot-to-s3 restore \
-  s3://my-bucket/backups/dataset-snapshot \
-  zfs:pool/dataset@snapshot-name \
-  --gpg-key-id "user@example.com"
-```
-
-Sometimes you may want to restore into another pool and/or dataset:
-
-```bash
-snapshot-to-s3 restore \
-  s3://my-bucket/backups/dataset-snapshot \
-  zfs:pool/dataset@snapshot-name \
-  --gpg-key-id "user@example.com" \
-  --target-pool optional_target_pool \
-  --target-dataset relative/dataset/path
-```
-
-`--target-dataset` is interpreted relative to `--target-pool`. It must not include another pool segment.
-
-For ZFS restore, follow the parent object keys and replay only the required chain, stopping at a matching latest local
-snapshot or a full backup. An incomplete remote chain cannot recover an empty target, but may still work with a matching
-local base. Use the original backup names to locate the source, even when restoring into a different target.
-
-For an existing target filesystem, Prepare confirms the latest snapshot as the receive base and runs `zfs diff` against
-the current filesystem. Changes or a failed check stop recovery before key, metadata or stream verification downloads.
-Prevent concurrent writes throughout restore; this early check cannot guarantee every subsequent receive will succeed.
-The tool does not automatically force rollback.
-
-Successful restore means complete authenticated decryption and successful ZFS receive. It does not require loading
-native ZFS keys or mounting the result. Users manage these separately; raw send retains native encryption only when
-the source already has it. Chain replay can stop after earlier snapshots were received if a later step fails.
-
-For debug purpose you may don't want to write to the pool directly, then you can send decrypted backup stream to stdout:
-
-```bash
-snapshot-to-s3 restore \
-  s3://my-bucket/backups/dataset-snapshot \
-  stdout:pool/dataset@snapshot-name \
-  --gpg-key-id "user@example.com"
-```
-
-Stdout exports only this backup's send stream, including a single incremental stream when applicable. It does not
-concatenate dependencies or inspect a local target. Diagnostics go to stderr; a nonzero exit status may follow partial
-output if decryption or writing fails.
-
-## Multipart and memory controls
-
-Backup upload limits are explicit CLI controls:
-
-* `--min-part-size` (default 5 MiB)
-* `--max-part-size` (default 5 GiB)
-* `--max-parts` (default 10,000)
-* `--max-object-size` (default 5 TiB)
-* `--part-buffer-size` (default 64 MiB)
-
-`--part-buffer-size` caps in-process part buffering for the single active multipart stream. Effective memory also includes
-crypto/rate pipes and runtime overhead; it is bounded and does not grow with total stream size. Large objects near a
-service's maximum may require a larger explicit buffer and limits aligned to that service's part/object constraints.
+`0` success, `1` any failure (details on stderr), `2` invalid command line. SIGINT and SIGTERM cancel
+cleanly through the same failure handling.
 
 ## Configuration
 
-### HTTP transfers and retries
+### S3 endpoint
 
-Object GET, POST and upload PUT requests have no total-duration cap. Transfers are checked for low throughput
-over a rolling window (by default, fewer than 1,024 bytes in 30 seconds of active network polling).
-GET retries resume from the downloaded ciphertext offset using Range and a pinned ETag; changed objects fail
-instead of mixing versions. HEAD, list and DELETE retain bounded control-request timeouts.
+| Option | Meaning |
+| --- | --- |
+| `--endpoint URL` | S3-compatible endpoint; implies path-style addressing |
+| `--region` (or `AWS_REGION`, then `AWS_DEFAULT_REGION`) | Signing region, default `us-east-1` |
+| `--path-style` / `--virtual-hosted-style` | Override the addressing style |
+| `--metadata-prefix` | User-metadata header prefix, default `x-amz-meta` (e.g. `x-bz-info` for B2) |
+| `--signing-service` | SigV4 service name, default `s3` |
 
-See [HTTP transfer liveness and recovery](docs/storage.md#http-transfer-liveness-and-recovery) for the retry
-budget, backpressure handling and environment overrides.
+HTTP liveness and retry behavior can be tuned with `SNAPSHOT_TO_S3_HTTP_*` variables; see
+[storage.md](docs/storage.md#http-transfers).
 
-### S3 Credentials
+### Credentials
 
-The binary does **not** use the AWS Rust SDK provider chain. It implements the currently supported credential sources:
+In this order: `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` (optional `AWS_SESSION_TOKEN`); the shared
+credentials file (`AWS_SHARED_CREDENTIALS_FILE` or `~/.aws/credentials`, profile `AWS_PROFILE`); EC2
+IMDSv2 role credentials. There are no credential flags. Other provider-chain sources (SSO, ECS, web
+identity, …) are not supported.
 
-- Environment variables: `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` (optional `AWS_SESSION_TOKEN`)
-- Shared credentials file (`~/.aws/credentials` or `AWS_SHARED_CREDENTIALS_FILE`) with `AWS_PROFILE`
-- EC2 IMDSv2 role credentials
+### GPG
 
-Command-line credential flags are intentionally unsupported to reduce secret leakage risk.
+Backup needs only the recipient's public key; restore needs the private key. Keeping them in separate
+keyrings is recommended. A usable key shows `[E]` in `gpg --list-keys --with-subkey-fingerprint KEY`.
+The selector is resolved to a full fingerprint, which is stored with the backup.
 
-Other AWS provider-chain sources (for example SSO, ECS task role, EKS IRSA, web identity, process providers) are not
-currently claimed unless separately implemented and validated.
+### Bucket permissions
 
-### GPG Key Setup
+`s3:PutObject` (objects, multipart uploads and the conditional lock), `s3:GetObject`, `s3:ListBucket`,
+`s3:AbortMultipartUpload`, and `s3:DeleteObject` for lock objects (`*/.lock`). Removing partial backups
+is a manual operator task.
 
-Backup file is finally protected by a GPG key, so you need to have a valid GPG keybox with a key ID available for
-encryption. It's better if you don't put private and public key together into same keybox.
+The service must support `If-None-Match: *` on PUT and preserve user metadata. Each backup checks both
+with a probe object under `<prefix>/.snapshot-to-s3-probes/` and deletes it afterwards. A lifecycle rule
+that aborts incomplete multipart uploads is recommended.
 
-To check if a key ID is available in keybox for encryption:
+## Limits and resource use
 
-```bash
-$ gpg --list-keys --with-subkey-fingerprint 4E8BBEB1DF8D5C3CCA2F6B51ED7C55E60B7543A2
-pub   ed25519 2026-10-06 [SC]
-      4E8BBEB1DF8D5C3CCA2F6B51ED7C55E60B7543A2
-uid           [ultimate] user@example.com
-sub   cv25519 2026-10-06 [E]
-      D3E17C2F5895E363AD1EFEA3B113F539F9C5F1B3
-```
+* **Memory** is bounded and independent of the stream size. Backup holds one part buffer
+  (`--part-buffer-size`) plus 2 MiB and 64 KiB pipes; restore holds a 2 MiB pipe and 1 MiB segments.
+  Command output and small objects are read with fixed caps.
+* **Size**: a stream larger than one object continues in further objects of at most `--max-parts` ×
+  part size bytes (625 GiB with the defaults; raise `--part-buffer-size` for fewer, larger objects, up to
+  5 TiB each on AWS). Up to 1,000,000 objects per backup are allowed; the encryption format allows about
+  4 PiB per backup.
+* GET downloads resume from the current offset after transient failures; uploads retry identical part
+  bytes. Retries are per object.
 
-The `[E]` mean a key is available for encryption.
+## Documentation
 
-Once you have generated the GPG key, you can refer the key in `--gpg-key-id` argument or `GPG_KEY_ID` environment variable.
-
-### S3 Bucket Permissions
-
-Your AWS/S3 account needs the following permissions for the backup bucket:
-
-- `s3:PutObject` - Upload backup files
-- `s3:GetObject` - Read existing backups (for incremental detection)
-- `s3:ListBucket` - List existing backups
-- `s3:AbortMultipartUpload` - Abort incomplete multipart uploads
-- `s3:DeleteObject` - Release lock objects
-
-`s3:PutObject` covers multipart initiation, part upload, completion, user-defined metadata and conditional creation of
-the lock. User-defined metadata is not object tagging. The endpoint must support atomic create-if-absent for locks;
-ordinary HEAD followed by PUT is insufficient.
-
-Before publication, backup performs atomic-condition and metadata capability probes under:
-`{configured-s3-prefix}/.snapshot-to-s3-probes/<random>/.lock`.
-The HTTP layer enforces a `.lock` probe-key suffix.
-
-Endpoints that ignore `If-None-Match: *` or do not preserve the configured metadata-header prefix are rejected early.
-Probe lock keys are transient and are deleted after verification.
-
-Configure bucket and object permissions in your AWS IAM policy. Restrict the application's `s3:DeleteObject` permission
-to lock-suffix objects (including transient probe locks); manual cleanup of partial backups is a separate operator action.
-
-## Internals
-
-How backup files organized? How the best incremental base is selected? Why ... ?
-
-For detailed design information, see:
-
-* [Requirements and component design](docs/design.md)
-* [Storage format, locks and publication](docs/storage.md)
-* [Backup and restore workflow](docs/workflow.md)
+* [Design](docs/design.md): scope, architecture, resource bounds and test coverage
+* [Storage](docs/storage.md): object layout, encryption, lock and commit protocol, HTTP behavior
+* [Workflow](docs/workflow.md): backup and restore step by step
+* [Contributing](CONTRIBUTING.md) and [development environment](DEVELOPMENT.md)
 
 ## License
 
-AGPL-3.0 - See LICENSE file for details.
-
----
-
-[aes-gcm-hkdf]: https://developers.google.com/tink/streaming-aead/aes_gcm_hkdf_streaming?hl=zh-cn
+AGPL-3.0; see [LICENSE](LICENSE).
