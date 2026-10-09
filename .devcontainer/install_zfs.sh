@@ -17,7 +17,7 @@ if ! grep -q '^zfs ' /proc/modules; then
 fi
 
 # Get version of the loaded ZFS module
-ZFS_VERSION=$(cat /sys/module/zfs/version|cut -d '-' -f 1)
+ZFS_VERSION=$(cut -d '-' -f 1 < /sys/module/zfs/version)
 if [ -z "$ZFS_VERSION" ]; then
   echo "Failed to get ZFS module version. Exiting."
   exit 1

@@ -336,3 +336,134 @@ mod tests {
             .any(|e| e.starts_with("GET ")));
     }
 }
+
+#[cfg(test)]
+mod chain_edge_tests {
+    use super::*;
+    use crate::testing::{FakeZfs, MemoryStore};
+    use crate::zfs::{SnapshotInfo, TargetInfo};
+    use bytes::Bytes;
+
+    async fn backup_with_parent(
+        store: &MemoryStore,
+        snapshot: &str,
+        guid: &str,
+        parent: Option<(&str, &str)>,
+    ) {
+        let location = S3Location::parse("s3://bucket/backups").unwrap();
+        let source = SnapshotName::parse(&format!("pool/data@{snapshot}")).unwrap();
+        let index = StreamIndex {
+            gpg_key_id: "fingerprint".into(),
+            fs_type: "zfs".into(),
+            vol_id: "1".into(),
+            current_snapshot_id: guid.into(),
+            base_snapshot_id: parent.map(|(parent_guid, _)| parent_guid.into()),
+            base_object_key: parent.map(|(_, parent_name)| {
+                location
+                    .stream_key(&SnapshotName::parse(&format!("pool/data@{parent_name}")).unwrap())
+            }),
+        };
+        store
+            .put(
+                &location.stream_key(&source),
+                Bytes::from_static(b"stream"),
+                &index.to_metadata().unwrap(),
+            )
+            .await
+            .unwrap();
+    }
+
+    fn target(snapshots: Vec<SnapshotInfo>) -> TargetInfo {
+        TargetInfo {
+            exists: true,
+            snapshots,
+        }
+    }
+
+    fn local_snapshot(name: &str, guid: &str, createtxg: u64) -> SnapshotInfo {
+        SnapshotInfo {
+            name: SnapshotName::parse(&format!("pool/target@{name}")).unwrap(),
+            guid: guid.into(),
+            volume_guid: "1".into(),
+            createtxg,
+        }
+    }
+
+    #[tokio::test]
+    async fn repeated_guid_on_a_new_key_is_rejected() {
+        let store = MemoryStore::default();
+        backup_with_parent(&store, "s3", "30", Some(("20", "s2"))).await;
+        backup_with_parent(&store, "s2", "20", Some(("10", "s1"))).await;
+        backup_with_parent(&store, "s1", "10", Some(("20", "s4"))).await;
+        backup_with_parent(&store, "s4", "20", None).await;
+        let err = prepare(
+            &store,
+            &FakeZfs::new(),
+            &S3Location::parse("s3://bucket/backups").unwrap(),
+            &SnapshotName::parse("pool/data@s3").unwrap(),
+            Some("pool/target"),
+        )
+        .await
+        .err()
+        .unwrap()
+        .to_string();
+        assert_eq!(
+            err,
+            "dependency cycle or repeated snapshot GUID in backup chain"
+        );
+    }
+
+    #[tokio::test]
+    async fn common_older_current_guid_survives_unmatched_base_guid() {
+        let store = MemoryStore::default();
+        backup_with_parent(&store, "s2", "20", Some(("10", "missing"))).await;
+        let zfs = FakeZfs {
+            target: target(vec![
+                local_snapshot("old", "20", 1),
+                local_snapshot("latest", "99", 2),
+            ]),
+            ..FakeZfs::new()
+        };
+        let error = prepare(
+            &store,
+            &zfs,
+            &S3Location::parse("s3://bucket/backups").unwrap(),
+            &SnapshotName::parse("pool/data@s2").unwrap(),
+            Some("pool/target"),
+        )
+        .await
+        .err()
+        .unwrap()
+        .to_string();
+        assert!(error.contains(
+            "required parent is missing and latest local snapshot is not a matching base"
+        ));
+    }
+
+    #[tokio::test]
+    async fn common_older_base_guid_is_detected_when_current_is_not_local() {
+        let store = MemoryStore::default();
+        backup_with_parent(&store, "s2", "20", Some(("10", "missing"))).await;
+        let zfs = FakeZfs {
+            target: target(vec![
+                local_snapshot("old", "10", 1),
+                local_snapshot("latest", "99", 2),
+            ]),
+            ..FakeZfs::new()
+        };
+        let error = prepare(
+            &store,
+            &zfs,
+            &S3Location::parse("s3://bucket/backups").unwrap(),
+            &SnapshotName::parse("pool/data@s2").unwrap(),
+            Some("pool/target"),
+        )
+        .await
+        .err()
+        .unwrap()
+        .to_string();
+        assert!(error.contains(
+            "required parent is missing and latest local snapshot is not a matching base"
+        ));
+    }
+}

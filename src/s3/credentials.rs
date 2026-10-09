@@ -1,75 +1,25 @@
-//! AWS credentials: environment, shared credentials file, then EC2 IMDSv2.
+//! AWS credentials from the environment or shared credentials file.
 
 use anyhow::{bail, Context, Result};
-use chrono::{DateTime, Utc};
-use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
-use reqwest::Response;
-use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::env;
 use std::io::{self, Read};
 use std::path::PathBuf;
-use std::time::Duration;
-use tokio::sync::Mutex;
 
 const MAX_CREDENTIALS_FILE_BYTES: usize = 1024 * 1024;
-const MAX_IMDS_RESPONSE_BYTES: usize = 16 * 1024;
-const IMDS: &str = "http://169.254.169.254/latest";
-const IMDS_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Clone)]
 pub(super) struct Credentials {
     pub access_key: String,
     pub secret_key: String,
     pub session_token: Option<String>,
-    expires_at: Option<DateTime<Utc>>,
 }
 
-pub(super) struct CredentialProvider {
-    static_credentials: Option<Credentials>,
-    cache: Mutex<Option<Credentials>>,
-    client: reqwest::Client,
-    metadata_disabled: bool,
-}
-
-impl CredentialProvider {
-    pub(super) fn from_env(client: reqwest::Client) -> Result<Self> {
-        let static_credentials = load_static_credentials()?;
-        let metadata_disabled = env::var("AWS_EC2_METADATA_DISABLED")
-            .map(|value| value.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
-        if static_credentials.is_none() && metadata_disabled {
-            bail!("no AWS credentials found and EC2 metadata credentials are disabled");
-        }
-        Ok(Self {
-            static_credentials,
-            cache: Mutex::new(None),
-            client,
-            metadata_disabled,
-        })
-    }
-
-    /// Static credentials, or cached IMDS credentials refreshed five
-    /// minutes before expiry.
-    pub(super) async fn get(&self) -> Result<Credentials> {
-        if let Some(credentials) = &self.static_credentials {
-            return Ok(credentials.clone());
-        }
-        let mut cached = self.cache.lock().await;
-        if let Some(credentials) = cached.as_ref() {
-            if credentials
-                .expires_at
-                .is_some_and(|expiration| expiration > Utc::now() + chrono::Duration::minutes(5))
-            {
-                return Ok(credentials.clone());
-            }
-        }
-        if self.metadata_disabled {
-            bail!("no AWS credentials found and EC2 metadata credentials are disabled");
-        }
-        let credentials = fetch_imds_credentials(&self.client).await?;
-        *cached = Some(credentials.clone());
-        Ok(credentials)
+impl Credentials {
+    pub(super) fn from_env() -> Result<Self> {
+        load_static_credentials()?.context(
+            "no AWS credentials found; set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY or configure a shared credentials file",
+        )
     }
 }
 
@@ -82,7 +32,6 @@ fn load_static_credentials() -> Result<Option<Credentials>> {
                 access_key: access,
                 secret_key: secret,
                 session_token: env::var("AWS_SESSION_TOKEN").ok().filter(|v| !v.is_empty()),
-                expires_at: None,
             }));
         }
         (None, None) => {}
@@ -142,7 +91,6 @@ fn parse_credentials_file(contents: &str, profile: &str) -> Result<Option<Creden
                 access_key: access,
                 secret_key: secret,
                 session_token: fields.remove("aws_session_token"),
-                expires_at: None,
             }))
         }
         (None, None) => Ok(None),
@@ -150,96 +98,10 @@ fn parse_credentials_file(contents: &str, profile: &str) -> Result<Option<Creden
     }
 }
 
-#[derive(Deserialize)]
-#[serde(rename_all = "PascalCase")]
-struct ImdsCredentials {
-    access_key_id: String,
-    secret_access_key: String,
-    token: String,
-    expiration: String,
-}
-
-async fn fetch_imds_credentials(client: &reqwest::Client) -> Result<Credentials> {
-    let token_response = client
-        .put(format!("{IMDS}/api/token"))
-        .header("x-aws-ec2-metadata-token-ttl-seconds", "21600")
-        .timeout(IMDS_TIMEOUT)
-        .send()
-        .await
-        .context("request IMDSv2 token")?
-        .error_for_status()
-        .context("IMDSv2 token request rejected")?;
-    let token = String::from_utf8(read_limited(token_response).await?)
-        .context("IMDSv2 token is not UTF-8")?;
-    if token.is_empty() {
-        bail!("IMDSv2 returned an invalid token");
-    }
-    let mut headers = HeaderMap::new();
-    headers.insert(
-        HeaderName::from_static("x-aws-ec2-metadata-token"),
-        HeaderValue::from_str(&token).context("invalid IMDSv2 token header")?,
-    );
-    let roles = format!("{IMDS}/meta-data/iam/security-credentials/");
-    let role_response = client
-        .get(&roles)
-        .headers(headers.clone())
-        .timeout(IMDS_TIMEOUT)
-        .send()
-        .await
-        .context("request EC2 IAM role name")?
-        .error_for_status()
-        .context("EC2 IAM role lookup rejected")?;
-    let role = read_limited(role_response).await?;
-    let role = std::str::from_utf8(&role)
-        .context("EC2 IAM role name is not UTF-8")?
-        .trim();
-    if role.is_empty() || role.contains(['/', '\n', '\r']) {
-        bail!("EC2 metadata returned an invalid IAM role name");
-    }
-    let credentials_response = client
-        .get(format!("{roles}{role}"))
-        .headers(headers)
-        .timeout(IMDS_TIMEOUT)
-        .send()
-        .await
-        .context("request EC2 IAM role credentials")?
-        .error_for_status()
-        .context("EC2 IAM credential lookup rejected")?;
-    let body = read_limited(credentials_response).await?;
-    let value: ImdsCredentials =
-        serde_json::from_slice(&body).context("parse EC2 IAM credentials")?;
-    let expiration = DateTime::parse_from_rfc3339(&value.expiration)
-        .context("parse EC2 credential expiration")?
-        .with_timezone(&Utc);
-    if value.access_key_id.is_empty()
-        || value.secret_access_key.is_empty()
-        || value.token.is_empty()
-        || expiration <= Utc::now()
-    {
-        bail!("EC2 metadata returned expired or incomplete credentials");
-    }
-    Ok(Credentials {
-        access_key: value.access_key_id,
-        secret_key: value.secret_access_key,
-        session_token: Some(value.token),
-        expires_at: Some(expiration),
-    })
-}
-
-async fn read_limited(mut response: Response) -> Result<Vec<u8>> {
-    let mut result = Vec::new();
-    while let Some(chunk) = response.chunk().await.context("read HTTP response")? {
-        if result.len().saturating_add(chunk.len()) > MAX_IMDS_RESPONSE_BYTES {
-            bail!("HTTP response exceeds {MAX_IMDS_RESPONSE_BYTES}-byte limit");
-        }
-        result.extend_from_slice(&chunk);
-    }
-    Ok(result)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testing::ScopedEnv;
 
     #[test]
     fn shared_credentials_select_profile_and_session_token() {
@@ -255,5 +117,120 @@ mod tests {
         assert_eq!(credentials.secret_key, "selected-secret");
         assert_eq!(credentials.session_token.as_deref(), Some("session-token"));
         assert!(parse_credentials_file("[partial]\naws_access_key_id=only\n", "partial").is_err());
+    }
+
+    #[test]
+    fn shared_credentials_reject_empty_keys_and_skip_absent_profiles() {
+        assert!(
+            parse_credentials_file("[other]\naws_access_key_id=a\n", "backup")
+                .unwrap()
+                .is_none()
+        );
+        for file in [
+            "[p]\naws_access_key_id=\naws_secret_access_key=secret\n",
+            "[p]\naws_access_key_id=access\naws_secret_access_key=\n",
+        ] {
+            assert!(parse_credentials_file(file, "p").is_err(), "{file:?}");
+        }
+        // Only a whole bracketed line starts a profile.
+        let file = "[p]\naws_access_key_id=a\naws_secret_access_key=s\naws_session_token=t]\n";
+        let credentials = parse_credentials_file(file, "p").unwrap().unwrap();
+        assert_eq!(credentials.session_token.as_deref(), Some("t]"));
+    }
+
+    const ENV: [&str; 5] = [
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_SESSION_TOKEN",
+        "AWS_PROFILE",
+        "AWS_SHARED_CREDENTIALS_FILE",
+    ];
+
+    /// Holds the environment lock; take only one per test.
+    fn scoped_env(file: &std::path::Path) -> ScopedEnv {
+        let mut env = ScopedEnv::new(&ENV.map(|name| (name, None)));
+        env.set("AWS_SHARED_CREDENTIALS_FILE", file.to_str());
+        env
+    }
+
+    #[test]
+    fn static_credentials_come_from_environment_then_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("credentials");
+        let mut env = scoped_env(&path);
+
+        assert!(load_static_credentials().unwrap().is_none());
+
+        std::fs::write(
+            &path,
+            "[default]\naws_access_key_id=file\naws_secret_access_key=file-secret\n",
+        )
+        .unwrap();
+        let from_file = load_static_credentials().unwrap().unwrap();
+        assert_eq!(from_file.access_key, "file");
+
+        env.set("AWS_ACCESS_KEY_ID", Some("env"));
+        assert!(load_static_credentials().is_err(), "secret missing");
+        env.set("AWS_SECRET_ACCESS_KEY", Some("env-secret"));
+        env.set("AWS_SESSION_TOKEN", Some(""));
+        let from_env = load_static_credentials().unwrap().unwrap();
+        assert_eq!(from_env.access_key, "env");
+        assert_eq!(from_env.secret_key, "env-secret");
+        assert_eq!(from_env.session_token, None);
+        env.set("AWS_ACCESS_KEY_ID", Some(""));
+        assert!(load_static_credentials().is_err(), "access key empty");
+
+        env.set("AWS_ACCESS_KEY_ID", None);
+        env.set("AWS_SECRET_ACCESS_KEY", None);
+        let not_a_dir = dir.path().join("credentials/nested");
+        env.set("AWS_SHARED_CREDENTIALS_FILE", not_a_dir.to_str());
+        let error = format!("{:#}", load_static_credentials().err().unwrap());
+        assert!(error.starts_with("open AWS credentials file"), "{error}");
+    }
+
+    #[test]
+    fn credentials_file_size_limit_is_exact() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("credentials");
+        let _env = scoped_env(&path);
+        let entry = "[default]\naws_access_key_id=a\naws_secret_access_key=last-byte\n";
+        let padding = "#".repeat(MAX_CREDENTIALS_FILE_BYTES - entry.len() - 1) + "\n";
+        std::fs::write(&path, padding.clone() + entry).unwrap();
+        let credentials = load_static_credentials().unwrap().unwrap();
+        assert_eq!(credentials.secret_key, "last-byte");
+
+        std::fs::write(&path, padding + "#" + entry).unwrap();
+        let error = load_static_credentials().err().unwrap().to_string();
+        assert!(error.contains("exceeds 1048576-byte limit"), "{error}");
+    }
+
+    #[test]
+    fn credentials_require_an_environment_or_file_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("credentials");
+        let mut env = scoped_env(&path);
+        assert_eq!(
+            Credentials::from_env().err().unwrap().to_string(),
+            "no AWS credentials found; set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY or configure a shared credentials file"
+        );
+        std::fs::write(
+            &path,
+            "[backup]\naws_access_key_id=file\naws_secret_access_key=file-secret\naws_session_token=file-token\n",
+        )
+        .unwrap();
+        assert!(Credentials::from_env().is_err(), "default profile absent");
+        env.set("AWS_PROFILE", Some("backup"));
+        let file = Credentials::from_env().unwrap();
+        assert_eq!(file.access_key, "file");
+        assert_eq!(file.secret_key, "file-secret");
+        assert_eq!(file.session_token.as_deref(), Some("file-token"));
+
+        env.set("AWS_ACCESS_KEY_ID", Some("a"));
+        env.set("AWS_SECRET_ACCESS_KEY", Some("s"));
+        env.set("AWS_SESSION_TOKEN", Some("env-token"));
+        let credentials = Credentials::from_env().unwrap();
+        assert_eq!(credentials.access_key, "a");
+        assert_eq!(credentials.secret_key, "s");
+        assert_eq!(credentials.session_token.as_deref(), Some("env-token"));
     }
 }

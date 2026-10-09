@@ -31,7 +31,13 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 futures-util = "0.3"
 tokio-util = { version = "0.7", features = ["io", "rt"] }
 
+[features]
+# Exposes the in-memory fakes in `snapshot_to_s3::testing` to the integration
+# tests (enabled for them by the dev-dependency below; never for releases).
+test-support = []
+
 [dev-dependencies]
+snapshot-to-s3 = { path = ".", features = ["test-support"] }
 tempfile = "3"
 tokio = { version = "1", features = ["test-util"] }
 

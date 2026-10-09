@@ -6,6 +6,7 @@ use tokio_util::sync::CancellationToken;
 
 pub const DEFAULT_STDERR_LIMIT: usize = 64 * 1024;
 pub const DEFAULT_STDOUT_LIMIT: usize = 64 * 1024;
+const READ_BUFFER_SIZE: usize = 8192;
 
 pub struct BoundedText {
     pub text: String,
@@ -31,7 +32,7 @@ where
         }
     };
 
-    let mut buf = vec![0u8; 8192];
+    let mut buf = vec![0u8; READ_BUFFER_SIZE];
     let mut collected = Vec::new();
     let mut truncated = false;
 

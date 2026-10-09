@@ -1,9 +1,16 @@
+//! In-memory fakes of the object store and ZFS used by the workflow tests.
+//!
+//! Both record what they were asked to do (`events`) and expose plain fields
+//! for fault injection, so tests can fail any step and inspect the outcome.
+//! [`ScopedEnv`] serializes tests that change process environment variables.
+
 use crate::model::{MetadataMap, Reader, SnapshotName};
 use crate::store::{ObjectHead, ObjectStore, Part};
 use crate::zfs::{SendStream, SnapshotInfo, TargetInfo, Zfs};
 use anyhow::{bail, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
+use sha2::Digest;
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 use tokio::io::AsyncReadExt;
@@ -11,13 +18,27 @@ use tokio_util::sync::CancellationToken;
 
 type TestUpload = (String, MetadataMap, BTreeMap<u32, Bytes>);
 
+/// An object store held in memory. Every call is logged to `events` as
+/// `"<OP> <key>"` (e.g. `PUT a/b`, `PART a/b 2`).
 #[derive(Default)]
 pub struct MemoryStore {
     pub objects: Mutex<BTreeMap<String, (Bytes, MetadataMap)>>,
     pub events: Mutex<Vec<String>>,
+    /// Fail every call whose event starts with this prefix.
     pub failure: Mutex<Option<String>>,
+    /// Commit multipart completions but then report an error, as if the
+    /// response was lost.
     pub completion_lost: Mutex<bool>,
+    /// Store parts as empty buffers to keep large-stream tests cheap.
     pub discard_parts: bool,
+    /// Report injected failures as retryable.
+    pub retryable_failures: bool,
+    /// Report injected failures as definite service rejections.
+    pub definite_rejections: bool,
+    /// Commit one conditional put, then report a lost response.
+    pub conditional_commit_lost: Mutex<bool>,
+    /// Fail one conditional put before it reaches the in-memory object map.
+    pub conditional_put_failure_once: Mutex<bool>,
     uploads: Mutex<BTreeMap<String, TestUpload>>,
 }
 
@@ -89,11 +110,19 @@ impl ObjectStore for MemoryStore {
     }
     async fn put_if_absent(&self, key: &str, data: Bytes) -> Result<bool> {
         self.event(format!("LOCK {key}"))?;
+        if *self.conditional_put_failure_once.lock().unwrap() {
+            *self.conditional_put_failure_once.lock().unwrap() = false;
+            bail!("injected one-shot conditional-put failure");
+        }
         let mut objects = self.objects.lock().unwrap();
         if objects.contains_key(key) {
             return Ok(false);
         }
         objects.insert(key.into(), (data, MetadataMap::new()));
+        if *self.conditional_commit_lost.lock().unwrap() {
+            *self.conditional_commit_lost.lock().unwrap() = false;
+            bail!("response lost after conditional put");
+        }
         Ok(true)
     }
     async fn delete(&self, key: &str) -> Result<()> {
@@ -166,24 +195,42 @@ impl ObjectStore for MemoryStore {
         self.uploads.lock().unwrap().remove(upload);
         Ok(())
     }
+    fn is_retryable(&self, error: &anyhow::Error) -> bool {
+        self.retryable_failures && error.to_string().starts_with("injected failure")
+    }
+    fn is_definite_rejection(&self, error: &anyhow::Error) -> bool {
+        self.definite_rejections && error.to_string().starts_with("injected failure")
+    }
 }
 
-use sha2::Digest;
-
+/// A scripted ZFS: serves `snapshots`/`target`, records calls in `events`
+/// and keeps every received stream in `receive_data`.
 pub struct FakeZfs {
     pub snapshots: Vec<SnapshotInfo>,
     pub target: TargetInfo,
+    /// `check_clean` reports that the target changed since its snapshot.
     pub dirty: bool,
+    /// `check_clean` fails as if `zfs diff` itself failed.
     pub diff_failure: bool,
     pub events: Mutex<Vec<String>>,
+    /// Fail the receive with this zero-based index.
     pub receive_failure: Option<usize>,
+    /// The send process reports failure when it completes.
     pub send_failure: bool,
     pub receive_data: Mutex<Vec<Vec<u8>>>,
     pub send_bytes: Vec<u8>,
+    /// Reading the send stream fails immediately.
     pub send_read_failure: bool,
 }
 
+impl Default for FakeZfs {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl FakeZfs {
+    /// One source snapshot `pool/data@s1` and an absent restore target.
     pub fn new() -> Self {
         Self {
             snapshots: vec![SnapshotInfo {
@@ -298,5 +345,51 @@ impl tokio::io::AsyncRead for FailingRead {
         _: &mut tokio::io::ReadBuf<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
         std::task::Poll::Ready(Err(std::io::Error::other("injected stream read failure")))
+    }
+}
+
+static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+/// Sets or removes environment variables for one test and restores them when
+/// dropped. A process-wide lock keeps such tests from overlapping.
+pub struct ScopedEnv {
+    saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+impl ScopedEnv {
+    /// Applies `vars`: `Some(value)` sets a variable, `None` removes it.
+    pub fn new(vars: &[(&'static str, Option<&str>)]) -> Self {
+        let lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut env = Self {
+            saved: Vec::new(),
+            _lock: lock,
+        };
+        for (name, value) in vars {
+            env.set(name, *value);
+        }
+        env
+    }
+
+    /// Changes one more variable; the first value seen is the one restored.
+    pub fn set(&mut self, name: &'static str, value: Option<&str>) {
+        if !self.saved.iter().any(|(saved, _)| *saved == name) {
+            self.saved.push((name, std::env::var_os(name)));
+        }
+        match value {
+            Some(value) => std::env::set_var(name, value),
+            None => std::env::remove_var(name),
+        }
+    }
+}
+
+impl Drop for ScopedEnv {
+    fn drop(&mut self) {
+        for (name, value) in self.saved.drain(..).rev() {
+            match value {
+                Some(value) => std::env::set_var(name, value),
+                None => std::env::remove_var(name),
+            }
+        }
     }
 }

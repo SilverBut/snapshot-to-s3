@@ -323,3 +323,82 @@ mod tests {
         assert_eq!(output, vector);
     }
 }
+
+#[cfg(test)]
+mod boundary_tests {
+    use super::*;
+
+    const KEY: [u8; 32] = [0x31; 32];
+    const AAD: &[u8] = b"verify-prefix boundary";
+
+    async fn ciphertext_for(plaintext_len: usize) -> Vec<u8> {
+        let plaintext = vec![0x6b; plaintext_len];
+        let mut input = plaintext.as_slice();
+        let mut ciphertext = Vec::new();
+        encrypt(&KEY, AAD, &mut input, &mut ciphertext)
+            .await
+            .unwrap();
+        ciphertext
+    }
+
+    #[tokio::test]
+    async fn ciphertext_size_matches_encrypted_lengths_at_segment_boundaries() {
+        let first = FIRST_PLAINTEXT_SEGMENT_SIZE;
+        let segment = PLAINTEXT_SEGMENT_SIZE;
+        for plaintext_len in [
+            0,
+            1,
+            first - 1,
+            first,
+            first + 1,
+            first + segment - 1,
+            first + segment,
+            first + segment + 1,
+            first + 2 * segment + 1,
+        ] {
+            let ciphertext = ciphertext_for(plaintext_len).await;
+            assert_eq!(
+                ciphertext_size(plaintext_len as u64),
+                ciphertext.len() as u64,
+                "plaintext length {plaintext_len}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn verify_prefix_handles_short_exact_and_over_boundary_objects() {
+        let short = ciphertext_for(29).await;
+        verify_prefix(&KEY, AAD, &mut short.as_slice(), short.len() as u64)
+            .await
+            .unwrap();
+        let mut trailing = short.clone();
+        trailing.push(0);
+        assert!(
+            verify_prefix(&KEY, AAD, &mut trailing.as_slice(), short.len() as u64)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("trailing data")
+        );
+
+        let exact = ciphertext_for(FIRST_PLAINTEXT_SEGMENT_SIZE + PLAINTEXT_SEGMENT_SIZE).await;
+        assert_eq!(exact.len() as u64, VERIFY_PREFIX_BYTES);
+        verify_prefix(&KEY, AAD, &mut exact.as_slice(), exact.len() as u64)
+            .await
+            .unwrap();
+
+        let over = ciphertext_for(FIRST_PLAINTEXT_SEGMENT_SIZE + PLAINTEXT_SEGMENT_SIZE + 1).await;
+        assert!(over.len() as u64 > VERIFY_PREFIX_BYTES);
+        let mut prefix = &over[..VERIFY_PREFIX_BYTES as usize];
+        verify_prefix(&KEY, AAD, &mut prefix, VERIFY_PREFIX_BYTES + 1)
+            .await
+            .unwrap();
+
+        let mut short_range = &exact[..exact.len() - 1];
+        assert!(
+            verify_prefix(&KEY, AAD, &mut short_range, exact.len() as u64)
+                .await
+                .is_err()
+        );
+    }
+}

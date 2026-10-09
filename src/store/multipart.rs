@@ -16,6 +16,8 @@ use tokio_util::sync::CancellationToken;
 const MIB: u64 = 1024 * 1024;
 /// Attempts per part, including the first, for retryable failures.
 const PART_ATTEMPTS: u64 = 3;
+/// Delay before retry `n` is `n` times this.
+const PART_RETRY_BACKOFF: Duration = Duration::from_millis(100);
 
 /// Provider multipart limits and the local part-buffer budget.
 #[derive(Clone, Debug)]
@@ -232,7 +234,7 @@ async fn upload_part(
             Err(error) if attempt < PART_ATTEMPTS && store.is_retryable(&error) => {
                 tokio::select! {
                     _ = cancel.cancelled() => bail!("backup cancelled during part retry"),
-                    _ = tokio::time::sleep(Duration::from_millis(100 * attempt)) => (),
+                    _ = tokio::time::sleep(PART_RETRY_BACKOFF * attempt as u32) => (),
                 }
             }
             Err(error) => {
@@ -469,5 +471,100 @@ mod tests {
         assert_eq!(result.parts.len(), 65);
         assert_eq!(result.peak_buffer_bytes, 2 * 1024 * 1024);
         store.abort_upload("large", &id).await.unwrap();
+    }
+
+    #[test]
+    fn limits_accept_boundaries_and_reject_each_violation() {
+        let tight = UploadLimits {
+            min_part_size: 4,
+            max_part_size: 4,
+            max_parts: 1,
+            max_object_size: 4,
+            buffer_limit: 4,
+        };
+        tight.validate().unwrap();
+        UploadLimits {
+            buffer_limit: u64::MAX,
+            ..tight.clone()
+        }
+        .validate()
+        .unwrap();
+        UploadLimits::default().validate().unwrap();
+
+        let invalid: [fn(&mut UploadLimits); 5] = [
+            |l| l.min_part_size = 0,
+            |l| l.min_part_size = 5,
+            |l| l.buffer_limit = 3,
+            |l| l.max_parts = 0,
+            |l| l.max_object_size = 3,
+        ];
+        for (index, change) in invalid.iter().enumerate() {
+            let mut limits = tight.clone();
+            change(&mut limits);
+            assert!(limits.validate().is_err(), "violation {index} accepted");
+        }
+    }
+
+    #[tokio::test]
+    async fn late_parts_grow_and_part_count_ends_the_object() {
+        let store = MemoryStore::discarding_parts();
+        let id = store
+            .create_upload("grow", &MetadataMap::new())
+            .await
+            .unwrap();
+        let mut input = tokio::io::BufReader::new(tokio::io::repeat(1).take(48 * MIB));
+        let limits = UploadLimits {
+            min_part_size: MIB,
+            max_part_size: 32 * MIB,
+            max_parts: 4,
+            max_object_size: 1024 * MIB,
+            buffer_limit: 32 * MIB,
+        };
+        let uploaded = upload_parts(
+            &store,
+            "grow",
+            &id,
+            &mut input,
+            1,
+            &limits,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        // Parts of 8, 8, 8 and 16 MiB: only the part after half of
+        // `max_parts` doubles, and the fourth part fills the object.
+        assert_eq!(uploaded.parts.len(), 4);
+        assert_eq!(uploaded.bytes, 40 * MIB);
+        assert_eq!(uploaded.peak_buffer_bytes, 16 * MIB as usize);
+        assert!(!uploaded.ended);
+        store.abort_upload("grow", &id).await.unwrap();
+    }
+
+    async fn part_attempts(retryable: bool) -> usize {
+        let mut store = MemoryStore::default();
+        store.retryable_failures = retryable;
+        *store.failure.lock().unwrap() = Some("PART flaky 1".into());
+        let id = store
+            .create_upload("flaky", &MetadataMap::new())
+            .await
+            .unwrap();
+        let mut input = &b"data"[..];
+        let (limits, cancel) = (UploadLimits::default(), CancellationToken::new());
+        let upload = upload_parts(&store, "flaky", &id, &mut input, 4, &limits, &cancel);
+        let Err(error) = tokio::time::timeout(Duration::from_secs(10), upload)
+            .await
+            .expect("retries must stop")
+        else {
+            panic!("a failing part must fail the upload");
+        };
+        assert!(format!("{error:#}").contains("injected failure: PART flaky 1"));
+        let events = store.events.lock().unwrap();
+        events.iter().filter(|e| *e == "PART flaky 1").count()
+    }
+
+    #[tokio::test]
+    async fn retryable_part_failures_get_three_attempts_and_others_one() {
+        assert_eq!(part_attempts(true).await, PART_ATTEMPTS as usize);
+        assert_eq!(part_attempts(false).await, 1);
     }
 }

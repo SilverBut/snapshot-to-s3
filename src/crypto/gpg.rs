@@ -251,14 +251,16 @@ async fn run_gpg(
     Ok(stdout)
 }
 
+const READ_BUFFER_SIZE: usize = 8192;
+
 /// Reads to EOF, keeping at most `limit` bytes; the flag reports overflow.
 async fn collect_limited<R: AsyncRead + Unpin>(
     mut reader: R,
     limit: usize,
 ) -> io::Result<(Zeroizing<Vec<u8>>, bool)> {
-    let mut collected = Zeroizing::new(Vec::with_capacity(limit.min(8192)));
+    let mut collected = Zeroizing::new(Vec::with_capacity(limit.min(READ_BUFFER_SIZE)));
     let mut overflow = false;
-    let mut buffer = Zeroizing::new([0u8; 8192]);
+    let mut buffer = Zeroizing::new([0u8; READ_BUFFER_SIZE]);
     loop {
         let count = reader.read(&mut buffer[..]).await?;
         if count == 0 {

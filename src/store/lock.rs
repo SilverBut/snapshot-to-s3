@@ -105,4 +105,44 @@ mod tests {
         lock.release(store.as_ref()).await.unwrap();
         assert!(store.head("backup/key.gpg").await.unwrap().is_some());
     }
+
+    #[tokio::test]
+    async fn acquisition_recovers_a_committed_create_with_a_lost_response() {
+        let store = MemoryStore::default();
+        *store.conditional_commit_lost.lock().unwrap() = true;
+        let lock = HeldLock::acquire(&store, "backup/")
+            .await
+            .expect("the stored token proves that the first put committed");
+        assert_eq!(lock.key, "backup/.lock");
+        assert_eq!(store.head(&lock.key).await.unwrap().unwrap().size, 64);
+        lock.release(&store).await.unwrap();
+        assert!(store.head(&lock.key).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn acquisition_rejects_a_different_token_after_an_uncertain_put() {
+        let store = MemoryStore::default();
+        store
+            .put(
+                "backup/.lock",
+                Bytes::from_static(b"owned-by-someone-else"),
+                &MetadataMap::new(),
+            )
+            .await
+            .unwrap();
+        *store.conditional_put_failure_once.lock().unwrap() = true;
+        let error = match HeldLock::acquire(&store, "backup/").await {
+            Ok(_) => panic!("a different ownership token must not be accepted"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            error.contains("lock acquisition outcome is unresolved"),
+            "{error}"
+        );
+        let reader = store.get("backup/.lock", None, None).await.unwrap();
+        assert_eq!(
+            crate::store::read_small(reader, 128).await.unwrap(),
+            b"owned-by-someone-else"
+        );
+    }
 }
