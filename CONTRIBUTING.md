@@ -54,6 +54,10 @@ Versions are SemVer tags: `vX.Y.Z`, or `vX.Y.Z-alpha.N` / `-beta.N` / `-rc.N` / 
    verifies it, and publishes it with `SHA256SUMS` (check with `sha256sum -c SHA256SUMS`).
 
 Both workflows run only when started manually; no push, PR or CI completion starts a release.
+Both Prepare Release jobs also require the default branch, including dry runs. Copilot note generation
+runs with read-only repository permissions; its token is not passed to the job that creates the PR.
+The release PR points to the CHANGELOG draft rather than generating a separate candidate-commit list.
+An empty generated draft fails preparation instead of silently substituting a template.
 
 Preparing the same version again reuses its PR and keeps the notes. If an accepted release was not
 published, run **Actions → Release → publish** again instead of bumping. **Release → build-only** and
