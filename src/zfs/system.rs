@@ -27,6 +27,9 @@ pub struct SystemZfs {
     stdout_limit: usize,
 }
 
+/// Captured stdout of a snapshot listing: about 300 bytes per snapshot.
+const LIST_STDOUT_LIMIT: usize = 64 * 1024 * 1024;
+
 struct CommandOutput {
     status: ExitStatus,
     stdout: String,
@@ -61,13 +64,26 @@ impl SystemZfs {
     where
         S: AsRef<OsStr> + Debug,
     {
+        self.run_capture_bounded(program, args, self.stdout_limit)
+            .await
+    }
+
+    async fn run_capture_bounded<S>(
+        &self,
+        program: &OsString,
+        args: &[S],
+        stdout_limit: usize,
+    ) -> Result<CommandOutput>
+    where
+        S: AsRef<OsStr> + Debug,
+    {
         let mut child = Self::command(program)
             .args(args)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
             .with_context(|| format!("failed to execute {program:?} {args:?}"))?;
-        let stdout_task = tokio::spawn(read_bounded_stdout(child.stdout.take(), self.stdout_limit));
+        let stdout_task = tokio::spawn(read_bounded_stdout(child.stdout.take(), stdout_limit));
         let stderr_task = tokio::spawn(read_bounded_stderr(child.stderr.take(), self.stderr_limit));
         let status = child.wait().await.context("failed waiting for command")?;
         let stdout = stdout_task
@@ -77,10 +93,7 @@ impl SystemZfs {
             .await
             .context("stderr collector join failed")??;
         if stdout.truncated {
-            bail!(
-                "command stdout exceeded {} bytes: {program:?} {args:?}",
-                self.stdout_limit
-            );
+            bail!("command stdout exceeded {stdout_limit} bytes: {program:?} {args:?}");
         }
         Ok(CommandOutput {
             status,
@@ -295,11 +308,12 @@ impl Zfs for SystemZfs {
     async fn snapshots(&self, dataset: &str) -> Result<Vec<SnapshotInfo>> {
         validate_dataset(dataset)?;
         self.ensure_filesystem(dataset).await?;
+        let args = [
+            "list", "-j", "-p", "-t", "snapshot", "-o", "name", "-d", "1", "-s", "creation",
+            dataset,
+        ];
         let output = self
-            .zfs(&[
-                "list", "-j", "-p", "-t", "snapshot", "-o", "name", "-d", "1", "-s", "creation",
-                dataset,
-            ])
+            .run_capture_bounded(&self.zfs_bin, &args, LIST_STDOUT_LIMIT)
             .await?;
         if !output.status.success() {
             bail!(

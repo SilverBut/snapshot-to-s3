@@ -1,246 +1,96 @@
-# Development Guidelines
+# Development environment
 
-## Devcontainer Setup
+Offline checks are listed in [CONTRIBUTING.md](CONTRIBUTING.md#build-and-check). This page covers the
+opt-in tests that need ZFS, a local S3 service or the official Tink runtime, and the CI that runs them.
 
-Ensure the host has OpenZFS installed and an administrator has provided a development pool. The container uses the
-host's ZFS kernel module through `/dev/zfs`; visible pools are not isolated from the host.
+## ZFS development pools
 
-Local agent tests must only use existing pools. Do not create or recreate pools, prepare backing devices
-or files, import, export or destroy pools, or change pool labels to make them eligible. If no suitable pool exists,
-stop and ask the administrator to provide one.
+Containers share the host's ZFS kernel module through `/dev/zfs`, so pools are not isolated from the host.
+Local tests use only an existing pool provided by an administrator:
 
-Discover pools on the current machine rather than hard-coding names or backing paths:
+* Discover pools (`zpool list`, `zpool get user:isdev`, `zpool status -P`); never hard-code names.
+* Use only an `ONLINE` pool whose **pool** property `user:isdev` is exactly `yes`
+  (`zpool get -j -p user:isdev "$pool"`). If there is none, stop and ask for one.
+* Never create, import, export, destroy or relabel pools, and never prepare backing files or devices.
 
-```bash
-zfs version
-zpool list
-zpool get user:isdev
-zpool status -P
-sudo -n true
-```
+Within the pool, tests must:
 
-Select only an ONLINE pool whose **pool property** `user:isdev` is exactly `yes`, and verify the selected pool:
+* create a unique child namespace such as `$pool/smoke_<id>`, after checking that it does not exist,
+  and change, write, roll back or destroy only inside it;
+* mount test filesystems at explicit temporary mountpoints with `canmount=on`, and check
+  `findmnt -n -o FSTYPE -T "$mountpoint"` reports `zfs` before writing;
+* set `atime=off` on source and received filesystems so verification reads do not change receive targets,
+  and never hide changes with `zfs receive -F`;
+* use `set -euo pipefail` and an exit trap for cleanup. Report cleanup failures, keep diagnostics, and
+  never delete a mountpoint tree while its dataset is mounted.
 
-```bash
-zpool get -j -p user:isdev "$pool"
-```
+Keep total test artifacts under 40 GiB and leave at least 20 GiB free (hosted VMs: 4 GiB each, set by
+the wrappers). Prefer generated streams to large fixtures.
 
-Inspect the selected pool's JSON `properties["user:isdev"].value`: it must be the string `yes`.
-Automated discovery uses `zpool list -j -p -o name,health`, requires `ONLINE` state/health, then reads and
-rechecks the **pool** property with `zpool get -j -p`. No pool may be created or relabeled to pass this check.
-The commands above for general inspection are interactive diagnostics, not formats to parse in scripts.
+## Local end-to-end tests
 
-The label permits isolated development testing, not unrestricted destruction. Follow [AGENTS.md](AGENTS.md):
-
-* Use a unique child namespace such as `$pool/smoke_<unique-id>`, and verify it does not already exist before creating it.
-* Change properties, write, receive, roll back and destroy datasets only within the namespace created by the test.
-* Use explicit temporary mountpoints and `canmount=on`; confirm `findmnt -n -o FSTYPE -T "$mountpoint"` reports `zfs`
-  before writing.
-* Set `atime=off` on source and received filesystems so verification reads do not modify the receive target.
-* Use `set -euo pipefail` and an exit trap for cleanup. Report cleanup failures and retain diagnostic files when needed.
-  Never remove a mountpoint tree while its dataset remains mounted.
-* Do not use `zfs receive -F` to hide unexpected target changes.
-
-The acceptance scenarios in [docs/design.md](docs/design.md#acceptance-scenarios) define later validation of the
-backup and restore requirements; preparing this environment does not establish that those behaviors are implemented.
-
-## Cloud Copilot handoff
-
-[copilot-setup-steps.yml](.github/workflows/copilot-setup-steps.yml) contains the single reserved
-`copilot-setup-steps` job required by GitHub. It uses standard Ubuntu 26.04 x64 with read-only checkout
-permissions, installs matching ZFS tools/module, Rust with clippy/rustfmt/rust-src, GnuPG, Python/venv,
-ShellCheck and static build tools, and fetches locked Cargo dependencies.
-
-Before the agent starts, [copilot_setup.sh](tests/support/copilot_setup.sh) downloads checksum-verified
-SeaweedFS 4.48, installs official Tink 1.16.1, creates its own **4 GiB sparse-file** development pool on
-an otherwise pool-free hosted VM, records its GUID and sets/verifies `user:isdev=yes`. It precompiles
-the tests and publishes `target/copilot-dev/env.sh` plus a ready marker only after successful setup.
-The pool and backing file are deliberately retained for the agent; the ephemeral VM owns their final lifetime.
-This bootstrap refuses local/self-hosted execution. Agents only consume the existing labeled pool.
-
-Load the handoff before working:
+[`zfs_s3_e2e.sh`](tests/support/zfs_s3_e2e.sh) finds a labeled pool and creates a unique namespace.
+It runs full, incremental and multi-object backups, restores into new and existing targets, a stdout
+export, rejection of a dirty target or incomplete chain, and native-encrypted raw send, all with a
+public-only GPG home for backup. It needs `python3`, GnuPG, a local S3 service and OpenZFS 2.3+.
 
 ```bash
-source target/copilot-dev/env.sh
-zpool get -j -p user:isdev "$COPILOT_ZFS_POOL"
-bash tests/support/copilot_setup.sh --verify
-```
-
-Verification starts a dedicated local S3 service, runs Tink/live HTTP/full and incremental ZFS recovery,
-stops that service and verifies the same development pool is still available afterward. Each ZFS run
-uses the harness's unique child namespace and short temporary GPG paths. It does not destroy the pool.
-SeaweedFS is preinstalled, not left as an orphan background daemon across setup boundaries. For a custom
-long-running local S3 session, use `WEED_BIN` and the existing `local_s3.sh` helper in an attached session.
-The handoff includes the 4-GiB ephemeral test-space reserve; shared-host local defaults remain 20 GiB.
-
-If setup fails, GitHub may still start the agent with a partial environment. A missing handoff/ready marker
-or a failed GUID/label check is an explicit setup failure; never import, recreate or relabel a pool to hide it.
-Do not rely solely on job-level environment variables (which Copilot does not customize): the ignored handoff
-file makes tool paths available even when the agent's shell does not inherit setup-step exports.
-
-The normal CI gate also calls this setup with handoff E2E verification enabled, so configuration/dependency
-regressions cannot be merged with a successful core CI but a broken cloud development environment. In an
-actual Copilot session, the expensive optional verification is not enabled by default. The setup file must
-be merged into the default branch for Copilot to use it.
-
-## Local S3 and capability probes (opt-in)
-
-Infrastructure-backed tests are opt-in and should not be silently treated as passing when skipped.
-
-Local end-to-end runs consume an existing `ONLINE` development pool whose pool property is `user:isdev=yes`.
-Remote CI runs on a fresh standard GitHub-hosted Ubuntu VM and provisions its own temporary file-backed pool.
-The hosted bootstrap refuses local and self-hosted execution and refuses VMs with existing pools.
-
-The optional official Tink runtime interoperability test checks encryption and decryption in both directions
-against Python Tink 1.16.1 with a 3 MiB payload. With Tink installed in a project-local virtual environment, run:
-
-```bash
-TINK_PYTHON=venv/bin/python cargo test --locked --test crypto_stream official_tink_runtime_bidirectional -- --ignored
-```
-
-Current support scripts:
-
-* `tests/support/local_s3.sh` — local S3 service bootstrap/helper (actively evolving)
-* `tests/support/s3_probe.py` — endpoint capability probe for lock/multipart/range assumptions
-* `tests/support/zfs_s3_e2e.sh` — ZFS + S3 end-to-end validation script
-
-Consult script interfaces before use because arguments and behavior may change while the rebuild is in progress.
-
-Current `zfs_s3_e2e.sh` coverage includes:
-
-* isolated safe namespace usage on a discovered `ONLINE` `user:isdev=yes` pool
-* backup/restore with a dedicated **public-only** GPG home for encryption selection
-* native encrypted ZFS dataset raw backup/recovery checks in that same namespace
-
-The script requires `python3` (standard-library JSON parsing, also used by the capability probes) and OpenZFS
-`zfs`/`zpool` `get`/`list` support for `-j`, usually available in 2.3+. It uses ordinary standard-library JSON
-decoding, checks map keys against each object's `name`, and validates the pool state, dataset types and
-required property values. Unrelated fields and envelope versions are ignored; there is no custom duplicate-key
-validator. Use `-j -p`, without `--json-int`, to retain exact decimal GUID strings. Invalid required data or
-failed commands, including permission failures while checking namespace absence, are fatal rather than evidence
-of a missing dataset or an unlabeled pool. There is no table-output fallback.
-
-The unique test namespace is checked against a successful recursive JSON dataset listing before creation.
-Runtime files and explicit mountpoints default to a unique directory under `target/test-artifacts`.
-Set `E2E_RUNTIME_DIR` to select a different dedicated diagnostics directory; it must not already exist.
-Failed runs retain that directory for diagnostics. Successful cleanup removes it only after destroying the
-test namespace and checking that no test mounts remain.
-Private and public-only GnuPG homes use a separate short `.gpg_<unique-id>` directory in the project root.
-For deep CI checkouts, set `E2E_GPG_DIR` to a short dedicated directory that does not already exist.
-The script checks the socket path length before launching GnuPG. Successful cleanup removes those homes
-after stopping their agents; failed runs report and retain both runtime directories for diagnostics.
-Modification commands do not need JSON output, and binary `zfs receive` input is unchanged. `zfs diff -H`
-and `zfs send -nP` are separate machine formats (neither accepts `-j` in OpenZFS 2.4.4).
-
-Once `local_s3.sh` is running and `local_s3.env` is loaded, use the current commands:
-
-```bash
+tests/support/local_s3.sh "$RUNTIME_DIR"   # SeaweedFS in the foreground; run the rest elsewhere
 source "$RUNTIME_DIR/local_s3.env"
 export TEST_S3_ENDPOINT="$LOCAL_S3_ENDPOINT" TEST_S3_BUCKET="$LOCAL_S3_BUCKET"
 tests/support/zfs_s3_e2e.sh
-cargo test --test live_http -- --ignored
+cargo test --locked --test live_http -- --ignored
+TINK_PYTHON=venv/bin/python cargo test --locked --test crypto_stream official_tink_runtime_bidirectional -- --ignored
 ```
 
-## Capacity and artifact budget
+`E2E_RUNTIME_DIR` (runtime files and mountpoints, default under `target/test-artifacts`) and
+`E2E_GPG_DIR` (short GnuPG home path) must not exist beforehand. Failed runs keep them for diagnosis.
+[`s3_probe.py`](tests/support/s3_probe.py) checks an endpoint's lock, multipart and range behavior.
 
-For local infrastructure and test artifacts, keep total incremental usage within **40 GiB** and preserve at least
-**20 GiB** free disk space. If both constraints cannot be met, reduce scope or stop and report the blocker.
+**Never run [`ci_e2e.sh`](tests/support/ci_e2e.sh) locally**: it creates and destroys its own pool and
+only runs on fresh GitHub-hosted VMs.
 
-Prefer generated streams and bounded fixtures over large persistent objects when validating multipart/error paths.
+## Cloud Copilot handoff
 
-The disposable hosted E2E fixture uses a **2 GiB sparse backing file**, a **4 GiB free-space reserve** and a
-**4 GiB incremental service/artifact budget**. Actual fixture data is small; a sparse file is not evidence of
-available storage. CI checks measured free space and monitors growth. The hosted wrapper sets
-`E2E_MIN_FREE_BYTES` and the existing local S3 budget overrides explicitly; local defaults remain unchanged.
+[`copilot-setup-steps.yml`](.github/workflows/copilot-setup-steps.yml) prepares the cloud agent's VM
+(Ubuntu 26.04). It installs ZFS, Rust, GnuPG, Python and ShellCheck, then runs
+[`copilot_setup.sh`](tests/support/copilot_setup.sh). That script installs checksum-verified SeaweedFS
+4.48 and Tink 1.16.1, creates a 4 GiB sparse-file pool labeled `user:isdev=yes`, records its GUID,
+precompiles the tests, and writes `target/copilot-dev/env.sh` last. It refuses to run anywhere but a
+fresh hosted VM.
 
-## Local checks and remote acceptance
-
-Before committing, run the offline tests and checks:
+Agents use only that pool:
 
 ```bash
-cargo test --locked
-cargo fmt --all -- --check
-cargo clippy --locked --all-targets --all-features -- -D warnings
-python3 -m unittest discover -s tests/support -p 'test_ci_*.py' -v
+source target/copilot-dev/env.sh
+bash tests/support/copilot_setup.sh --verify
 ```
 
-Do not run [ci_e2e.sh](tests/support/ci_e2e.sh) on the shared development host, even by forging runner environment
-variables. Its infrastructure bootstrap is exclusively for fresh GitHub-hosted VMs. Use
-[zfs_s3_e2e.sh](tests/support/zfs_s3_e2e.sh) for local tests with the existing labeled pools instead.
+`--verify` checks the pool's label and GUID, starts a temporary SeaweedFS, and runs the Tink, live HTTP,
+probe and ZFS E2E tests. It then stops the service and checks that the pool is still there. A missing
+handoff file or a failed pool check is a setup failure: report it; never import, recreate or relabel a
+pool. CI runs the same setup and verification, so a broken agent environment fails the gate.
 
-### Hosted workflow
+## CI
 
-[CI](.github/workflows/ci.yml) runs on pushes, pull requests, manual dispatch and merge groups. It uses fixed
-`ubuntu-26.04` standard hosted VMs, not a self-hosted runner, a larger runner or a privileged job container.
-Separate jobs run:
+[CI](.github/workflows/ci.yml) runs on pushes, pull requests, merge groups and manual dispatch, on
+standard `ubuntu-26.04` hosted VMs. The jobs are: tests; quality (fmt, clippy, ShellCheck, CI-script tests,
+`release.py check`); release build; [RustSec audit](.github/workflows/security.yml) (also weekly); the
+cloud setup check; and E2E. `CI Gate` passes only if all of them succeed.
 
-* all default Rust unit and integration tests;
-* formatting, strict clippy, ShellCheck, and CI gate/hosted-guard tests;
-* cloud Copilot setup and retained-pool handoff E2E verification;
-* the release build;
-* the reusable [RustSec audit](.github/workflows/security.yml), also run weekly;
-* every opt-in test and the real ZFS/S3 E2E harness.
+The E2E job ([`ci_e2e.sh`](tests/support/ci_e2e.sh)) refuses VMs that already have pools. It creates and
+labels a temporary pool, starts SeaweedFS with throwaway credentials, and runs every opt-in test
+(including a GET that lasts more than 120 s) plus the ZFS E2E script. Its exit trap destroys only that pool,
+after checking the GUID. Diagnostics are uploaded without credentials, keys or large data.
 
-The E2E job installs the distribution's JSON-capable OpenZFS tools and loads its matching kernel module.
-[ci_e2e.sh](tests/support/ci_e2e.sh) verifies usable versions (2.3+) and refuses VMs with existing pools.
-A successful empty `zpool list -j` response is recognized as the distribution's no-pool case; nonempty output
-must be valid JSON. The script creates a uniquely named temporary pool, records its GUID, and sets
-`user:isdev=yes` on that owned pool with `zpool set` (the creation `-o` interface rejects user properties).
-It verifies both GUID and label before starting checksum-verified SeaweedFS 4.48
-with throwaway credentials. It explicitly runs official Tink 1.16.1 bidirectional interoperability, live HTTP
-capability tests, the real GET regression lasting more than 120 seconds, and full/multi-step raw ZFS recovery.
-GnuPG homes and mountpoints use short dedicated paths under the runner's temporary directory.
+PR jobs get read-only permissions and no secrets. Do not switch to `pull_request_target`. Check a pushed
+branch with `gh run list --branch BRANCH`, `gh run view RUN_ID --log-failed` and `gh pr checks PR`.
+Local results do not replace this remote check.
 
-An exit trap stops owned services, verifies the created pool's identity/GUID, destroys only that CI pool and
-removes its backing file after successful pool shutdown. It refuses to delete mounted runtime trees. Cleanup
-failures fail the job; diagnostics are uploaded even on failure. Artifacts exclude S3 credentials, GPG homes,
-native ZFS keys and large data/backing files.
+## Release automation
 
-PR jobs have read-only repository permissions, no repository secrets and no persisted checkout credentials.
-Fork PRs use the same disposable infrastructure, subject to GitHub's approval requirements for first-time
-contributors. Do not replace `pull_request` with `pull_request_target` to execute untrusted PR code.
-
-GitHub's licensed Dependency Review feature is not required. RustSec audits the actual lockfile in CI, without
-advisory ignore lists; vulnerable dependencies fail the gate.
-
-### Main-branch gate and remote verification
-
-`CI Gate` requires every test, quality, release, audit, E2E and cloud-setup job to succeed. Missing, skipped, cancelled or
-failed prerequisite jobs cannot produce a successful gate. Main-branch protection requires a PR, this check
-from the GitHub Actions app, and an up-to-date branch. No independent human approval is required; administrators
-retain the explicitly allowed emergency bypass. Normal force pushes and branch deletion are prohibited.
-
-Commit on a topic branch, push, and verify the exact revision remotely:
-
-```bash
-gh run list --branch YOUR_BRANCH
-gh run watch RUN_ID --exit-status --compact
-gh run view RUN_ID --log-failed
-gh pr checks PR_NUMBER
-```
-
-Passing local tests or merely linting the workflow is not remote acceptance. All opt-in and real ZFS tests
-must actually run. Verify both the run results and the server-side protection settings; workflow YAML alone
-does not configure a repository's required checks.
-
-## Release workflow verification
-
-Release preparation is explicitly selected in the Actions UI; normal main updates do not create version branches.
-See [CONTRIBUTING.md](CONTRIBUTING.md#versioning-and-releases) for bump, notes, prerelease and retry operations.
-The preparation and publication helpers are covered by `test_ci_release.py`, including a real local bare-Git
-test that recovers an existing release branch without force-pushing or discarding handwritten notes.
-
-`release.py check` adds release metadata validation to the existing quality gate. Empty/unreviewed notes and
-inconsistent package/lockfile/proposal versions fail CI. Main push CI groups include the commit SHA so newer
-main commits cannot cancel the CI of an accepted release snapshot; stale PR runs can still be cancelled.
-
-The Release controller only trusts successful CI from this repository. Publication requires an associated
-merged release PR, the exact merge SHA's GitHub Actions CI Gate, main ancestry, consistent frozen metadata,
-an unchanged tag and verified artifact digests. A successful release-branch CI can mark its draft PR ready,
-but cannot publish. Fork/ordinary PR completions do not authorize publication. Privileged controller code is
-checked out from main for automatic/retry runs, never executed from an untrusted upstream artifact.
-
-Verify workflow changes with **Release -> build-only** and **Prepare Release -> dry_run** on a topic branch.
-Build-only produces the actual static archive, checks the CLI version/ELF linkage and never creates tags or
-GitHub Releases. Do not merge a real version proposal or publish an official tag merely to test the automation.
-After deployment, rerun an initial dry preview twice to prove no release branch/PR/tag is created by preview.
+The steps are in [CONTRIBUTING.md](CONTRIBUTING.md#releases). The release controller publishes only from
+a merged release PR whose exact merge commit passed `CI Gate` on `main`. The tag must be unchanged and
+the artifact digests must verify. Privileged jobs check out controller code from `main`. The helpers are
+tested by `tests/support/test_ci_release.py`, including recovery of an existing release branch without
+force-pushing.

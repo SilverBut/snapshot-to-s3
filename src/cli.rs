@@ -198,8 +198,12 @@ async fn run_backup(
     };
     let result = backup(store, zfs, options).await?;
     eprintln!(
-        "backup committed: {} (snapshot GUID {}, {} ciphertext bytes in {} objects)",
-        result.stream_key, result.snapshot_guid, result.ciphertext_bytes, result.stream_objects
+        "backup committed: {} (snapshot GUID {}, {} ciphertext bytes in {} object{})",
+        result.stream_key,
+        result.snapshot_guid,
+        result.ciphertext_bytes,
+        result.stream_objects,
+        if result.stream_objects == 1 { "" } else { "s" }
     );
     Ok(())
 }
