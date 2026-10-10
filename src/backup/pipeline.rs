@@ -84,6 +84,12 @@ impl Job<'_> {
                 return Err(error);
             }
         };
+        tracing::debug!(
+            encryption = ?encryption.as_ref().map(|r| r.as_ref().map_err(|e| format!("{e:#}"))),
+            limiter = ?limiter.as_ref().map(|r| r.as_ref().map_err(|e| format!("{e:#}"))),
+            send = ?send.as_ref().map(|r| r.as_ref().map_err(|e| format!("{e:#}"))),
+            "producers finished"
+        );
         encryption.context("encryption task failed")??;
         limiter.context("rate limiter task failed")??;
         send.context("send monitor failed")??;
@@ -132,6 +138,12 @@ impl Job<'_> {
                 object::MAX_CONTINUATIONS
             );
             let key = object::continuation(&self.stream_key, stream.objects);
+            tracing::info!(
+                %key,
+                uploaded_bytes = stream.bytes,
+                objects = stream.objects,
+                "previous object full; stream continues in a continuation object"
+            );
             // Past the estimate, assume the rest is large: use the largest parts.
             let remaining = Some(estimate.saturating_sub(stream.bytes))
                 .filter(|remaining| *remaining > 0)

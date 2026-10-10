@@ -115,9 +115,9 @@ async fn metadata_probe_rejects_wrong_size_and_cleans_fixed_sibling_key() -> Res
     .expect_err("a provider ignoring metadata must fail its capability probe");
     assert!(format!("{error:#}").contains("unexpected length"));
     let requests = String::from_utf8(server.await?).expect("fixture requests are UTF-8");
-    assert!(requests.contains("/fixture-bucket/backups/snapshot/.metadata-probe HTTP/1.1"));
+    assert!(requests.contains("/fixture-bucket/backups/snapshot/_metadata-probe HTTP/1.1"));
     assert!(requests.contains("x-fixture-meta-current-snapshot-id:"));
-    assert!(requests.contains("DELETE /fixture-bucket/backups/snapshot/.metadata-probe"));
+    assert!(requests.contains("DELETE /fixture-bucket/backups/snapshot/_metadata-probe"));
     for (head, body) in split_captured_requests(requests.as_bytes())
         .into_iter()
         .take(1)
@@ -391,7 +391,7 @@ async fn metadata_probe_accepts_all_preserved_fields_and_provider_extras() -> Re
     ] {
         assert!(requests.contains(&format!("x-fixture-meta-{field}:")));
     }
-    assert!(requests.contains("DELETE /fixture-bucket/backups/snapshot/.metadata-probe"));
+    assert!(requests.contains("DELETE /fixture-bucket/backups/snapshot/_metadata-probe"));
     Ok(())
 }
 

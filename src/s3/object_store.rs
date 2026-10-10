@@ -87,6 +87,7 @@ impl ObjectStore for HttpStore {
                     Some("NoSuchKey" | "NoSuchBucket" | "NotFound" | "NoSuchObject")
                 )
             {
+                tracing::trace!(%key, error_code = ?code, "HEAD: object absent");
                 return Ok(None);
             }
             return Err(self.response_error("HEAD object", response).await);
@@ -107,10 +108,12 @@ impl ObjectStore for HttpStore {
             .to_str()
             .context("invalid HEAD ETag")?
             .to_owned();
+        let metadata = self.metadata_from_headers(response.headers());
+        tracing::trace!(%key, size, %etag, ?metadata, "HEAD: object present");
         Ok(Some(ObjectHead {
             size,
             etag,
-            metadata: self.metadata_from_headers(response.headers()),
+            metadata,
         }))
     }
 
@@ -143,6 +146,7 @@ impl ObjectStore for HttpStore {
             response.status(),
             StatusCode::CONFLICT | StatusCode::PRECONDITION_FAILED
         ) {
+            tracing::debug!(%key, status = %response.status(), "conditional PUT refused: object exists");
             return Ok(false);
         }
         if !response.status().is_success() {
@@ -152,10 +156,12 @@ impl ObjectStore for HttpStore {
             if self.lock_detection_mode == LockDetectionMode::XCosForbidOverwrite
                 && is_file_already_exists(&error)
             {
+                tracing::debug!(%key, "conditional PUT refused: COS FileAlreadyExists");
                 return Ok(false);
             }
             return Err(error);
         }
+        tracing::debug!(%key, mode = ?self.lock_detection_mode, "conditional PUT created the object");
         Ok(true)
     }
 

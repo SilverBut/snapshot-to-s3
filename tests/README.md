@@ -14,6 +14,7 @@ official Tink runtime are opt-in; see [DEVELOPMENT.md](../DEVELOPMENT.md).
 | `zfs_backend/` | `SystemZfs` against the fake `zfs`/`zpool` scripts in `fixtures/`, installed by `support.rs` | `cargo test --test zfs_backend` |
 | `crypto_stream.rs` | Streaming AEAD framing, tampering and Tink vectors | `cargo test --test crypto_stream` |
 | `rate_limit.rs` | Ciphertext rate limiting | `cargo test --test rate_limit` |
+| `diagnostics.rs` | Debug log lines of lock and metadata probe decisions; one test per binary because it installs the global subscriber | `cargo test --test diagnostics` |
 | `live_http.rs` | `HttpStore` against a real S3 endpoint (ignored by default) | see DEVELOPMENT.md |
 | `fixtures/` | Static inputs; provenance in [fixtures/README.md](fixtures/README.md) | — |
 | `e2e/` | ZFS + S3 end-to-end scenarios on a labeled development pool | `tests/e2e/run.sh` |

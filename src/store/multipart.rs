@@ -140,17 +140,29 @@ pub async fn upload_parts<R: AsyncBufRead + Unpin + ?Sized>(
         let room = limits.max_object_size - uploaded.bytes;
         if uploaded.parts.len() >= limits.max_parts as usize || room == 0 {
             uploaded.ended = at_end(reader, cancel).await?;
+            tracing::debug!(
+                %key,
+                parts = uploaded.parts.len(),
+                bytes = uploaded.bytes,
+                ended = uploaded.ended,
+                "object full"
+            );
             break;
         }
         if uploaded.parts.len() > limits.max_parts as usize / 2 {
             // Grow late parts so a stream larger than its estimate needs
             // fewer objects.
-            size = size.saturating_mul(2).min(limits.max_part_size as usize);
+            let grown = size.saturating_mul(2).min(limits.max_part_size as usize);
+            if grown != size {
+                tracing::debug!(%key, from = size, to = grown, "growing late parts");
+            }
+            size = grown;
         }
         let wanted = size.min(usize::try_from(room).unwrap_or(usize::MAX));
         uploaded.peak_part_bytes = uploaded.peak_part_bytes.max(wanted);
         let body = spool.fill(reader, wanted, cancel).await?;
         if body.is_empty() {
+            tracing::debug!(%key, parts = uploaded.parts.len(), "stream ended at a part boundary");
             uploaded.ended = true;
             break;
         }
@@ -188,9 +200,19 @@ pub async fn upload_object<R: AsyncBufRead + Unpin + ?Sized>(
         .create_upload(key, &metadata)
         .await
         .with_context(|| format!("multipart initiation failed: {key}"))?;
+    tracing::info!(%key, upload_id = %upload, estimate, "continuation object upload initiated");
     let result = async {
         let uploaded = upload_parts(store, key, &upload, reader, estimate, limits, cancel).await?;
+        tracing::debug!(
+            %key,
+            parts = uploaded.parts.len(),
+            bytes = uploaded.bytes,
+            "completing continuation object"
+        );
         let completed = store.complete_upload(key, &upload, &uploaded.parts).await;
+        if let Err(error) = &completed {
+            tracing::warn!(%key, "completion failed; checking with HEAD: {error:#}");
+        }
         if matches!(
             confirm_commit(store, key, &metadata, uploaded.bytes).await?,
             CommitConfirmation::Committed
@@ -198,6 +220,13 @@ pub async fn upload_object<R: AsyncBufRead + Unpin + ?Sized>(
             if let Err(error) = completed {
                 tracing::warn!("completion response failed, but {key} matches: {error:#}");
             }
+            tracing::info!(
+                %key,
+                parts = uploaded.parts.len(),
+                bytes = uploaded.bytes,
+                ended = uploaded.ended,
+                "continuation object committed"
+            );
             return Ok(uploaded);
         }
         Err(completed
@@ -206,9 +235,11 @@ pub async fn upload_object<R: AsyncBufRead + Unpin + ?Sized>(
         .with_context(|| format!("object not published after completion: {key}"))
     }
     .await;
-    if result.is_err() {
-        if let Err(error) = store.abort_upload(key, &upload).await {
-            tracing::warn!("multipart abort failed for {key}: {error:#}");
+    if let Err(error) = &result {
+        tracing::warn!(%key, upload_id = %upload, "continuation object failed, aborting: {error:#}");
+        match store.abort_upload(key, &upload).await {
+            Ok(()) => tracing::info!(%key, upload_id = %upload, "multipart upload aborted"),
+            Err(error) => tracing::warn!("multipart abort failed for {key}: {error:#}"),
         }
     }
     result
@@ -244,7 +275,10 @@ async fn upload_part(
             .upload_part_body(key, upload, number, body.clone())
             .await
         {
-            Ok(etag) => break etag,
+            Ok(etag) => {
+                tracing::trace!(%key, number, attempt, %etag, "part accepted");
+                break etag;
+            }
             Err(error) if attempt < PART_ATTEMPTS && store.is_retryable(&error) => {
                 tracing::warn!(
                     "retrying part {number} of {key} after attempt {attempt}: {error:#}"
@@ -255,8 +289,15 @@ async fn upload_part(
                 }
             }
             Err(error) => {
+                tracing::warn!(
+                    %key,
+                    number,
+                    attempt,
+                    retryable = store.is_retryable(&error),
+                    "part upload failed; not retrying: {error:#}"
+                );
                 return Err(error)
-                    .with_context(|| format!("upload part {number}, attempt {attempt}"))
+                    .with_context(|| format!("upload part {number}, attempt {attempt}"));
             }
         }
     };
@@ -284,9 +325,22 @@ pub async fn confirm_commit(
     metadata: &MetadataMap,
     expected_bytes: u64,
 ) -> Result<CommitConfirmation> {
-    match store.head(key).await? {
+    tracing::debug!(%key, expected_bytes, "confirming publication: re-reading with HEAD");
+    let head = store.head(key).await.inspect_err(|error| {
+        tracing::warn!(%key, "HEAD re-read failed: {error:#}");
+    })?;
+    match head {
         Some(head) if head.size == expected_bytes => {
             let mismatch = crate::model::MetadataMismatch::between(metadata, &head.metadata);
+            tracing::debug!(
+                %key,
+                size = head.size,
+                etag = %head.etag,
+                metadata = ?head.metadata,
+                missing = ?mismatch.missing,
+                wrong = ?mismatch.wrong,
+                "HEAD re-read: published with the expected size"
+            );
             if mismatch.is_empty() {
                 Ok(CommitConfirmation::Committed)
             } else {
@@ -296,8 +350,20 @@ pub async fn confirm_commit(
                 })
             }
         }
-        Some(_) => bail!("published stream has unexpected length: {key}"),
-        None => Ok(CommitConfirmation::Absent),
+        Some(head) => {
+            tracing::warn!(
+                %key,
+                size = head.size,
+                expected_bytes,
+                etag = %head.etag,
+                "HEAD re-read: published object has an unexpected size"
+            );
+            bail!("published stream has unexpected length: {key}")
+        }
+        None => {
+            tracing::debug!(%key, "HEAD re-read: object absent");
+            Ok(CommitConfirmation::Absent)
+        }
     }
 }
 

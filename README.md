@@ -42,8 +42,15 @@ The backup is written under `s3://bucket/backups/pool/dataset/snap/`. The snapsh
 | `--part-temp-file PATH` | Hold each ciphertext part in this file instead of memory, so large parts fit small-memory hosts. The path must not exist; it is created with mode 0600 and removed afterwards |
 | `--min-part-size` (default 100 MiB), `--max-parts`, `--max-object-size` | Multipart limits (maximums default to AWS S3); lower `--min-part-size` for services that allow smaller parts |
 
-Diagnostics: set `RUST_LOG` (for example `RUST_LOG=debug`) for logs of external commands, S3 requests and
-upload steps. Logs go to stderr only (default level `warn`), so `restore ... stdout:` output stays clean.
+Diagnostics: logs go to stderr only (default level `warn`), so `restore ... stdout:` output stays clean.
+Set `RUST_LOG` to keep a record for later investigation:
+
+* `info`: each decision and its outcome: store settings, lock acquisition and release, prefix checks,
+  metadata probe results, base selection, uploaded objects, commit confirmation, failure recovery
+  (abort, keep or release), and restore planning, verification and replay.
+* `debug`: also every `HEAD` read-back with the observed size, ETag and metadata compared with the
+  expected values, base candidates and estimates, external commands and S3 requests.
+* `trace`: also skipped snapshots, accepted parts and raw `HEAD` responses.
 
 An incremental base must be an older local snapshot whose committed backup exists at the same prefix.
 Choosing a base does not check that the base's own chain is complete; keep the backups a chain needs
@@ -108,14 +115,14 @@ The selector is resolved to a full fingerprint, which is stored with the backup.
 
 `s3:PutObject` (objects and, unless locking is disabled, the conditional lock), `s3:GetObject`,
 `s3:ListBucket`, `s3:AbortMultipartUpload`, and `s3:DeleteObject` for lock and probe objects
-(`*/.lock`, `*/.metadata-probe`, `*/.metadata-probe-multipart`).
+(`*/_lock`, `*/_metadata-probe`, `*/_metadata-probe-multipart`).
 Removing partial backups is a manual operator task.
 
 When locking is enabled, the service must support conditional create on PUT and preserve user metadata.
 By default, locks use `If-None-Match: *`; for Tencent COS,
 `--lock-detection-mode x-cos-forbid-overwrite` selects COS's `x-cos-forbid-overwrite: true` header
 (not effective on versioning-enabled buckets). Lock acquisition checks the selected condition.
-Metadata probing happens afterwards, inside the backup prefix next to `.lock`; see
+Metadata probing happens afterwards, inside the backup prefix next to `_lock`; see
 [storage.md](docs/storage.md#lock-and-commit-protocol). A lifecycle rule that aborts incomplete multipart
 uploads is recommended.
 

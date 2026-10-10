@@ -195,7 +195,7 @@ async fn force_overwrite_replaces_existing_backup_but_not_the_lock(fingerprint: 
         .unwrap();
     assert!(has_object(&store, "stream.encrypted"));
     assert!(!has_object(&store, "stream.encrypted.1"));
-    assert!(!has_object(&store, ".lock"));
+    assert!(!has_object(&store, "_lock"));
 
     // The exclusive lock is never bypassed.
     let held = snapshot_to_s3::store::HeldLock::acquire(store.as_ref(), "backups/pool/data/s1/")
@@ -207,7 +207,7 @@ async fn force_overwrite_replaces_existing_backup_but_not_the_lock(fingerprint: 
         .await
         .unwrap_err();
     assert!(format!("{error:#}").contains("lock already exists"));
-    assert!(has_object(&store, ".lock"));
+    assert!(has_object(&store, "_lock"));
     assert!(has_object(&store, "stream.encrypted"));
     held.release(store.as_ref()).await.unwrap();
 }
@@ -221,7 +221,7 @@ async fn dangerously_skipped_lock_still_commits_without_lock_objects(fingerprint
     )
     .await
     .unwrap();
-    assert!(!has_object(&store, ".lock"));
+    assert!(!has_object(&store, "_lock"));
     assert!(!has_event(&store, "LOCK "));
     assert!(has_object(&store, "stream.encrypted"));
 }
@@ -238,7 +238,7 @@ async fn dangerously_skipped_lock_reports_unresolved_commit_without_protection(f
     .err()
     .unwrap();
     assert!(format!("{error:#}").contains("no lock was held"));
-    assert!(!has_object(&store, ".lock"));
+    assert!(!has_object(&store, "_lock"));
     assert!(!has_event(&store, "LOCK "));
 }
 
@@ -259,7 +259,7 @@ async fn failed_small_object_put_leaves_no_stream(fingerprint: &str) {
         .await
         .is_err());
         assert!(!has_object(&store, "stream.encrypted"), "{stage}");
-        assert!(!has_object(&store, ".lock"), "{stage}");
+        assert!(!has_object(&store, "_lock"), "{stage}");
     }
 }
 
@@ -296,7 +296,7 @@ async fn unknown_completion_retains_lock(fingerprint: &str) {
     let message = format!("{error:#}");
     assert!(message.contains("unknown"));
     assert!(message.contains("upload-id=Some(\"upload-backups/pool/data/s1/stream.encrypted\")"));
-    assert!(has_object(&store, ".lock"));
+    assert!(has_object(&store, "_lock"));
     assert!(!has_event(&store, "ABORT "));
 }
 
@@ -312,7 +312,7 @@ async fn upload_shutdown_unresolved_retains_lock(fingerprint: &str) {
     let message = format!("{error:#}");
     assert!(message.contains("upload shutdown unresolved, retaining lock"));
     assert!(message.contains("upload-id=Some(\"upload-backups/pool/data/s1/stream.encrypted\")"));
-    assert!(has_object(&store, ".lock"));
+    assert!(has_object(&store, "_lock"));
     assert!(has_event(&store, "ABORT "));
 }
 
@@ -336,7 +336,7 @@ async fn definite_completion_rejection_aborts_and_releases_lock(fingerprint: &st
         &store,
         "ABORT backups/pool/data/s1/stream.encrypted"
     ));
-    assert!(!has_object(&store, ".lock"));
+    assert!(!has_object(&store, "_lock"));
     assert!(!has_object(&store, "stream.encrypted"));
 }
 
@@ -350,7 +350,7 @@ async fn lost_completion_response_still_commits(fingerprint: &str) {
     )
     .await
     .unwrap();
-    assert!(!has_object(&store, ".lock"));
+    assert!(!has_object(&store, "_lock"));
     let zfs = Arc::new(FakeZfs::new());
     let mut stdout = Vec::new();
     restore(
@@ -369,7 +369,7 @@ async fn metadata_probe_and_committed_damage(fingerprint: &str) {
     let blocked = Arc::new(MemoryStore::default());
     blocked
         .put(
-            &format!("{PREFIX}.lock"),
+            &format!("{PREFIX}_lock"),
             Bytes::from_static(b"other-writer"),
             &Default::default(),
         )
@@ -384,9 +384,9 @@ async fn metadata_probe_and_committed_damage(fingerprint: &str) {
     .is_err());
     assert!(!has_event(
         &blocked,
-        &format!("PUT {PREFIX}.metadata-probe")
+        &format!("PUT {PREFIX}_metadata-probe")
     ));
-    assert!(has_object(&blocked, ".lock"));
+    assert!(has_object(&blocked, "_lock"));
     for multipart in [false, true] {
         let mut memory = MemoryStore::default();
         memory.drop_put_metadata = !multipart;
@@ -398,10 +398,10 @@ async fn metadata_probe_and_committed_damage(fingerprint: &str) {
             .await
             .unwrap_err();
         assert!(format!("{error:#}").contains("did not preserve configured metadata"));
-        assert!(!has_object(&store, ".lock"));
+        assert!(!has_object(&store, "_lock"));
         assert!(!has_object(&store, "key.gpg"));
-        assert!(!has_object(&store, ".metadata-probe"));
-        assert!(!has_object(&store, ".metadata-probe-multipart"));
+        assert!(!has_object(&store, "_metadata-probe"));
+        assert!(!has_object(&store, "_metadata-probe-multipart"));
     }
     for lost_response in [false, true] {
         let mut memory = MemoryStore::default();
@@ -423,7 +423,7 @@ async fn metadata_probe_and_committed_damage(fingerprint: &str) {
             .starts_with("backup committed, stream metadata missing or wrong"));
         assert_eq!(mismatch.mismatch.missing.len(), 4);
         assert!(mismatch.found.is_empty());
-        assert!(!has_object(&store, ".lock"));
+        assert!(!has_object(&store, "_lock"));
         assert!(has_object(&store, "stream.encrypted"));
         assert!(has_object(&store, "backup.log.encrypted"));
         assert!(!has_event(&store, "ABORT "));
@@ -445,15 +445,15 @@ async fn metadata_probe_and_committed_damage(fingerprint: &str) {
         let events = store.events.lock().unwrap();
         let event_index = |event: &str| events.iter().position(|e| e == event).unwrap();
         assert!(
-            event_index(&format!("LOCK {PREFIX}.lock"))
-                < event_index(&format!("PUT {PREFIX}.metadata-probe"))
+            event_index(&format!("LOCK {PREFIX}_lock"))
+                < event_index(&format!("PUT {PREFIX}_metadata-probe"))
         );
         assert!(
             event_index(&format!("LIST {PREFIX}"))
-                < event_index(&format!("PUT {PREFIX}.metadata-probe"))
+                < event_index(&format!("PUT {PREFIX}_metadata-probe"))
         );
         assert!(
-            event_index(&format!("DELETE {PREFIX}.metadata-probe"))
+            event_index(&format!("DELETE {PREFIX}_metadata-probe"))
                 < event_index(&format!("PUT {PREFIX}key.gpg"))
         );
         assert!(
@@ -471,13 +471,13 @@ async fn metadata_probe_and_committed_damage(fingerprint: &str) {
     backup(store.clone(), Arc::new(FakeZfs::new()), args)
         .await
         .unwrap();
-    assert!(!has_object(&store, ".lock"));
+    assert!(!has_object(&store, "_lock"));
     assert!(has_object(&store, "stream.encrypted"));
 }
 
 async fn lock_cleanup_failure_after_commit_is_reported(fingerprint: &str) {
     let store = Arc::new(MemoryStore::default());
-    *store.failure.lock().unwrap() = Some(format!("DELETE {PREFIX}.lock"));
+    *store.failure.lock().unwrap() = Some(format!("DELETE {PREFIX}_lock"));
     let error = backup(
         store.clone(),
         Arc::new(FakeZfs::new()),
@@ -676,5 +676,5 @@ async fn continuation_failure_aborts_without_commit(fingerprint: &str) {
         .unwrap()
         .contains(&format!("ABORT {PREFIX}stream.encrypted")));
     assert!(!has_object(&store, "stream.encrypted"));
-    assert!(!has_object(&store, ".lock"));
+    assert!(!has_object(&store, "_lock"));
 }
