@@ -215,9 +215,6 @@ def publish(root: Path, sha: str, directory: Path) -> None:
             run(command, root)
         else:
             run(["gh", "release", "edit", tag, "--notes-file", notes_file.name], root)
-            legacy_archive = f"{BINARY_NAME}.tar.gz"
-            if any(a["name"] == legacy_archive for a in records[0].get("assets", [])):
-                run(["gh", "release", "delete-asset", tag, legacy_archive, "--yes"], root)
     run(["gh", "release", "upload", tag, str(binary), str(checksums), "--clobber"], root)
     records = [r for r in release_records(repo, root) if r["tag_name"] == tag]
     if len(records) != 1:
