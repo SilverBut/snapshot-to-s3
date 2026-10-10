@@ -4,10 +4,11 @@ Object names, the lock and commit protocol are defined in [storage.md](storage.m
 
 ## Backup
 
-1. **Check.** Validate limits and the source (an existing filesystem snapshot). Probe that the service
-   honors conditional `PUT` and user metadata.
+1. **Check.** Validate limits and the source (an existing filesystem snapshot).
 2. **Lock.** Acquire `.lock` and require an otherwise empty prefix. With `--force-overwrite`, delete every other
-   object under the prefix instead; the lock itself is still acquired exclusively.
+   object under the prefix instead; the lock itself is still acquired exclusively. Acquisition verifies
+   conditional create. Then check user metadata using the sibling probe objects described in
+   [storage.md](storage.md#lock-and-commit-protocol); optionally also probe multipart metadata.
 3. **Select a base** (skipped with `--force-full-snapshot`), as described below.
 4. **Write the key and metadata.** Resolve the GPG selector to one fingerprint. Generate a key, and
    upload `key.gpg`, `key.sha256sum` and `meta.json.encrypted`.
@@ -15,7 +16,9 @@ Object names, the lock and commit protocol are defined in [storage.md](storage.m
    `zfs send -w [-i base]` through encryption and the rate limiter into parts. When an object is full,
    continue in completed continuation objects.
 6. **Commit.** Once the send, encryption and all uploads have succeeded, upload `backup.log.encrypted`.
-   Then complete `stream.encrypted`, confirm it with `HEAD`, and delete the lock.
+   Then complete `stream.encrypted`, confirm it with `HEAD`, and delete the lock. The log always includes
+   expected stream metadata. A published, correctly sized stream with missing or wrong metadata is kept,
+   with a nonzero exit and repair diagnostics, rather than treated as an unknown commit.
 
 Raw send keeps native ZFS encryption when the source has it; it does not add native encryption.
 
@@ -29,7 +32,9 @@ Raw send keeps native ZFS encryption when the source has it; it does not add nat
    This is the best of the shortlist, not necessarily of all snapshots.
 
 Candidates that disappear or are not valid bases are skipped and recorded in the log. If none remains,
-the backup is full. Operational errors (permissions, failed commands, unreadable properties, S3 errors)
+the backup is full. Candidates with missing or invalid stream metadata are also skipped with a warning
+and log diagnostic; repair their metadata before using them as bases. Operational errors (permissions,
+failed commands, unreadable properties, S3 errors)
 abort the backup instead of falling back to a full send.
 
 ## Restore

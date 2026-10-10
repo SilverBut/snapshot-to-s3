@@ -57,7 +57,18 @@ pub async fn select_base(
         let Some(head) = store.head(&location.stream_key(&snapshot.name)).await? else {
             continue;
         };
-        let index = StreamIndex::from_metadata(&head.metadata)?;
+        let index = match StreamIndex::from_metadata(&head.metadata) {
+            Ok(index) => index,
+            Err(error) => {
+                let diagnostic = format!(
+                    "exclude {}: invalid remote metadata: {error:#}",
+                    snapshot.name
+                );
+                tracing::warn!("{diagnostic}");
+                diagnostics.push(diagnostic);
+                continue;
+            }
+        };
         if index.current_snapshot_id != snapshot.guid || index.vol_id != current.volume_guid {
             diagnostics.push(format!("exclude {}: remote GUID mismatch", snapshot.name));
             continue;
@@ -204,6 +215,39 @@ mod filtering_tests {
     use crate::model::SnapshotName;
     use crate::testing::{FakeZfs, MemoryStore};
     use bytes::Bytes;
+
+    #[tokio::test]
+    async fn missing_or_invalid_index_skips_candidate_without_masking_head_errors() {
+        let store = MemoryStore::default();
+        let location = S3Location::parse("s3://bucket/backups").unwrap();
+        let mut zfs = FakeZfs::new();
+        let current = zfs.snapshots.last().unwrap().clone();
+        let mut base = current.clone();
+        base.name = SnapshotName::parse("pool/data@base").unwrap();
+        base.guid = "100".into();
+        base.createtxg = current.createtxg - 1;
+        zfs.snapshots = vec![base.clone(), current.clone()];
+        let key = location.stream_key(&base.name);
+        for metadata in [
+            crate::model::MetadataMap::new(),
+            crate::model::MetadataMap::from([("fs-type".into(), "not-zfs".into())]),
+        ] {
+            store
+                .put(&key, Bytes::from_static(b"stream"), &metadata)
+                .await
+                .unwrap();
+            let selected = select_base(&store, &zfs, &location, &current, false)
+                .await
+                .unwrap();
+            assert!(selected.base.is_none());
+            assert_eq!(selected.diagnostics.len(), 1);
+            assert!(selected.diagnostics[0].contains("invalid remote metadata"));
+        }
+        *store.failure.lock().unwrap() = Some("HEAD ".into());
+        assert!(select_base(&store, &zfs, &location, &current, false)
+            .await
+            .is_err());
+    }
 
     async fn index_for(
         store: &MemoryStore,

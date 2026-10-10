@@ -21,6 +21,7 @@ fn options(fingerprint: &str) -> BackupOptions {
         gpg_key_id: fingerprint.into(),
         force_full: true,
         force_overwrite: false,
+        probe_metadata_multipart: false,
         rate_limit: None,
         limits: UploadLimits::default(),
         cancel: CancellationToken::new(),
@@ -151,6 +152,7 @@ async fn backup_and_restore_workflows() {
     upload_shutdown_unresolved_retains_lock(&fingerprint).await;
     definite_completion_rejection_aborts_and_releases_lock(&fingerprint).await;
     lost_completion_response_still_commits(&fingerprint).await;
+    metadata_probe_and_committed_damage(&fingerprint).await;
     lock_cleanup_failure_after_commit_is_reported(&fingerprint).await;
     incremental_chain_stops_at_receive_failure_and_tampering(&fingerprint).await;
     corrupt_stream_tail_stops_export(&fingerprint).await;
@@ -363,9 +365,119 @@ async fn lost_completion_response_still_commits(fingerprint: &str) {
     assert!(zfs.events.lock().unwrap().is_empty());
 }
 
+async fn metadata_probe_and_committed_damage(fingerprint: &str) {
+    let blocked = Arc::new(MemoryStore::default());
+    blocked
+        .put(
+            &format!("{PREFIX}.lock"),
+            Bytes::from_static(b"other-writer"),
+            &Default::default(),
+        )
+        .await
+        .unwrap();
+    assert!(backup(
+        blocked.clone(),
+        Arc::new(FakeZfs::new()),
+        options(fingerprint)
+    )
+    .await
+    .is_err());
+    assert!(!has_event(
+        &blocked,
+        &format!("PUT {PREFIX}.metadata-probe")
+    ));
+    assert!(has_object(&blocked, ".lock"));
+    for multipart in [false, true] {
+        let mut memory = MemoryStore::default();
+        memory.drop_put_metadata = !multipart;
+        memory.drop_multipart_metadata = multipart;
+        let store = Arc::new(memory);
+        let mut args = options(fingerprint);
+        args.probe_metadata_multipart = multipart;
+        let error = backup(store.clone(), Arc::new(FakeZfs::new()), args)
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("did not preserve configured metadata"));
+        assert!(!has_object(&store, ".lock"));
+        assert!(!has_object(&store, "key.gpg"));
+        assert!(!has_object(&store, ".metadata-probe"));
+        assert!(!has_object(&store, ".metadata-probe-multipart"));
+    }
+    for lost_response in [false, true] {
+        let mut memory = MemoryStore::default();
+        memory.drop_multipart_metadata = true;
+        let store = Arc::new(memory);
+        *store.completion_lost.lock().unwrap() = lost_response;
+        let error = backup(
+            store.clone(),
+            Arc::new(FakeZfs::new()),
+            options(fingerprint),
+        )
+        .await
+        .unwrap_err();
+        let mismatch = error
+            .downcast_ref::<snapshot_to_s3::backup::StreamMetadataMismatch>()
+            .unwrap();
+        assert!(error
+            .to_string()
+            .starts_with("backup committed, stream metadata missing or wrong"));
+        assert_eq!(mismatch.mismatch.missing.len(), 4);
+        assert!(mismatch.found.is_empty());
+        assert!(!has_object(&store, ".lock"));
+        assert!(has_object(&store, "stream.encrypted"));
+        assert!(has_object(&store, "backup.log.encrypted"));
+        assert!(!has_event(&store, "ABORT "));
+        let objects = store.objects.lock().unwrap().clone();
+        let key = crypto::decrypt_key(&objects[&format!("{PREFIX}key.gpg")].0)
+            .await
+            .unwrap();
+        let log = crypto::decrypt_small(
+            &key,
+            &objects[&format!("{PREFIX}backup.log.encrypted")].0,
+            snapshot_to_s3::model::LOG_LIMIT,
+        )
+        .await
+        .unwrap();
+        let log = String::from_utf8(log).unwrap();
+        for (name, value) in &mismatch.expected {
+            assert!(log.contains(&format!("stream-metadata.{name}={value}\n")));
+        }
+        let events = store.events.lock().unwrap();
+        let event_index = |event: &str| events.iter().position(|e| e == event).unwrap();
+        assert!(
+            event_index(&format!("LOCK {PREFIX}.lock"))
+                < event_index(&format!("PUT {PREFIX}.metadata-probe"))
+        );
+        assert!(
+            event_index(&format!("LIST {PREFIX}"))
+                < event_index(&format!("PUT {PREFIX}.metadata-probe"))
+        );
+        assert!(
+            event_index(&format!("DELETE {PREFIX}.metadata-probe"))
+                < event_index(&format!("PUT {PREFIX}key.gpg"))
+        );
+        assert!(
+            event_index(&format!("PUT {PREFIX}backup.log.encrypted"))
+                < event_index(&format!("COMPLETE {PREFIX}stream.encrypted"))
+        );
+    }
+    let mut memory = MemoryStore::default();
+    memory
+        .extra_metadata
+        .insert("provider-extra".into(), "accepted".into());
+    let store = Arc::new(memory);
+    let mut args = options(fingerprint);
+    args.probe_metadata_multipart = true;
+    backup(store.clone(), Arc::new(FakeZfs::new()), args)
+        .await
+        .unwrap();
+    assert!(!has_object(&store, ".lock"));
+    assert!(has_object(&store, "stream.encrypted"));
+}
+
 async fn lock_cleanup_failure_after_commit_is_reported(fingerprint: &str) {
     let store = Arc::new(MemoryStore::default());
-    *store.failure.lock().unwrap() = Some("DELETE ".into());
+    *store.failure.lock().unwrap() = Some(format!("DELETE {PREFIX}.lock"));
     let error = backup(
         store.clone(),
         Arc::new(FakeZfs::new()),

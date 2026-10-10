@@ -7,7 +7,7 @@ use bytes::Bytes;
 use snapshot_to_s3::{
     model::MetadataMap,
     s3::{is_retryable, HttpStore, LockDetectionMode},
-    store::ObjectStore,
+    store::{probe_metadata, HeldLock, ObjectStore},
 };
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
@@ -93,12 +93,9 @@ async fn head_returns_none_only_for_not_found_and_preserves_service_errors() -> 
 }
 
 #[tokio::test]
-async fn conditional_capability_probe_rejects_ignored_metadata_and_cleans_lock_key() -> Result<()> {
+async fn metadata_probe_rejects_wrong_size_and_cleans_fixed_sibling_key() -> Result<()> {
     let _env = EnvGuard::new();
     let responses = [
-        "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-        "HTTP/1.1 412 Precondition Failed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-        "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
         "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
         "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nETag: \"probe-etag\"\r\nConnection: close\r\n\r\n",
         "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
@@ -108,26 +105,32 @@ async fn conditional_capability_probe_rejects_ignored_metadata_and_cleans_lock_k
     .collect();
     let (endpoint, server) = fixture_sequence(responses).await?;
     let store = HttpStore::new(config(endpoint)).await?;
-    let error = store
-        .probe_capabilities("backups/snapshot")
-        .await
-        .expect_err("a provider ignoring metadata must fail its capability probe");
-    assert!(format!("{error:#}").contains("metadata prefix"));
+    let error = probe_metadata(
+        &store,
+        "backups/snapshot/",
+        "backups/snapshot/stream.encrypted",
+        false,
+    )
+    .await
+    .expect_err("a provider ignoring metadata must fail its capability probe");
+    assert!(format!("{error:#}").contains("unexpected length"));
     let requests = String::from_utf8(server.await?).expect("fixture requests are UTF-8");
-    assert!(requests.contains("/fixture-bucket/backups/snapshot/.snapshot-to-s3-probes/"));
-    assert!(requests.contains("/.lock HTTP/1.1"));
-    assert!(requests.contains("x-fixture-meta-http-store-capability:"));
-    assert!(requests.contains("DELETE /fixture-bucket/backups/snapshot/.snapshot-to-s3-probes/"));
+    assert!(requests.contains("/fixture-bucket/backups/snapshot/.metadata-probe HTTP/1.1"));
+    assert!(requests.contains("x-fixture-meta-current-snapshot-id:"));
+    assert!(requests.contains("DELETE /fixture-bucket/backups/snapshot/.metadata-probe"));
     for (head, body) in split_captured_requests(requests.as_bytes())
         .into_iter()
-        .take(2)
+        .take(1)
     {
         assert!(head.starts_with("PUT "));
-        assert!(head.lines().any(|line| line == "content-length: 0"));
+        assert!(head.lines().any(|line| line == "content-length: 31"));
         assert!(!head.to_ascii_lowercase().contains("transfer-encoding:"));
-        assert!(body.is_empty());
-        assert!(head.contains("if-none-match: *"));
-        verify_wire_signature(&format!("{head}\r\n\r\n"), "fixture-secret");
+        assert_eq!(body, b"snapshot-to-s3 capability probe");
+        assert!(!head.contains("if-none-match:"));
+        verify_wire_signature(
+            &format!("{head}\r\n\r\n{}", String::from_utf8_lossy(&body)),
+            "fixture-secret",
+        );
     }
     Ok(())
 }
@@ -315,8 +318,7 @@ async fn head_and_delete_keep_the_whole_request_control_timeout() -> Result<()> 
 }
 
 #[tokio::test]
-async fn capability_probe_accepts_successful_duplicate_rejection_and_preserved_metadata(
-) -> Result<()> {
+async fn metadata_probe_accepts_all_preserved_fields_and_provider_extras() -> Result<()> {
     use tokio::{
         io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
         net::TcpListener,
@@ -327,8 +329,8 @@ async fn capability_probe_accepts_successful_duplicate_rejection_and_preserved_m
     let address = listener.local_addr()?;
     let server = tokio::spawn(async move {
         let mut captured = Vec::new();
-        let mut marker = String::new();
-        for index in 0..6 {
+        let mut metadata_headers = String::new();
+        for index in 0..3 {
             let (stream, _) = listener.accept().await.unwrap();
             let mut reader = BufReader::new(stream);
             let mut lines = Vec::new();
@@ -340,8 +342,8 @@ async fn capability_probe_accepts_successful_duplicate_rejection_and_preserved_m
                     if name.eq_ignore_ascii_case("content-length") {
                         content_length = value.trim().parse().unwrap();
                     }
-                    if name.eq_ignore_ascii_case("x-fixture-meta-http-store-capability") {
-                        marker = value.trim().to_owned();
+                    if name.starts_with("x-fixture-meta-") {
+                        metadata_headers.push_str(&line);
                     }
                 }
                 lines.push(line);
@@ -355,11 +357,9 @@ async fn capability_probe_accepts_successful_duplicate_rejection_and_preserved_m
             captured.extend_from_slice(&body);
             let response = match index {
                 0 => "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_owned(),
-                1 => "HTTP/1.1 412 Precondition Failed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_owned(),
-                2 | 5 => "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_owned(),
-                3 => "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_owned(),
-                4 => format!(
-                    "HTTP/1.1 200 OK\r\nContent-Length: 31\r\nETag: \"probe\"\r\nx-fixture-meta-http-store-capability: {marker}\r\nConnection: close\r\n\r\n"
+                2 => "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_owned(),
+                1 => format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: 31\r\nETag: \"probe\"\r\n{metadata_headers}x-fixture-meta-provider-extra: accepted\r\nConnection: close\r\n\r\n"
                 ),
                 _ => unreachable!(),
             };
@@ -372,26 +372,41 @@ async fn capability_probe_accepts_successful_duplicate_rejection_and_preserved_m
         captured
     });
     let store = HttpStore::new(config(format!("http://{address}"))).await?;
-    store.probe_capabilities("backups/snapshot").await?;
+    probe_metadata(
+        &store,
+        "backups/snapshot/",
+        "backups/snapshot/stream.encrypted",
+        false,
+    )
+    .await?;
     let requests = String::from_utf8(server.await?)?;
-    assert_eq!(requests.matches("HTTP/1.1\r\n").count(), 6);
-    assert!(requests.contains("x-fixture-meta-http-store-capability:"));
-    assert!(requests.contains("DELETE /fixture-bucket/backups/snapshot/.snapshot-to-s3-probes/"));
+    assert_eq!(requests.matches("HTTP/1.1\r\n").count(), 3);
+    for field in [
+        "gpg-key-id",
+        "fs-type",
+        "vol-id",
+        "current-snapshot-id",
+        "base-snapshot-id",
+        "base-object-key",
+    ] {
+        assert!(requests.contains(&format!("x-fixture-meta-{field}:")));
+    }
+    assert!(requests.contains("DELETE /fixture-bucket/backups/snapshot/.metadata-probe"));
     Ok(())
 }
 
 #[tokio::test]
-async fn capability_probe_names_an_ignored_successful_conditional_put() -> Result<()> {
+async fn lock_acquisition_rejects_an_ignored_successful_conditional_put() -> Result<()> {
     let _env = EnvGuard::new();
     let (endpoint, server) = fixture_sequence(vec![
         "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into(),
         "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into(),
-        "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into(),
+        "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into(),
     ])
     .await?;
     let store = HttpStore::new(config(endpoint)).await?;
-    let error = store.probe_capabilities("backup").await.unwrap_err();
-    assert!(format!("{error:#}").contains("ignored If-None-Match: *"));
+    let error = HeldLock::acquire(&store, "backup/").await.err().unwrap();
+    assert!(format!("{error:#}").contains("storage does not confirm create-if-absent semantics"));
     assert_eq!(split_captured_requests(&server.await?).len(), 3);
     Ok(())
 }
@@ -419,26 +434,29 @@ async fn cos_forbid_overwrite_is_create_if_absent_and_signed() -> Result<()> {
         assert!(head.starts_with("PUT "));
         assert!(head.contains("x-cos-forbid-overwrite: true"));
         assert!(!head.contains("if-none-match:"));
-        verify_wire_signature(&format!("{head}\r\n\r\n"), "fixture-secret");
+        verify_wire_signature(
+            &format!("{head}\r\n\r\n{}", String::from_utf8_lossy(&body)),
+            "fixture-secret",
+        );
         assert!(body.is_empty());
     }
     Ok(())
 }
 
 #[tokio::test]
-async fn cos_capability_probe_rejects_ignored_forbid_overwrite_header() -> Result<()> {
+async fn cos_lock_acquisition_rejects_ignored_forbid_overwrite_header() -> Result<()> {
     let _env = EnvGuard::new();
     let (endpoint, server) = fixture_sequence(vec![
         "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into(),
         "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into(),
-        "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into(),
+        "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into(),
     ])
     .await?;
     let store = HttpStore::new(config(endpoint))
         .await?
         .with_lock_detection_mode(LockDetectionMode::XCosForbidOverwrite);
-    let error = store.probe_capabilities("backup").await.unwrap_err();
-    assert!(format!("{error:#}").contains("ignored x-cos-forbid-overwrite: true"));
+    let error = HeldLock::acquire(&store, "backup/").await.err().unwrap();
+    assert!(format!("{error:#}").contains("storage does not confirm create-if-absent semantics"));
 
     let requests = split_captured_requests(&server.await?);
     assert_eq!(requests.len(), 3);
@@ -446,8 +464,11 @@ async fn cos_capability_probe_rejects_ignored_forbid_overwrite_header() -> Resul
         assert!(head.starts_with("PUT "));
         assert!(head.contains("x-cos-forbid-overwrite: true"));
         assert!(!head.contains("if-none-match:"));
-        verify_wire_signature(&format!("{head}\r\n\r\n"), "fixture-secret");
-        assert!(body.is_empty());
+        verify_wire_signature(
+            &format!("{head}\r\n\r\n{}", String::from_utf8_lossy(body)),
+            "fixture-secret",
+        );
+        assert_eq!(body.len(), 64);
     }
     Ok(())
 }
@@ -457,7 +478,7 @@ async fn dangerously_skip_probe_checks_metadata_without_conditional_puts() -> Re
     let _env = EnvGuard::new();
     let (endpoint, server) = fixture_sequence(vec![
         "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into(),
-        "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nETag: \"probe\"\r\nConnection: close\r\n\r\n"
+        "HTTP/1.1 200 OK\r\nContent-Length: 31\r\nETag: \"probe\"\r\nConnection: close\r\n\r\n"
             .into(),
         "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into(),
     ])
@@ -465,8 +486,7 @@ async fn dangerously_skip_probe_checks_metadata_without_conditional_puts() -> Re
     let store = HttpStore::new(config(endpoint))
         .await?
         .with_lock_detection_mode(LockDetectionMode::DangerouslySkip);
-    let error = store
-        .probe_metadata_capability("backup")
+    let error = probe_metadata(&store, "backup/", "backup/stream.encrypted", false)
         .await
         .expect_err("the fixture omits the probed user metadata");
     assert!(format!("{error:#}").contains("did not preserve configured metadata"));
@@ -480,12 +500,9 @@ async fn dangerously_skip_probe_checks_metadata_without_conditional_puts() -> Re
 }
 
 #[tokio::test]
-async fn capability_probe_rejects_matching_size_without_metadata() -> Result<()> {
+async fn metadata_probe_rejects_matching_size_without_metadata() -> Result<()> {
     let _env = EnvGuard::new();
     let responses = [
-        "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-        "HTTP/1.1 412 Precondition Failed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-        "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
         "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
         "HTTP/1.1 200 OK\r\nContent-Length: 31\r\nETag: \"probe\"\r\nConnection: close\r\n\r\n",
         "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
@@ -495,23 +512,25 @@ async fn capability_probe_rejects_matching_size_without_metadata() -> Result<()>
     .collect();
     let (endpoint, server) = fixture_sequence(responses).await?;
     let store = HttpStore::new(config(endpoint)).await?;
-    let error = store.probe_capabilities("backup").await.unwrap_err();
-    assert!(format!("{error:#}").contains("metadata prefix"));
-    assert_eq!(split_captured_requests(&server.await?).len(), 6);
+    let error = probe_metadata(&store, "backup/", "backup/stream.encrypted", false)
+        .await
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("missing="));
+    assert_eq!(split_captured_requests(&server.await?).len(), 3);
     Ok(())
 }
 
 #[tokio::test]
-async fn capability_probe_surfaces_unexpected_server_errors_on_duplicate_put() -> Result<()> {
+async fn lock_acquisition_surfaces_unexpected_server_errors_on_duplicate_put() -> Result<()> {
     let _env = EnvGuard::new();
     let (endpoint, server) = fixture_sequence(vec![
         "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into(),
         "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into(),
-        "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into(),
+        "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into(),
     ])
     .await?;
     let store = HttpStore::new(config(endpoint)).await?;
-    let error = store.probe_capabilities("backup").await.unwrap_err();
+    let error = HeldLock::acquire(&store, "backup/").await.err().unwrap();
     assert!(format!("{error:#}").contains("HTTP 503"));
     assert_eq!(split_captured_requests(&server.await?).len(), 3);
     Ok(())

@@ -9,13 +9,11 @@ mod error;
 mod get;
 mod object_store;
 mod policy;
-mod probe;
 mod sigv4;
 mod throughput;
 
 pub use error::{is_definite_rejection, is_retryable};
 pub use policy::HttpPolicy;
-pub use probe::PROBE_NAMESPACE;
 
 use crate::model::MetadataMap;
 use crate::store::FilePart;
@@ -121,14 +119,6 @@ impl HttpStore {
         };
         put_header(&mut headers, name, value)?;
         Ok(headers)
-    }
-
-    fn lock_condition_description(&self) -> &'static str {
-        match self.lock_detection_mode {
-            LockDetectionMode::IfNoneMatch => "If-None-Match: *",
-            LockDetectionMode::XCosForbidOverwrite => "x-cos-forbid-overwrite: true",
-            LockDetectionMode::DangerouslySkip => "dangerously-skip",
-        }
     }
 
     fn object_url(&self, key: &str, query: &[(String, String)]) -> Result<Url> {

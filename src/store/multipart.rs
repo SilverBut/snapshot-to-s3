@@ -191,7 +191,10 @@ pub async fn upload_object<R: AsyncBufRead + Unpin + ?Sized>(
     let result = async {
         let uploaded = upload_parts(store, key, &upload, reader, estimate, limits, cancel).await?;
         let completed = store.complete_upload(key, &upload, &uploaded.parts).await;
-        if confirm_commit(store, key, &metadata, uploaded.bytes).await? {
+        if matches!(
+            confirm_commit(store, key, &metadata, uploaded.bytes).await?,
+            CommitConfirmation::Committed
+        ) {
             if let Err(error) = completed {
                 tracing::warn!("completion response failed, but {key} matches: {error:#}");
             }
@@ -263,18 +266,38 @@ async fn upload_part(
     Ok(etag)
 }
 
-/// Whether the published object matches the upload: `Ok(false)` if absent,
-/// an error if present with different metadata or length.
+/// Publication status, with repairable metadata damage reported separately.
+#[derive(Debug, PartialEq, Eq)]
+pub enum CommitConfirmation {
+    Committed,
+    Absent,
+    CommittedMetadataMismatch {
+        found: MetadataMap,
+        mismatch: crate::model::MetadataMismatch,
+    },
+}
+
+/// Checks publication by HEAD; size mismatches and operational failures remain errors.
 pub async fn confirm_commit(
     store: &dyn ObjectStore,
     key: &str,
     metadata: &MetadataMap,
     expected_bytes: u64,
-) -> Result<bool> {
+) -> Result<CommitConfirmation> {
     match store.head(key).await? {
-        Some(head) if head.size == expected_bytes && &head.metadata == metadata => Ok(true),
-        Some(_) => bail!("published stream has unexpected metadata or length: {key}"),
-        None => Ok(false),
+        Some(head) if head.size == expected_bytes => {
+            let mismatch = crate::model::MetadataMismatch::between(metadata, &head.metadata);
+            if mismatch.is_empty() {
+                Ok(CommitConfirmation::Committed)
+            } else {
+                Ok(CommitConfirmation::CommittedMetadataMismatch {
+                    found: head.metadata,
+                    mismatch,
+                })
+            }
+        }
+        Some(_) => bail!("published stream has unexpected length: {key}"),
+        None => Ok(CommitConfirmation::Absent),
     }
 }
 
@@ -426,9 +449,27 @@ mod tests {
             .complete_upload("stream", &id, &[Part { number: 1, etag }])
             .await
             .is_err());
-        assert!(confirm_commit(&store, "stream", &meta, 10).await.unwrap());
-        assert!(!confirm_commit(&store, "absent", &meta, 10).await.unwrap());
+        assert_eq!(
+            confirm_commit(&store, "stream", &meta, 10).await.unwrap(),
+            CommitConfirmation::Committed
+        );
+        assert_eq!(
+            confirm_commit(&store, "absent", &meta, 10).await.unwrap(),
+            CommitConfirmation::Absent
+        );
         assert!(confirm_commit(&store, "stream", &meta, 9).await.is_err());
+        store.objects.lock().unwrap().get_mut("stream").unwrap().1 =
+            MetadataMap::from([("identity".into(), "wrong".into())]);
+        assert_eq!(
+            confirm_commit(&store, "stream", &meta, 10).await.unwrap(),
+            CommitConfirmation::CommittedMetadataMismatch {
+                found: MetadataMap::from([("identity".into(), "wrong".into())]),
+                mismatch: crate::model::MetadataMismatch {
+                    missing: vec![],
+                    wrong: vec!["identity".into()],
+                },
+            }
+        );
     }
 
     #[tokio::test]

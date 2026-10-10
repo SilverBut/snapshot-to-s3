@@ -1,6 +1,6 @@
 //! Command-line interface.
 
-use crate::backup::{backup, backup_without_lock, BackupOptions};
+use crate::backup::{backup, backup_without_lock, BackupOptions, StreamMetadataMismatch};
 use crate::model::{validate_dataset, S3Location, SnapshotName};
 use crate::progress::{Mode, Reporter};
 use crate::restore::{restore, RestoreOptions};
@@ -54,6 +54,9 @@ struct BackupArgs {
     /// refusing; the writer lock is still required
     #[arg(long)]
     force_overwrite: bool,
+    /// Also probe user metadata through a small multipart upload (extra S3 requests)
+    #[arg(long)]
+    probe_metadata_multipart: bool,
     #[command(flatten)]
     progress: ProgressArgs,
     #[command(flatten)]
@@ -219,22 +222,23 @@ async fn run_backup(
     let limits = args.parts.limits();
     limits.validate()?;
     let location = args.destination;
+    let metadata_prefix = args
+        .storage
+        .metadata_prefix
+        .trim_end_matches('-')
+        .to_ascii_lowercase();
     let store = Arc::new(
         args.storage
             .store(location.bucket.clone(), args.lock_detection_mode)
             .await?,
     );
-    if args.lock_detection_mode == LockDetectionMode::DangerouslySkip {
-        store.probe_metadata_capability(&location.prefix).await?;
-    } else {
-        store.probe_capabilities(&location.prefix).await?;
-    }
     let options = BackupOptions {
         source: args.source,
         location,
         gpg_key_id: args.gpg_key_id,
         force_full: args.force_full_snapshot,
         force_overwrite: args.force_overwrite,
+        probe_metadata_multipart: args.probe_metadata_multipart,
         rate_limit: args.rate_limit,
         limits,
         cancel,
@@ -246,6 +250,15 @@ async fn run_backup(
         backup(store, zfs, options).await
     };
     reporter.finish().await;
+    if let Err(error) = &result {
+        if let Some(mismatch) = error.downcast_ref::<StreamMetadataMismatch>() {
+            eprintln!("ERROR: {error:#}");
+            for (name, value) in &mismatch.expected {
+                eprintln!("ERROR: expected {metadata_prefix}-{name}: {value}");
+            }
+            eprintln!("ERROR: observed stream metadata: {:?}", mismatch.found);
+        }
+    }
     let result = result?;
     eprintln!(
         "backup committed: {} (snapshot GUID {}, {} ciphertext bytes in {} object{})",
@@ -431,6 +444,19 @@ mod tests {
             args.lock_detection_mode,
             LockDetectionMode::IfNoneMatch
         ));
+        assert!(!args.probe_metadata_multipart);
+        let with_probe =
+            Cli::try_parse_from([&backup[..], &["--probe-metadata-multipart"]].concat()).unwrap();
+        let Command::Backup(args) = with_probe.command else {
+            panic!("expected backup command");
+        };
+        assert!(args.probe_metadata_multipart);
+        assert!(!parses(&[
+            "restore",
+            "s3://bucket/backups",
+            "stdout:pool/data@s1",
+            "--probe-metadata-multipart",
+        ]));
 
         let cos_mode = Cli::try_parse_from(
             [
