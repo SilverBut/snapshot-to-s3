@@ -5,7 +5,7 @@ Object names, the lock and commit protocol are defined in [storage.md](storage.m
 ## Backup
 
 1. **Check.** Validate limits and the source (an existing filesystem snapshot).
-2. **Lock.** Acquire `.lock` and require an otherwise empty prefix. With `--force-overwrite`, delete every other
+2. **Lock.** Acquire `_lock` and require an otherwise empty prefix. With `--force-overwrite`, delete every other
    object under the prefix instead; the lock itself is still acquired exclusively. Acquisition verifies
    conditional create. Then check user metadata using the sibling probe objects described in
    [storage.md](storage.md#lock-and-commit-protocol); optionally also probe multipart metadata.

@@ -13,9 +13,9 @@ A backup of `dataset@snapshot` to `s3://bucket/prefix` is a group of objects und
 | `backup.log.encrypted` | Encrypted diagnostics (at most 256 KiB): sizes, object count, base candidates |
 | `stream.encrypted` | The encrypted `zfs send -w` stream, or its first part; carries the index metadata |
 | `stream.encrypted.000001`, … | Continuations of a stream larger than one object |
-| `.lock` | Writer lock; exists only while a backup runs or after an unresolved failure |
-| `.metadata-probe` | Temporary PUT metadata check, next to `.lock`; deleted before backup objects are written |
-| `.metadata-probe-multipart` | Optional temporary multipart metadata check; same lifecycle as `.metadata-probe` |
+| `_lock` | Writer lock; exists only while a backup runs or after an unresolved failure |
+| `_metadata-probe` | Temporary PUT metadata check, next to `_lock`; deleted before backup objects are written |
+| `_metadata-probe-multipart` | Optional temporary multipart metadata check; same lifecycle as `_metadata-probe` |
 
 Objects are never tar archives and are never overwritten.
 
@@ -76,17 +76,17 @@ in `backup.log.encrypted`, before any truncatable base-selection diagnostics, fo
 
 ## Lock and commit protocol
 
-1. Normally create `.lock` with a conditional `PUT`, containing a random token. By default this uses
+1. Normally create `_lock` with a conditional `PUT`, containing a random token. By default this uses
    `If-None-Match: *`; `--lock-detection-mode x-cos-forbid-overwrite` uses COS's
    `x-cos-forbid-overwrite: true` instead. If the lock exists, stop. A `HEAD` followed by a `PUT` is
    not a lock, so services without conditional create are rejected.
    Acquisition verifies the condition by attempting another create of the same lock and requiring refusal.
 2. Holding the lock, require that the prefix contains nothing else.
    With `--force-overwrite`, delete all other objects first.
-   Before writing backup objects, PUT `.metadata-probe` in this same prefix with all six index fields
+   Before writing backup objects, PUT `_metadata-probe` in this same prefix with all six index fields
    (including incremental fields) and realistic values, then HEAD it and check metadata and size.
    Delete the probe. With `--probe-metadata-multipart` (off by default), also initiate, upload one small
-   part, complete, HEAD and delete `.metadata-probe-multipart` with the same metadata.
+   part, complete, HEAD and delete `_metadata-probe-multipart` with the same metadata.
 3. Upload `key.gpg`, `key.sha256sum` and `meta.json.encrypted`.
 4. Start the multipart upload of `stream.encrypted` and upload its parts. Upload, complete and confirm
    (by `HEAD` size) each continuation object. Do not complete `stream.encrypted` yet.
@@ -103,7 +103,7 @@ The lock never expires and is never taken over. An operator may delete a stale l
 after making sure that its writer and uploads have stopped.
 
 `--lock-detection-mode dangerously-skip` is an unsafe alternative: it does not create, acquire, or
-release `.lock` and permits concurrent writers to race. The prefix is still listed and must be empty
+release `_lock` and permits concurrent writers to race. The prefix is still listed and must be empty
 before upload, but that check is not atomic.
 
 The selected lock mode is verified during acquisition itself; there is no additional lock probe.

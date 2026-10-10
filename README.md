@@ -108,14 +108,14 @@ The selector is resolved to a full fingerprint, which is stored with the backup.
 
 `s3:PutObject` (objects and, unless locking is disabled, the conditional lock), `s3:GetObject`,
 `s3:ListBucket`, `s3:AbortMultipartUpload`, and `s3:DeleteObject` for lock and probe objects
-(`*/.lock`, `*/.metadata-probe`, `*/.metadata-probe-multipart`).
+(`*/_lock`, `*/_metadata-probe`, `*/_metadata-probe-multipart`).
 Removing partial backups is a manual operator task.
 
 When locking is enabled, the service must support conditional create on PUT and preserve user metadata.
 By default, locks use `If-None-Match: *`; for Tencent COS,
 `--lock-detection-mode x-cos-forbid-overwrite` selects COS's `x-cos-forbid-overwrite: true` header
 (not effective on versioning-enabled buckets). Lock acquisition checks the selected condition.
-Metadata probing happens afterwards, inside the backup prefix next to `.lock`; see
+Metadata probing happens afterwards, inside the backup prefix next to `_lock`; see
 [storage.md](docs/storage.md#lock-and-commit-protocol). A lifecycle rule that aborts incomplete multipart
 uploads is recommended.
 
