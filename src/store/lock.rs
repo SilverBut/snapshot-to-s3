@@ -6,7 +6,7 @@ use anyhow::{bail, Context, Result};
 use bytes::Bytes;
 use rand::RngCore;
 
-/// A `.lock` object holding a random ownership token. Locks are never
+/// A `_lock` object holding a random ownership token. Locks are never
 /// stolen; only the holder of the token deletes it.
 pub struct HeldLock {
     pub key: String,
@@ -148,7 +148,7 @@ mod tests {
         let lock = HeldLock::acquire(&store, "backup/")
             .await
             .expect("the stored token proves that the first put committed");
-        assert_eq!(lock.key, "backup/.lock");
+        assert_eq!(lock.key, "backup/_lock");
         assert_eq!(store.head(&lock.key).await.unwrap().unwrap().size, 64);
         lock.release(&store).await.unwrap();
         assert!(store.head(&lock.key).await.unwrap().is_none());
@@ -159,7 +159,7 @@ mod tests {
         let store = MemoryStore::default();
         store
             .put(
-                "backup/.lock",
+                "backup/_lock",
                 Bytes::from_static(b"owned-by-someone-else"),
                 &MetadataMap::new(),
             )
@@ -174,7 +174,7 @@ mod tests {
             error.contains("lock acquisition outcome is unresolved"),
             "{error}"
         );
-        let reader = store.get("backup/.lock", None, None).await.unwrap();
+        let reader = store.get("backup/_lock", None, None).await.unwrap();
         assert_eq!(
             crate::store::read_small(reader, 128).await.unwrap(),
             b"owned-by-someone-else"

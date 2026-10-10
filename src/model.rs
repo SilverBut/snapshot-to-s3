@@ -59,9 +59,9 @@ impl MetadataMismatch {
 /// Object names inside one backup prefix, `<prefix>/<dataset>/<snapshot>/`.
 pub mod object {
     /// Writer lock; present only while a backup is running or unresolved.
-    pub const LOCK: &str = ".lock";
-    pub const METADATA_PROBE: &str = ".metadata-probe";
-    pub const METADATA_PROBE_MULTIPART: &str = ".metadata-probe-multipart";
+    pub const LOCK: &str = "_lock";
+    pub const METADATA_PROBE: &str = "_metadata-probe";
+    pub const METADATA_PROBE_MULTIPART: &str = "_metadata-probe-multipart";
     /// Per-backup data key, encrypted to the GPG recipient.
     pub const WRAPPED_KEY: &str = "key.gpg";
     /// Hex SHA-256 of the data key.

@@ -142,14 +142,14 @@ mod tests {
         assert_eq!(
             *store.events.lock().unwrap(),
             [
-                "PUT backup/.metadata-probe",
-                "HEAD backup/.metadata-probe",
-                "DELETE backup/.metadata-probe",
-                "CREATE backup/.metadata-probe-multipart",
-                "PART backup/.metadata-probe-multipart 1",
-                "COMPLETE backup/.metadata-probe-multipart",
-                "HEAD backup/.metadata-probe-multipart",
-                "DELETE backup/.metadata-probe-multipart",
+                "PUT backup/_metadata-probe",
+                "HEAD backup/_metadata-probe",
+                "DELETE backup/_metadata-probe",
+                "CREATE backup/_metadata-probe-multipart",
+                "PART backup/_metadata-probe-multipart 1",
+                "COMPLETE backup/_metadata-probe-multipart",
+                "HEAD backup/_metadata-probe-multipart",
+                "DELETE backup/_metadata-probe-multipart",
             ]
         );
     }
@@ -188,9 +188,9 @@ mod tests {
         assert_eq!(
             &store.events.lock().unwrap()[4..],
             [
-                "PART backup/.metadata-probe-multipart 1",
-                "ABORT backup/.metadata-probe-multipart",
-                "DELETE backup/.metadata-probe-multipart",
+                "PART backup/_metadata-probe-multipart 1",
+                "ABORT backup/_metadata-probe-multipart",
+                "DELETE backup/_metadata-probe-multipart",
             ]
         );
         assert!(store.objects.lock().unwrap().is_empty());
@@ -204,6 +204,6 @@ mod tests {
             .objects
             .lock()
             .unwrap()
-            .contains_key("backup/.metadata-probe"));
+            .contains_key("backup/_metadata-probe"));
     }
 }
