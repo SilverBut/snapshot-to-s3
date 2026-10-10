@@ -210,16 +210,52 @@ class ReleaseTests(unittest.TestCase):
     def test_asset_digest_and_exact_file_set(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            archive = root / "snapshot-to-s3-linux-x86_64.tar.gz"
-            archive.write_bytes(b"fixture archive")
+            binary = root / "snapshot-to-s3-linux-x86_64"
+            binary.write_bytes(b"fixture binary")
             checksum = root / "SHA256SUMS"
             checksum.write_text(
-                f"{hashlib.sha256(archive.read_bytes()).hexdigest()}  {archive.name}\n"
+                f"{hashlib.sha256(binary.read_bytes()).hexdigest()}  {binary.name}\n"
             )
-            publish_release.verify_assets(root)
-            archive.write_bytes(b"damaged")
+            self.assertEqual(publish_release.verify_assets(root), (binary, checksum))
+            binary.write_bytes(b"damaged")
             with self.assertRaises(ValueError):
                 publish_release.verify_assets(root)
+
+    def test_binary_assets_reject_missing_extra_and_archive_files(self):
+        for damage in ("missing binary", "missing checksums", "extra", "archive", "wrong name"):
+            with self.subTest(damage=damage), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                binary = root / "snapshot-to-s3-linux-x86_64"
+                binary.write_bytes(b"fixture binary")
+                checksums = root / "SHA256SUMS"
+                digest = hashlib.sha256(binary.read_bytes()).hexdigest()
+                checksums.write_text(f"{digest}  {binary.name}\n")
+                if damage == "missing binary":
+                    binary.unlink()
+                elif damage == "missing checksums":
+                    checksums.unlink()
+                elif damage == "extra":
+                    (root / "unexpected").write_bytes(b"extra")
+                elif damage == "archive":
+                    binary.rename(root / "snapshot-to-s3-linux-x86_64.tar.gz")
+                    checksums.write_text(f"{digest}  snapshot-to-s3-linux-x86_64.tar.gz\n")
+                else:
+                    checksums.write_text(f"{digest}  snapshot-to-s3\n")
+                with self.assertRaises(ValueError):
+                    publish_release.verify_assets(root)
+
+    def test_release_workflow_stages_binary_without_tar(self):
+        workflow = (
+            Path(__file__).resolve().parents[2] / ".github/workflows/release.yml"
+        ).read_text()
+        self.assertIn('install -m 0755 "$binary" dist/snapshot-to-s3-linux-x86_64', workflow)
+        self.assertIn("(cd dist && sha256sum snapshot-to-s3-linux-x86_64 > SHA256SUMS)", workflow)
+        self.assertNotIn("tar -", workflow)
+        self.assertNotIn(".tar.gz", workflow)
+        self.assertIn(
+            '[[ "$("$binary" --version)" == "snapshot-to-s3 $EXPECTED_VERSION" ]]', workflow
+        )
+        self.assertIn('readelf -l "$binary"', workflow)
 
     def test_publish_is_manual_and_main_only(self):
         with self.assertRaises(SystemExit), patch("sys.argv", ["x", "select", "--mode", "auto"]):
@@ -286,11 +322,11 @@ class ReleaseTests(unittest.TestCase):
                 tempfile.TemporaryDirectory() as directory,
             ):
                 root = Path(directory)
-                archive = root / "snapshot-to-s3-linux-x86_64.tar.gz"
-                archive.write_bytes(b"verified fixture")
+                binary = root / "snapshot-to-s3-linux-x86_64"
+                binary.write_bytes(b"verified fixture")
                 sums = root / "SHA256SUMS"
                 sums.write_text(
-                    f"{hashlib.sha256(archive.read_bytes()).hexdigest()}  {archive.name}\n"
+                    f"{hashlib.sha256(binary.read_bytes()).hexdigest()}  {binary.name}\n"
                 )
                 assets = [
                     {
@@ -298,7 +334,7 @@ class ReleaseTests(unittest.TestCase):
                         "size": p.stat().st_size,
                         "digest": f"sha256:{hashlib.sha256(p.read_bytes()).hexdigest()}",
                     }
-                    for p in (archive, sums)
+                    for p in (binary, sums)
                 ]
                 if damage == "digest":
                     assets[0]["digest"] = "sha256:" + "0" * 64
@@ -350,6 +386,10 @@ class ReleaseTests(unittest.TestCase):
                 upload = next(
                     i for i, c in enumerate(calls) if c[:3] == ["gh", "release", "upload"]
                 )
+                self.assertEqual(
+                    calls[upload],
+                    ["gh", "release", "upload", "v0.1.0", str(binary), str(sums), "--clobber"],
+                )
                 if existing:
                     self.assertEqual(created, [])
                     edit = next(
@@ -392,7 +432,7 @@ class ReleaseTests(unittest.TestCase):
                     patch.object(
                         publish_release,
                         "verify_assets",
-                        return_value=(Path("archive"), Path("SHA256SUMS")),
+                        return_value=(Path("snapshot-to-s3-linux-x86_64"), Path("SHA256SUMS")),
                     ),
                     patch.object(publish_release, "release_records", side_effect=[[], records]),
                     patch.object(publish_release, "run") as run,
@@ -406,10 +446,10 @@ class ReleaseTests(unittest.TestCase):
     def test_published_release_is_never_overwritten(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            archive = root / "snapshot-to-s3-linux-x86_64.tar.gz"
-            archive.write_bytes(b"fixture")
+            binary = root / "snapshot-to-s3-linux-x86_64"
+            binary.write_bytes(b"fixture")
             (root / "SHA256SUMS").write_text(
-                f"{hashlib.sha256(archive.read_bytes()).hexdigest()}  {archive.name}\n"
+                f"{hashlib.sha256(binary.read_bytes()).hexdigest()}  {binary.name}\n"
             )
             env = {"GITHUB_REPOSITORY": "fixture/repo", "GITHUB_REF": "refs/heads/main"}
             with (
