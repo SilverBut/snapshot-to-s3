@@ -123,3 +123,87 @@ fn with_cleanup(result: Result<()>, cleanup: Result<()>) -> Result<()> {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testing::MemoryStore;
+
+    const PREFIX: &str = "backup/";
+    const STREAM: &str = "backup/stream.encrypted";
+
+    #[tokio::test]
+    async fn probes_preserve_all_fields_and_clean_fixed_sibling_objects() {
+        let mut store = MemoryStore::default();
+        store
+            .extra_metadata
+            .insert("provider".into(), "extra".into());
+        probe_metadata(&store, PREFIX, STREAM, true).await.unwrap();
+        assert!(store.objects.lock().unwrap().is_empty());
+        assert_eq!(
+            *store.events.lock().unwrap(),
+            [
+                "PUT backup/.metadata-probe",
+                "HEAD backup/.metadata-probe",
+                "DELETE backup/.metadata-probe",
+                "CREATE backup/.metadata-probe-multipart",
+                "PART backup/.metadata-probe-multipart 1",
+                "COMPLETE backup/.metadata-probe-multipart",
+                "HEAD backup/.metadata-probe-multipart",
+                "DELETE backup/.metadata-probe-multipart",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn put_and_multipart_metadata_loss_are_detected_and_cleaned() {
+        for multipart in [false, true] {
+            let mut store = MemoryStore::default();
+            store.drop_put_metadata = !multipart;
+            store.drop_multipart_metadata = multipart;
+            let error = probe_metadata(&store, PREFIX, STREAM, multipart)
+                .await
+                .unwrap_err();
+            let message = format!("{error:#}");
+            assert!(message.contains("missing="));
+            assert!(message.contains("base-object-key"));
+            assert!(message.contains("gpg-key-id"));
+            assert!(store.objects.lock().unwrap().is_empty());
+            assert!(!store
+                .events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|e| e.starts_with("ABORT ")));
+        }
+    }
+
+    #[tokio::test]
+    async fn multipart_probe_aborts_part_failure_and_surfaces_cleanup_failure() {
+        let store = MemoryStore::default();
+        *store.failure.lock().unwrap() = Some("PART ".into());
+        let error = probe_metadata(&store, PREFIX, STREAM, true)
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("injected failure: PART"));
+        assert_eq!(
+            &store.events.lock().unwrap()[4..],
+            [
+                "PART backup/.metadata-probe-multipart 1",
+                "ABORT backup/.metadata-probe-multipart",
+                "DELETE backup/.metadata-probe-multipart",
+            ]
+        );
+        assert!(store.objects.lock().unwrap().is_empty());
+
+        *store.failure.lock().unwrap() = Some("DELETE ".into());
+        let error = probe_metadata(&store, PREFIX, STREAM, false)
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("probe cleanup failed"));
+        assert!(store
+            .objects
+            .lock()
+            .unwrap()
+            .contains_key("backup/.metadata-probe"));
+    }
+}

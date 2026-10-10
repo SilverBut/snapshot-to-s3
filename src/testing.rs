@@ -39,10 +39,23 @@ pub struct MemoryStore {
     pub conditional_commit_lost: Mutex<bool>,
     /// Fail one conditional put before it reaches the in-memory object map.
     pub conditional_put_failure_once: Mutex<bool>,
+    pub drop_put_metadata: bool,
+    pub drop_multipart_metadata: bool,
+    pub extra_metadata: MetadataMap,
     uploads: Mutex<BTreeMap<String, TestUpload>>,
 }
 
 impl MemoryStore {
+    fn stored_metadata(&self, metadata: &MetadataMap, drop: bool) -> MetadataMap {
+        let mut result = if drop {
+            MetadataMap::new()
+        } else {
+            metadata.clone()
+        };
+        result.extend(self.extra_metadata.clone());
+        result
+    }
+
     pub fn discarding_parts() -> Self {
         Self {
             discard_parts: true,
@@ -102,10 +115,10 @@ impl ObjectStore for MemoryStore {
     }
     async fn put(&self, key: &str, data: Bytes, meta: &MetadataMap) -> Result<()> {
         self.event(format!("PUT {key}"))?;
-        self.objects
-            .lock()
-            .unwrap()
-            .insert(key.into(), (data, meta.clone()));
+        self.objects.lock().unwrap().insert(
+            key.into(),
+            (data, self.stored_metadata(meta, self.drop_put_metadata)),
+        );
         Ok(())
     }
     async fn put_if_absent(&self, key: &str, data: Bytes) -> Result<bool> {
@@ -144,10 +157,14 @@ impl ObjectStore for MemoryStore {
     async fn create_upload(&self, key: &str, meta: &MetadataMap) -> Result<String> {
         self.event(format!("CREATE {key}"))?;
         let id = format!("upload-{key}");
-        self.uploads
-            .lock()
-            .unwrap()
-            .insert(id.clone(), (key.into(), meta.clone(), BTreeMap::new()));
+        self.uploads.lock().unwrap().insert(
+            id.clone(),
+            (
+                key.into(),
+                self.stored_metadata(meta, self.drop_multipart_metadata),
+                BTreeMap::new(),
+            ),
+        );
         Ok(id)
     }
     async fn upload_part(

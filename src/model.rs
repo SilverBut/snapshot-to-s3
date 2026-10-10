@@ -323,6 +323,33 @@ impl BackupMetadata {
 mod tests {
     use super::*;
 
+    #[test]
+    fn metadata_comparison_tolerates_extras_but_reports_each_missing_or_wrong_value() {
+        let expected = MetadataMap::from([
+            ("fs-type".into(), "zfs".into()),
+            ("vol-id".into(), "1".into()),
+        ]);
+        let mut actual = expected.clone();
+        actual.insert("provider".into(), "extra".into());
+        assert!(MetadataMismatch::between(&expected, &actual).is_empty());
+        actual.remove("vol-id");
+        actual.insert("fs-type".into(), "wrong".into());
+        assert_eq!(
+            MetadataMismatch::between(&expected, &actual),
+            MetadataMismatch {
+                missing: vec!["vol-id".into()],
+                wrong: vec!["fs-type".into()]
+            }
+        );
+        let expected = metadata().index.to_metadata().unwrap();
+        let mut actual = expected.clone();
+        actual.insert(metadata_field::BASE_SNAPSHOT_ID.into(), "3".into());
+        assert_eq!(
+            MetadataMismatch::between(&expected, &actual).wrong,
+            [metadata_field::BASE_SNAPSHOT_ID]
+        );
+    }
+
     fn metadata() -> BackupMetadata {
         BackupMetadata {
             index: StreamIndex {

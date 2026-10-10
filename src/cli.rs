@@ -444,6 +444,19 @@ mod tests {
             args.lock_detection_mode,
             LockDetectionMode::IfNoneMatch
         ));
+        assert!(!args.probe_metadata_multipart);
+        let with_probe =
+            Cli::try_parse_from([&backup[..], &["--probe-metadata-multipart"]].concat()).unwrap();
+        let Command::Backup(args) = with_probe.command else {
+            panic!("expected backup command");
+        };
+        assert!(args.probe_metadata_multipart);
+        assert!(!parses(&[
+            "restore",
+            "s3://bucket/backups",
+            "stdout:pool/data@s1",
+            "--probe-metadata-multipart",
+        ]));
 
         let cos_mode = Cli::try_parse_from(
             [

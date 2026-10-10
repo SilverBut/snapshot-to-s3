@@ -449,9 +449,27 @@ mod tests {
             .complete_upload("stream", &id, &[Part { number: 1, etag }])
             .await
             .is_err());
-        assert!(confirm_commit(&store, "stream", &meta, 10).await.unwrap());
-        assert!(!confirm_commit(&store, "absent", &meta, 10).await.unwrap());
+        assert_eq!(
+            confirm_commit(&store, "stream", &meta, 10).await.unwrap(),
+            CommitConfirmation::Committed
+        );
+        assert_eq!(
+            confirm_commit(&store, "absent", &meta, 10).await.unwrap(),
+            CommitConfirmation::Absent
+        );
         assert!(confirm_commit(&store, "stream", &meta, 9).await.is_err());
+        store.objects.lock().unwrap().get_mut("stream").unwrap().1 =
+            MetadataMap::from([("identity".into(), "wrong".into())]);
+        assert_eq!(
+            confirm_commit(&store, "stream", &meta, 10).await.unwrap(),
+            CommitConfirmation::CommittedMetadataMismatch {
+                found: MetadataMap::from([("identity".into(), "wrong".into())]),
+                mismatch: crate::model::MetadataMismatch {
+                    missing: vec![],
+                    wrong: vec!["identity".into()],
+                },
+            }
+        );
     }
 
     #[tokio::test]

@@ -457,6 +457,7 @@ mod tests {
                 gpg_key_id: "recipient".into(),
                 force_full: false,
                 force_overwrite: false,
+                probe_metadata_multipart: false,
                 rate_limit: None,
                 limits: UploadLimits::default(),
                 cancel: CancellationToken::new(),
@@ -486,8 +487,9 @@ mod tests {
         let (options, current, stream) = log_inputs();
         let base = "source=pool/data@s1\nsnapshot-guid=guid-current\nmode=incremental\n\
                      ciphertext-bytes=123456\nstream-objects=3\npeak-part-bytes=65536\n\
-                     producers-and-parts=succeeded\ncommit=pending\n";
-        let plain = backup_log(&options, &current, true, &stream, &[]);
+                     producers-and-parts=succeeded\ncommit=pending\nstream-metadata.fs-type=zfs\n";
+        let metadata = MetadataMap::from([("fs-type".into(), "zfs".into())]);
+        let plain = backup_log(&options, &current, true, &stream, &metadata, &[]);
         assert_eq!(plain, base);
 
         let diagnostic_len = LOG_LIMIT - 64 - plain.len() - 1;
@@ -497,12 +499,13 @@ mod tests {
             &current,
             true,
             &stream,
+            &metadata,
             std::slice::from_ref(&diagnostic),
         );
         assert_eq!(at_limit, format!("{plain}{diagnostic}\n"));
 
         let too_long = format!("{diagnostic}x");
-        let truncated = backup_log(&options, &current, true, &stream, &[too_long]);
+        let truncated = backup_log(&options, &current, true, &stream, &metadata, &[too_long]);
         assert_eq!(truncated, format!("{plain}diagnostics-truncated=true\n"));
     }
 }
