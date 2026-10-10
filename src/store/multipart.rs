@@ -267,7 +267,7 @@ async fn upload_part(
 }
 
 /// Whether the published object matches the upload: `Ok(false)` if absent,
-/// an error if present with different metadata or length.
+/// Reports metadata damage separately from absent or incorrectly sized objects.
 #[derive(Debug, PartialEq, Eq)]
 pub enum CommitConfirmation {
     Committed,

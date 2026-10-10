@@ -121,14 +121,6 @@ impl HttpStore {
         Ok(headers)
     }
 
-    fn lock_condition_description(&self) -> &'static str {
-        match self.lock_detection_mode {
-            LockDetectionMode::IfNoneMatch => "If-None-Match: *",
-            LockDetectionMode::XCosForbidOverwrite => "x-cos-forbid-overwrite: true",
-            LockDetectionMode::DangerouslySkip => "dangerously-skip",
-        }
-    }
-
     fn object_url(&self, key: &str, query: &[(String, String)]) -> Result<Url> {
         let mut url = self.endpoint.clone();
         let host = url
