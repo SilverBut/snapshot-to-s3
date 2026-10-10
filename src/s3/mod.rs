@@ -92,6 +92,15 @@ impl HttpStore {
             .build()
             .context("create S3 HTTP client")?;
         let credentials = Arc::new(Credentials::from_env()?);
+        tracing::info!(
+            bucket = %config.bucket,
+            %endpoint,
+            region = %config.region,
+            metadata_header_prefix = %metadata_header_prefix,
+            signing_service = %config.signing_service,
+            path_style = config.path_style,
+            "S3 store configured"
+        );
         Ok(Self {
             config,
             client,
@@ -104,6 +113,7 @@ impl HttpStore {
     }
 
     pub fn with_lock_detection_mode(mut self, mode: LockDetectionMode) -> Self {
+        tracing::debug!(?mode, "lock detection mode");
         self.lock_detection_mode = mode;
         self
     }

@@ -22,15 +22,27 @@ pub async fn probe_metadata(
     .to_metadata()?;
     let key = format!("{prefix}{}", object::METADATA_PROBE);
     let data = Bytes::from_static(b"snapshot-to-s3 capability probe");
+    tracing::info!(
+        %key,
+        fields = metadata.len(),
+        bytes = data.len(),
+        multipart,
+        "metadata probe: PUT probe object with all index fields"
+    );
+    tracing::debug!(%key, expected = ?metadata, "metadata probe: expected metadata");
     let result = async {
         store.put(&key, data.clone(), &metadata).await?;
+        tracing::debug!(%key, "metadata probe: PUT accepted; re-reading it with HEAD");
         confirm_metadata(store, &key, &metadata, data.len() as u64).await
     }
     .await;
-    with_cleanup(result, store.delete(&key).await)?;
+    with_cleanup(&key, result, store.delete(&key).await)?;
     if multipart {
         probe_multipart(store, prefix, data, &metadata).await?;
+    } else {
+        tracing::debug!("metadata probe: multipart probe disabled (--probe-metadata-multipart)");
     }
+    tracing::info!("metadata probe passed");
     Ok(())
 }
 
@@ -41,15 +53,29 @@ async fn probe_multipart(
     metadata: &MetadataMap,
 ) -> Result<()> {
     let key = format!("{prefix}{}", object::METADATA_PROBE_MULTIPART);
+    tracing::info!(%key, "metadata probe: multipart upload of probe object");
     let mut upload = None;
     let mut published = false;
     let result = async {
         let id = store.create_upload(&key, metadata).await?;
+        tracing::debug!(%key, upload_id = %id, "metadata probe: multipart upload initiated");
         upload = Some(id.clone());
         let etag = store.upload_part(&key, &id, 1, data.clone()).await?;
+        tracing::debug!(%key, %etag, "metadata probe: part 1 uploaded; completing");
         let completed = store
             .complete_upload(&key, &id, &[Part { number: 1, etag }])
             .await;
+        match &completed {
+            Ok(()) => tracing::debug!(
+                %key,
+                "metadata probe: completion accepted; re-reading it with HEAD"
+            ),
+            Err(error) => tracing::warn!(
+                %key,
+                "metadata probe: completion failed, re-reading with HEAD to resolve its outcome: \
+                 {error:#}"
+            ),
+        }
         // Preserve the completion error, even if confirmation also fails.
         published = completed.is_ok();
         let confirmation = match confirm_commit(store, &key, metadata, data.len() as u64).await {
@@ -75,15 +101,34 @@ async fn probe_multipart(
     .await;
     let result = if result.is_err() && !published {
         match upload {
-            Some(id) => with_cleanup(result, store.abort_upload(&key, &id).await),
-            None => result.context(
-                "metadata probe initiation failed; upload outcome may be unknown, inspect multipart uploads",
-            ),
+            Some(id) => {
+                tracing::warn!(
+                    %key,
+                    upload_id = %id,
+                    "metadata probe failed before publication; aborting its multipart upload"
+                );
+                with_cleanup(&key, result, store.abort_upload(&key, &id).await)
+            }
+            None => {
+                tracing::warn!(
+                    %key,
+                    "metadata probe initiation failed without an upload ID; nothing to abort"
+                );
+                result.context(
+                    "metadata probe initiation failed; upload outcome may be unknown, inspect multipart uploads",
+                )
+            }
         }
     } else {
+        if result.is_err() {
+            tracing::warn!(
+                %key,
+                "metadata probe failed after publication; deleting the object instead of aborting"
+            );
+        }
         result
     };
-    with_cleanup(result, store.delete(&key).await)
+    with_cleanup(&key, result, store.delete(&key).await)
 }
 
 async fn confirm_metadata(
@@ -101,18 +146,42 @@ async fn confirm_metadata(
 
 fn check_metadata(outcome: CommitConfirmation, key: &str, metadata: &MetadataMap) -> Result<()> {
     match outcome {
-        CommitConfirmation::Committed => Ok(()),
-        CommitConfirmation::Absent => bail!("metadata capability probe object absent: {key}"),
-        CommitConfirmation::CommittedMetadataMismatch { found, mismatch } => bail!(
-            "S3 endpoint did not preserve configured metadata on {key}: \
-             missing={:?}, wrong={:?}, expected={metadata:?}, found={found:?}",
-            mismatch.missing,
-            mismatch.wrong
-        ),
+        CommitConfirmation::Committed => {
+            tracing::info!(
+                %key,
+                fields = metadata.len(),
+                "metadata probe: HEAD re-read matches size and every expected field"
+            );
+            Ok(())
+        }
+        CommitConfirmation::Absent => {
+            tracing::warn!(%key, "metadata probe: HEAD re-read found no object");
+            bail!("metadata capability probe object absent: {key}")
+        }
+        CommitConfirmation::CommittedMetadataMismatch { found, mismatch } => {
+            tracing::warn!(
+                %key,
+                missing = ?mismatch.missing,
+                wrong = ?mismatch.wrong,
+                expected = ?metadata,
+                found = ?found,
+                "metadata probe: HEAD re-read shows the endpoint did not preserve metadata"
+            );
+            bail!(
+                "S3 endpoint did not preserve configured metadata on {key}: \
+                 missing={:?}, wrong={:?}, expected={metadata:?}, found={found:?}",
+                mismatch.missing,
+                mismatch.wrong
+            )
+        }
     }
 }
 
-fn with_cleanup(result: Result<()>, cleanup: Result<()>) -> Result<()> {
+fn with_cleanup(key: &str, result: Result<()>, cleanup: Result<()>) -> Result<()> {
+    match &cleanup {
+        Ok(()) => tracing::debug!(%key, "metadata probe: cleanup succeeded"),
+        Err(error) => tracing::warn!(%key, "metadata probe: cleanup failed: {error:#}"),
+    }
     match (result, cleanup) {
         (Ok(()), Ok(())) => Ok(()),
         (Err(error), Ok(())) => Err(error),

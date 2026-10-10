@@ -104,9 +104,24 @@ async fn backup_with_lock(
     ensure!(options.rate_limit != Some(0), "rate limit must be positive");
     let current = zfs.snapshot(&options.source).await?;
     let prefix = options.location.backup_prefix(&options.source);
+    tracing::info!(
+        source = %options.source,
+        guid = %current.guid,
+        volume_guid = %current.volume_guid,
+        createtxg = current.createtxg,
+        %prefix,
+        locking = locking_enabled,
+        force_full = options.force_full,
+        force_overwrite = options.force_overwrite,
+        probe_metadata_multipart = options.probe_metadata_multipart,
+        rate_limit = ?options.rate_limit,
+        limits = ?options.limits,
+        "backup started"
+    );
     let lock = if locking_enabled {
         Some(HeldLock::acquire(store.as_ref(), &prefix).await?)
     } else {
+        tracing::warn!(%prefix, "writer lock disabled (dangerously-skip); concurrent writers can race");
         None
     };
     let mut job = Job {
@@ -127,7 +142,13 @@ async fn backup_with_lock(
             },
             None => Ok(result),
         },
-        Err(error) => Err(job.recover(lock.as_ref(), error).await),
+        Err(error) => {
+            tracing::warn!(
+                upload = ?job.upload,
+                "backup failed; resolving upload state: {error:#}"
+            );
+            Err(job.recover(lock.as_ref(), error).await)
+        }
     }
 }
 
@@ -197,6 +218,11 @@ impl Job<'_> {
         .await?;
         let base = selected.base.as_ref();
         let fingerprint = crypto::resolve_recipient(&options.gpg_key_id).await?;
+        tracing::info!(
+            selector = %options.gpg_key_id,
+            %fingerprint,
+            "resolved GPG recipient"
+        );
         let metadata = BackupMetadata {
             index: StreamIndex {
                 gpg_key_id: fingerprint,
@@ -212,6 +238,7 @@ impl Job<'_> {
         let json = serde_json::to_vec(&metadata)?;
         let aad: [u8; 32] = Sha256::digest(&json).into();
         let index = metadata.index.to_metadata()?;
+        tracing::debug!(stream_key = %self.stream_key, ?index, "stream index metadata");
 
         let key = crypto::generate_key();
         let wrapped = crypto::encrypt_key(&metadata.index.gpg_key_id, &key).await?;
@@ -229,10 +256,23 @@ impl Job<'_> {
             .send(&options.source, base.map(|base| &base.name))
             .await?;
         let estimate = crypto::ciphertext_size(selected.estimate);
+        tracing::info!(
+            base = ?base.map(|base| base.name.to_string()),
+            plaintext_estimate = selected.estimate,
+            ciphertext_estimate = estimate,
+            "zfs send started"
+        );
         crate::progress::set_total(estimate);
         let stream = self
             .upload_stream(&upload_id, send, &key, aad, estimate)
             .await?;
+        tracing::info!(
+            ciphertext_bytes = stream.bytes,
+            objects = stream.objects,
+            head_parts = stream.head.parts.len(),
+            peak_part_bytes = stream.peak_part_bytes,
+            "send, encryption and part uploads finished"
+        );
 
         let log = backup_log(
             options,
@@ -261,20 +301,29 @@ impl Job<'_> {
     }
 
     async fn put(&self, name: &str, body: Bytes) -> Result<()> {
-        self.store
-            .put(&format!("{}{name}", self.prefix), body, &MetadataMap::new())
-            .await
+        let key = format!("{}{name}", self.prefix);
+        let bytes = body.len();
+        self.store.put(&key, body, &MetadataMap::new()).await?;
+        tracing::info!(%key, bytes, "uploaded");
+        Ok(())
     }
 
     async fn create_upload(&mut self, index: &MetadataMap) -> Result<String> {
         self.upload = Upload::InitiationUnknown;
         match self.store.create_upload(&self.stream_key, index).await {
             Ok(id) => {
+                tracing::info!(stream_key = %self.stream_key, upload_id = %id, "stream multipart upload initiated");
                 self.upload = Upload::Open(id.clone());
                 Ok(id)
             }
             Err(error) => {
-                if self.store.is_definite_rejection(&error) {
+                let rejected = self.store.is_definite_rejection(&error);
+                tracing::warn!(
+                    stream_key = %self.stream_key,
+                    definite_rejection = rejected,
+                    "stream multipart initiation failed: {error:#}"
+                );
+                if rejected {
                     self.upload = Upload::NotStarted;
                 }
                 Err(error).context("multipart initiation failed")
@@ -292,6 +341,13 @@ impl Job<'_> {
         lock: Option<&HeldLock>,
     ) -> Result<()> {
         self.upload = Upload::CompletionUnknown(upload_id.clone());
+        tracing::info!(
+            stream_key = %self.stream_key,
+            upload_id = %upload_id,
+            parts = parts.parts.len(),
+            bytes = parts.bytes,
+            "completing stream upload (commit point)"
+        );
         let completed = self
             .store
             .complete_upload(&self.stream_key, &upload_id, &parts.parts)
@@ -300,7 +356,20 @@ impl Job<'_> {
             .as_ref()
             .err()
             .is_some_and(|error| self.store.is_definite_rejection(error));
-        match confirm_commit(self.store, &self.stream_key, index, parts.bytes).await {
+        if let Err(error) = &completed {
+            tracing::warn!(
+                stream_key = %self.stream_key,
+                definite_rejection = rejected,
+                "stream completion failed; resolving the outcome with HEAD: {error:#}"
+            );
+        }
+        let confirmation = confirm_commit(self.store, &self.stream_key, index, parts.bytes).await;
+        tracing::info!(
+            stream_key = %self.stream_key,
+            confirmation = ?confirmation.as_ref().map_err(|error| format!("{error:#}")),
+            "stream commit confirmation"
+        );
+        match confirmation {
             Ok(CommitConfirmation::Committed) => {
                 self.upload = Upload::Committed;
                 if let Err(error) = completed {
@@ -350,6 +419,7 @@ impl Job<'_> {
     /// publish the stream; otherwise keeps the lock for manual recovery.
     async fn recover(&self, lock: Option<&HeldLock>, error: Error) -> Error {
         if matches!(self.upload, Upload::Committed) {
+            tracing::info!("stream is committed; keeping it and releasing the lock");
             return match lock {
                 Some(lock) => match lock.release(self.store).await {
                     Ok(()) => error,
@@ -364,19 +434,32 @@ impl Job<'_> {
         let lock_status = lock_status(lock);
         let stopped = match &self.upload {
             Upload::CompletionUnknown(_) => {
+                tracing::warn!(
+                    ?upload_id,
+                    "completion outcome unknown; not aborting, {lock_status}"
+                );
                 return anyhow::anyhow!(
                     "{error:#}; outcome unknown, {lock_status}; upload-id={upload_id:?}"
                 );
             }
             Upload::Open(id) => match self.store.abort_upload(&self.stream_key, id).await {
-                Ok(()) => true,
+                Ok(()) => {
+                    tracing::info!(upload_id = %id, "open stream upload aborted");
+                    true
+                }
                 Err(cleanup) => {
                     tracing::warn!("multipart abort failed; {lock_status}: {cleanup:#}");
                     false
                 }
             },
-            Upload::InitiationUnknown => false,
-            Upload::NotStarted => true,
+            Upload::InitiationUnknown => {
+                tracing::warn!("stream initiation outcome unknown; cannot abort, {lock_status}");
+                false
+            }
+            Upload::NotStarted => {
+                tracing::debug!("no stream upload was started; nothing to abort");
+                true
+            }
             Upload::Committed => unreachable!("committed uploads handled above"),
         };
         match self.store.list(&self.prefix).await {

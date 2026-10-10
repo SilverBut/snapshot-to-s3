@@ -39,6 +39,13 @@ pub async fn prepare(
         .head(&key)
         .await?
         .with_context(|| format!("selected backup is not committed: {key}"))?;
+    tracing::info!(
+        %key,
+        size = head.size,
+        etag = %head.etag,
+        metadata = ?head.metadata,
+        "selected backup found"
+    );
     let index = StreamIndex::from_metadata(&head.metadata)?;
     let mut node = ReplayNode {
         key,
@@ -47,6 +54,7 @@ pub async fn prepare(
         index,
     };
     let Some(target) = target else {
+        tracing::info!("stdout export: replaying only the selected stream");
         return Ok(RestorePlan {
             nodes: vec![node],
             local_base: None,
@@ -54,6 +62,13 @@ pub async fn prepare(
     };
     let target_info = zfs.target(target).await?;
     let latest = target_info.snapshots.iter().max_by_key(|s| s.createtxg);
+    tracing::info!(
+        %target,
+        exists = target_info.exists,
+        snapshots = target_info.snapshots.len(),
+        latest = ?latest.map(|s| (s.name.to_string(), s.guid.clone())),
+        "restore target inspected"
+    );
     if target_info.exists && latest.is_none() {
         bail!("existing target has no usable snapshot; use a new target for full recovery");
     }
@@ -73,7 +88,18 @@ pub async fn prepare(
         if node.index.vol_id != volume {
             bail!("parent backup volume GUID disagrees with source chain");
         }
+        tracing::debug!(
+            key = %node.key,
+            guid = %node.index.current_snapshot_id,
+            base_guid = ?node.index.base_snapshot_id,
+            base_key = ?node.index.base_object_key,
+            "chain step"
+        );
         if latest_guid == Some(node.index.current_snapshot_id.as_str()) {
+            tracing::info!(
+                key = %node.key,
+                "target's latest snapshot is this backup; chain ends here"
+            );
             local_base = Some(node.index.current_snapshot_id.clone());
             break;
         }
@@ -85,9 +111,16 @@ pub async fn prepare(
         let parent_key = node.index.base_object_key.clone();
         nodes.push(node);
         match (base, parent_key) {
-            (None, None) => break,
+            (None, None) => {
+                tracing::info!("reached a full stream; chain ends here");
+                break;
+            }
             (Some(base), Some(parent_key)) => {
                 if latest_guid == Some(base.as_str()) {
+                    tracing::info!(
+                        %base,
+                        "target's latest snapshot is the declared base; chain ends here"
+                    );
                     local_base = Some(base);
                     break;
                 }
@@ -109,6 +142,13 @@ pub async fn prepare(
                         "required parent is missing: {parent_key}; no matching latest local base"
                     );
                 };
+                tracing::debug!(
+                    %parent_key,
+                    size = head.size,
+                    etag = %head.etag,
+                    metadata = ?head.metadata,
+                    "parent backup found"
+                );
                 let index = StreamIndex::from_metadata(&head.metadata)?;
                 if index.current_snapshot_id != base {
                     bail!("parent GUID does not match base-snapshot-id at {parent_key}");
@@ -140,6 +180,11 @@ pub async fn prepare(
             .await?;
     }
     nodes.reverse();
+    tracing::info!(
+        streams = ?nodes.iter().map(|node| node.key.as_str()).collect::<Vec<_>>(),
+        ?local_base,
+        "restore plan"
+    );
     Ok(RestorePlan { nodes, local_base })
 }
 

@@ -58,6 +58,10 @@ pub async fn restore<W: AsyncWrite + Unpin>(
         bail!("restore cancelled during preparation");
     }
     let Some(selected) = plan.nodes.last() else {
+        tracing::info!(
+            local_base = ?plan.local_base,
+            "target already holds the selected snapshot; nothing to replay"
+        );
         return Ok(RestoreResult {
             received: vec![],
             local_base: plan.local_base,
@@ -66,6 +70,12 @@ pub async fn restore<W: AsyncWrite + Unpin>(
     };
     if let Some(selector) = &options.gpg_key_id {
         let fingerprint = crypto::resolve_decryption_recipient(selector).await?;
+        tracing::info!(
+            %selector,
+            %fingerprint,
+            backup_recipient = %selected.index.gpg_key_id,
+            "checking backup recipient against --gpg-key-id"
+        );
         if selected.index.gpg_key_id != fingerprint {
             bail!("selected backup recipient does not match --gpg-key-id");
         }
@@ -77,6 +87,7 @@ pub async fn restore<W: AsyncWrite + Unpin>(
             bail!("restore cancelled during verification");
         }
         let name = node.key.clone();
+        tracing::info!(stream_key = %name, "verifying backup");
         verified.push(
             verify(&store, node)
                 .await
@@ -88,7 +99,15 @@ pub async fn restore<W: AsyncWrite + Unpin>(
     for backup in verified {
         let stream_key = backup.node.key.clone();
         let snapshot_guid = backup.node.index.current_snapshot_id.clone();
+        tracing::info!(
+            %stream_key,
+            %snapshot_guid,
+            objects = backup.objects.len(),
+            target = ?options.target,
+            "replaying backup"
+        );
         if let Err(error) = replay(&store, zfs.as_ref(), &options, backup, stdout).await {
+            tracing::warn!(%stream_key, "replay failed: {error:#}");
             if options.target.is_none() {
                 bail!(
                     "incomplete stdout export of {stream_key}; partial authenticated output \
@@ -101,6 +120,7 @@ pub async fn restore<W: AsyncWrite + Unpin>(
                 received.last().or(plan.local_base.as_ref())
             );
         }
+        tracing::info!(%stream_key, %snapshot_guid, "replay finished");
         received.push(snapshot_guid);
     }
     Ok(RestoreResult {
@@ -165,6 +185,12 @@ async fn replay<W: AsyncWrite + Unpin>(
                 snapshot: node.source.snapshot.clone(),
             })
             .await?;
+        tracing::info!(
+            snapshot = %received.name,
+            received_guid = %received.guid,
+            expected_guid = %node.index.current_snapshot_id,
+            "checking received snapshot GUID"
+        );
         if received.guid != node.index.current_snapshot_id {
             bail!("received snapshot GUID disagrees with authenticated backup");
         }

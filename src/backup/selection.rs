@@ -38,6 +38,7 @@ pub async fn select_base(
             .ok_or_else(|| anyhow!("selected source snapshot disappeared"))
     };
     if force_full {
+        tracing::info!("base selection skipped: full stream forced");
         return Ok(Selection {
             base: None,
             estimate: full().await?,
@@ -52,9 +53,16 @@ pub async fn select_base(
             || snapshot.volume_guid != current.volume_guid
             || snapshot.guid == current.guid
         {
+            tracing::trace!(
+                snapshot = %snapshot.name,
+                createtxg = snapshot.createtxg,
+                "not an older snapshot of this filesystem; skipped"
+            );
             continue;
         }
-        let Some(head) = store.head(&location.stream_key(&snapshot.name)).await? else {
+        let stream_key = location.stream_key(&snapshot.name);
+        let Some(head) = store.head(&stream_key).await? else {
+            tracing::debug!(snapshot = %snapshot.name, %stream_key, "no committed backup; skipped");
             continue;
         };
         let index = match StreamIndex::from_metadata(&head.metadata) {
@@ -70,15 +78,30 @@ pub async fn select_base(
             }
         };
         if index.current_snapshot_id != snapshot.guid || index.vol_id != current.volume_guid {
+            tracing::info!(
+                snapshot = %snapshot.name,
+                local_guid = %snapshot.guid,
+                remote_guid = %index.current_snapshot_id,
+                local_volume = %current.volume_guid,
+                remote_volume = %index.vol_id,
+                "excluded base candidate: remote GUID mismatch"
+            );
             diagnostics.push(format!("exclude {}: remote GUID mismatch", snapshot.name));
             continue;
         }
         match zfs.written(&snapshot.name, &current.name).await? {
-            Some(written) => candidates.push((snapshot, written)),
-            None => diagnostics.push(format!(
-                "exclude {}: snapshot disappeared or is no longer a send base",
-                snapshot.name
-            )),
+            Some(written) => {
+                tracing::debug!(snapshot = %snapshot.name, written, "base candidate");
+                candidates.push((snapshot, written))
+            }
+            None => {
+                let diagnostic = format!(
+                    "exclude {}: snapshot disappeared or is no longer a send base",
+                    snapshot.name
+                );
+                tracing::info!("{diagnostic}");
+                diagnostics.push(diagnostic)
+            }
         }
     }
     let mut by_written: Vec<_> = candidates.iter().collect();
@@ -91,28 +114,57 @@ pub async fn select_base(
         .chain(by_txg.into_iter().take(SHORTLIST_PER_ORDER))
         .map(|(s, _)| (s.name.full_name(), s))
         .collect();
+    tracing::debug!(
+        candidates = candidates.len(),
+        shortlist = ?shortlist.keys().collect::<Vec<_>>(),
+        "base shortlist"
+    );
     let mut estimates = Vec::new();
     for snapshot in shortlist.values() {
         match zfs.estimate(&current.name, Some(&snapshot.name)).await? {
-            Some(size) => estimates.push((size, snapshot.name.full_name(), (*snapshot).clone())),
-            None => diagnostics.push(format!(
-                "exclude {}: estimate base disappeared or became invalid",
-                snapshot.name
-            )),
+            Some(size) => {
+                tracing::debug!(base = %snapshot.name, estimate = size, "incremental estimate");
+                estimates.push((size, snapshot.name.full_name(), (*snapshot).clone()))
+            }
+            None => {
+                let diagnostic = format!(
+                    "exclude {}: estimate base disappeared or became invalid",
+                    snapshot.name
+                );
+                tracing::info!("{diagnostic}");
+                diagnostics.push(diagnostic)
+            }
         }
     }
     estimates.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
     match estimates.into_iter().next() {
-        Some((estimate, _, base)) => Ok(Selection {
-            base: Some(base),
-            estimate,
-            diagnostics,
-        }),
-        None => Ok(Selection {
-            base: None,
-            estimate: full().await?,
-            diagnostics,
-        }),
+        Some((estimate, _, base)) => {
+            tracing::info!(
+                base = %base.name,
+                base_guid = %base.guid,
+                estimate,
+                candidates = candidates.len(),
+                "selected incremental base with the smallest estimate"
+            );
+            Ok(Selection {
+                base: Some(base),
+                estimate,
+                diagnostics,
+            })
+        }
+        None => {
+            let estimate = full().await?;
+            tracing::info!(
+                estimate,
+                candidates = candidates.len(),
+                "no usable incremental base; sending a full stream"
+            );
+            Ok(Selection {
+                base: None,
+                estimate,
+                diagnostics,
+            })
+        }
     }
 }
 

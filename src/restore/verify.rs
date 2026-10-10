@@ -39,17 +39,20 @@ pub(super) async fn verify(
     let checksum = small(object::KEY_CHECKSUM, CHECKSUM_SIZE).await?;
     let key = crypto::decrypt_key(&wrapped).await?;
     crypto::verify_checksum(&key, &checksum)?;
+    tracing::debug!(%prefix, "data key unwrapped and checksum matches");
 
     let encrypted = small(object::METADATA, SMALL_OBJECT_LIMIT).await?;
     let json = crypto::decrypt_small(&key, &encrypted, SMALL_OBJECT_LIMIT).await?;
     let metadata: BackupMetadata =
         serde_json::from_slice(&json).context("parse authenticated metadata")?;
     metadata.verify(&node.index, &node.source)?;
+    tracing::debug!(%prefix, "authenticated metadata matches the stream index");
 
     let log = small(object::LOG, SMALL_OBJECT_LIMIT).await?;
     crypto::decrypt_small(&key, &log, LOG_LIMIT)
         .await
         .context("authenticate backup log")?;
+    tracing::debug!(%prefix, "backup log authenticated");
 
     let aad: [u8; 32] = Sha256::digest(&json).into();
     let objects = stream_objects(store.as_ref(), &node).await?;
@@ -57,9 +60,16 @@ pub(super) async fn verify(
         total.checked_add(*size).context("stream size overflow")
     })?;
     let mut prefix_stream = read_chain(store.clone(), prefix_ranges(&objects));
+    tracing::debug!(
+        %prefix,
+        objects = objects.len(),
+        bytes = size,
+        "stream objects found; authenticating the stream prefix"
+    );
     crypto::verify_prefix(&key, &aad, &mut prefix_stream, size)
         .await
         .context("authenticate stream prefix")?;
+    tracing::info!(key = %node.key, objects = objects.len(), bytes = size, "backup verified");
     Ok(VerifiedBackup {
         node,
         key,
