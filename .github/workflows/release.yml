@@ -20,6 +20,7 @@ concurrency:
 jobs:
   select:
     name: Select only an authorized frozen release
+    if: github.event_name == 'workflow_dispatch' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
     runs-on: ubuntu-26.04
     timeout-minutes: 10
     permissions:
@@ -35,7 +36,7 @@ jobs:
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
-          ref: ${{ github.ref }}
+          ref: ${{ github.sha }}
           fetch-depth: 0
           persist-credentials: false
       - name: Validate mode, proposal and exact commit CI
@@ -54,8 +55,16 @@ jobs:
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
-          ref: ${{ needs.select.outputs.sha }}
+          ref: ${{ github.sha }}
+          fetch-depth: 0
           persist-credentials: false
+      - name: Verify the frozen release belongs to trusted dispatch history
+        env:
+          RELEASE_SHA: ${{ needs.select.outputs.sha }}
+        run: |
+          [[ "$RELEASE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          git merge-base --is-ancestor "$RELEASE_SHA" HEAD
+          git checkout --detach "$RELEASE_SHA"
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-unknown-linux-musl
