@@ -272,9 +272,7 @@ class ReleaseTests(unittest.TestCase):
             patch.object(publish_release, "output") as output,
         ):
             publish_release.select(Path.cwd(), "build-only")
-            self.assertEqual(
-                run.call_args_list[0].args[0][3], "a" * 40 + "^{commit}"
-            )
+            self.assertEqual(run.call_args_list[0].args[0][3], "a" * 40 + "^{commit}")
             self.assertEqual(output.call_args.args[0]["sha"], "a" * 40)
 
     def test_draft_upload_verification_precedes_publication(self):
