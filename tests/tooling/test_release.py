@@ -346,6 +346,9 @@ class ReleaseTests(unittest.TestCase):
                     assets.append({**assets[0], "name": "unexpected"})
                 calls = []
                 draft = {"id": 123, "tag_name": "v0.1.0", "draft": True}
+                legacy_archive = "snapshot-to-s3-linux-x86_64.tar.gz"
+                if existing:
+                    draft["assets"] = [{"name": legacy_archive}]
 
                 def api_reply(path, _root, calls=calls, draft=draft, assets=assets):
                     if path == "repos/fixture/repo":
@@ -355,7 +358,12 @@ class ReleaseTests(unittest.TestCase):
                     self.assertEqual(path, "repos/fixture/repo/releases/123")
                     if any("--draft=false" in command for command in calls):
                         return {"draft": False, "html_url": "https://example.invalid/release"}
-                    return {**draft, "assets": assets}
+                    retained = (
+                        []
+                        if any(c[:3] == ["gh", "release", "delete-asset"] for c in calls)
+                        else draft.get("assets", [])
+                    )
+                    return {**draft, "assets": assets + retained}
 
                 env = {"GITHUB_REPOSITORY": "fixture/repo", "GITHUB_REF": "refs/heads/main"}
                 with (
@@ -390,8 +398,14 @@ class ReleaseTests(unittest.TestCase):
                     calls[upload],
                     ["gh", "release", "upload", "v0.1.0", str(binary), str(sums), "--clobber"],
                 )
+                deletions = [c for c in calls if c[:3] == ["gh", "release", "delete-asset"]]
                 if existing:
                     self.assertEqual(created, [])
+                    self.assertEqual(
+                        deletions,
+                        [["gh", "release", "delete-asset", "v0.1.0", legacy_archive, "--yes"]],
+                    )
+                    self.assertLess(calls.index(deletions[0]), upload)
                     edit = next(
                         i
                         for i, c in enumerate(calls)
@@ -400,6 +414,7 @@ class ReleaseTests(unittest.TestCase):
                     self.assertLess(edit, upload)
                 else:
                     self.assertEqual(len(created), 1)
+                    self.assertEqual(deletions, [])
                     self.assertIn("--draft", created[0])
                     self.assertLess(calls.index(created[0]), upload)
                 published = [c for c in calls if "--draft=false" in c]
@@ -461,7 +476,13 @@ class ReleaseTests(unittest.TestCase):
                 patch.object(
                     publish_release,
                     "release_records",
-                    return_value=[{"tag_name": "v0.1.0", "draft": False}],
+                    return_value=[
+                        {
+                            "tag_name": "v0.1.0",
+                            "draft": False,
+                            "assets": [{"name": "snapshot-to-s3-linux-x86_64.tar.gz"}],
+                        }
+                    ],
                 ),
                 patch.object(publish_release, "run") as run,
             ):
