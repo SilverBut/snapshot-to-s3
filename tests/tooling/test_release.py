@@ -3,6 +3,7 @@ import json
 import os
 import subprocess
 import tempfile
+import textwrap
 import tomllib
 import unittest
 from pathlib import Path
@@ -278,6 +279,63 @@ class ReleaseTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 publish_release.select(Path.cwd(), "publish")
             output.assert_not_called()
+
+    def test_release_build_only_checks_out_verified_dispatch_ancestors(self):
+        workflow = (
+            Path(__file__).resolve().parents[2] / ".github/workflows/release.yml"
+        ).read_text()
+        select, build = workflow.split("\n  select:\n", 1)[1].split("\n  build:\n", 1)
+        self.assertIn(
+            "if: github.event_name == 'workflow_dispatch' && "
+            "github.ref == format('refs/heads/{0}', github.event.repository.default_branch)",
+            select,
+        )
+        build = build.split("\n  publish:\n", 1)[0]
+        checkout, verification = build.split(
+            "      - name: Verify the frozen release belongs to trusted dispatch history\n", 1
+        )
+        for job in (select, checkout):
+            self.assertIn("ref: ${{ github.sha }}", job)
+            self.assertIn("fetch-depth: 0", job)
+            self.assertIn("persist-credentials: false", job)
+        self.assertIn("RELEASE_SHA: ${{ needs.select.outputs.sha }}", verification)
+        script = textwrap.dedent(
+            verification.split("        run: |\n", 1)[1].split("      - uses:", 1)[0]
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+
+            def git(*args):
+                return subprocess.run(
+                    ["git", *args], cwd=root, check=True, capture_output=True, text=True
+                ).stdout.strip()
+
+            git("init", "-b", "main")
+            git("config", "user.name", "Fixture")
+            git("config", "user.email", "fixture@example.invalid")
+            git("commit", "--allow-empty", "-m", "accepted")
+            accepted = git("rev-parse", "HEAD")
+            git("commit", "--allow-empty", "-m", "dispatch")
+            dispatch = git("rev-parse", "HEAD")
+            git("checkout", "--orphan", "unmerged")
+            git("commit", "--allow-empty", "-m", "unmerged")
+            unmerged = git("rev-parse", "HEAD")
+            for sha, succeeds in (
+                (accepted, True),
+                (dispatch, True),
+                (unmerged, False),
+                ("", False),
+            ):
+                with self.subTest(sha=sha):
+                    git("checkout", "--detach", dispatch)
+                    result = subprocess.run(
+                        ["bash", "-euo", "pipefail", "-c", script],
+                        cwd=root,
+                        env={**os.environ, "RELEASE_SHA": sha},
+                        capture_output=True,
+                    )
+                    self.assertEqual(result.returncode == 0, succeeds)
+                    self.assertEqual(git("rev-parse", "HEAD"), sha if succeeds else dispatch)
 
     def test_build_only_requires_main_and_uses_dispatch_commit(self):
         env = {
