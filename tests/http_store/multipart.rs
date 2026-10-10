@@ -1,8 +1,14 @@
 use super::support::{config, fixture, fixture_sequence, split_captured_requests, EnvGuard};
 use anyhow::Result;
 use snapshot_to_s3::{
+    progress,
     s3::{is_definite_rejection, is_retryable, HttpStore},
     store::{upload_parts, ObjectStore, Part, PartStorage, UploadLimits},
+};
+use tokio::{
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
+    net::TcpListener,
+    sync::oneshot,
 };
 
 #[tokio::test]
@@ -131,6 +137,96 @@ async fn retries_identical_bytes(part_storage: PartStorage) -> Result<()> {
     }
     assert_eq!(requests[0].1, requests[1].1);
     assert_eq!(requests[1].1, requests[2].1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn memory_part_progress_grows_while_the_body_is_sent() -> Result<()> {
+    progress_grows_while_the_body_is_sent(PartStorage::Memory).await
+}
+
+#[tokio::test]
+async fn temp_file_part_progress_grows_while_the_body_is_sent() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    progress_grows_while_the_body_is_sent(PartStorage::TempFile(dir.path().join("part"))).await
+}
+
+/// The server pauses after reading part of the body; the bytes it has read
+/// must already be in the transfer progress, before the part completes.
+async fn progress_grows_while_the_body_is_sent(part_storage: PartStorage) -> Result<()> {
+    const PART: usize = 8 * 1024 * 1024;
+    const FIRST: usize = 1024 * 1024;
+    let _env = EnvGuard::new();
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let (paused, wait_paused) = oneshot::channel();
+    let (resume, wait_resume) = oneshot::channel::<()>();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut reader = BufReader::new(stream);
+        let mut length = 0;
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).await.unwrap();
+            if let Some((name, value)) = line.split_once(':') {
+                if name.eq_ignore_ascii_case("content-length") {
+                    length = value.trim().parse::<usize>().unwrap();
+                }
+            }
+            if line == "\r\n" {
+                break;
+            }
+        }
+        let mut body = vec![0u8; length];
+        reader.read_exact(&mut body[..FIRST]).await.unwrap();
+        paused.send(()).unwrap();
+        wait_resume.await.unwrap();
+        reader.read_exact(&mut body[FIRST..]).await.unwrap();
+        reader
+            .get_mut()
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nETag: \"part\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        body
+    });
+    let store = HttpStore::new(config(format!("http://{address}"))).await?;
+    let ciphertext: Vec<u8> = (0..PART).map(|i| i as u8).collect();
+    let mut reader = std::io::Cursor::new(ciphertext.clone());
+    let limits = UploadLimits {
+        min_part_size: 1,
+        max_part_size: PART as u64,
+        max_parts: 1,
+        max_object_size: PART as u64,
+        part_storage,
+    };
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let before = progress::transferred();
+    let upload = upload_parts(
+        &store,
+        "stream",
+        "upload",
+        &mut reader,
+        PART as u64,
+        &limits,
+        &cancel,
+    );
+    let probe = async {
+        wait_paused.await.unwrap();
+        let during = progress::transferred() - before;
+        resume.send(()).unwrap();
+        during
+    };
+    let (uploaded, during) = tokio::join!(upload, probe);
+    let uploaded = uploaded?;
+    assert!(
+        during >= FIRST as u64,
+        "{during} bytes counted while the server had read {FIRST}"
+    );
+    assert_eq!(uploaded.bytes, PART as u64);
+    assert!(progress::transferred() - before >= PART as u64);
+    assert_eq!(server.await?, ciphertext);
     Ok(())
 }
 

@@ -175,6 +175,7 @@ impl ObjectStore for MemoryStore {
         data: Bytes,
     ) -> Result<String> {
         self.event(format!("PART {key} {number}"))?;
+        crate::progress::add(data.len() as u64);
         self.uploads
             .lock()
             .unwrap()

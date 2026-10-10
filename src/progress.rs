@@ -34,6 +34,11 @@ pub fn add(bytes: u64) {
     TRANSFERRED.fetch_add(bytes, Ordering::Relaxed);
 }
 
+/// Bytes recorded since the last [`Reporter::start`].
+pub fn transferred() -> u64 {
+    TRANSFERRED.load(Ordering::Relaxed)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
     Off,
