@@ -14,6 +14,8 @@ A backup of `dataset@snapshot` to `s3://bucket/prefix` is a group of objects und
 | `stream.encrypted` | The encrypted `zfs send -w` stream, or its first part; carries the index metadata |
 | `stream.encrypted.000001`, … | Continuations of a stream larger than one object |
 | `.lock` | Writer lock; exists only while a backup runs or after an unresolved failure |
+| `.metadata-probe` | Temporary PUT metadata check, next to `.lock`; deleted before backup objects are written |
+| `.metadata-probe-multipart` | Optional temporary multipart metadata check; same lifecycle as `.metadata-probe` |
 
 Objects are never tar archives and are never overwritten.
 
@@ -67,19 +69,34 @@ GUIDs are exact decimal strings. The decrypted `meta.json` repeats these fields 
 The object metadata is an unauthenticated index for planning. Restore uses it only after checking that
 it agrees with the authenticated `meta.json`.
 
+Backup checks that every expected metadata field has its exact value; unrelated provider-added fields
+are tolerated. The two base fields must remain absent for a full backup. The expected fields and values
+are also recorded as `stream-metadata.<name>=<value>`
+in `backup.log.encrypted`, before any truncatable base-selection diagnostics, for manual repair.
+
 ## Lock and commit protocol
 
 1. Normally create `.lock` with a conditional `PUT`, containing a random token. By default this uses
    `If-None-Match: *`; `--lock-detection-mode x-cos-forbid-overwrite` uses COS's
    `x-cos-forbid-overwrite: true` instead. If the lock exists, stop. A `HEAD` followed by a `PUT` is
    not a lock, so services without conditional create are rejected.
+   Acquisition verifies the condition by attempting another create of the same lock and requiring refusal.
 2. Holding the lock, require that the prefix contains nothing else.
+   With `--force-overwrite`, delete all other objects first.
+   Before writing backup objects, PUT `.metadata-probe` in this same prefix with all six index fields
+   (including incremental fields) and realistic values, then HEAD it and check metadata and size.
+   Delete the probe. With `--probe-metadata-multipart` (off by default), also initiate, upload one small
+   part, complete, HEAD and delete `.metadata-probe-multipart` with the same metadata.
 3. Upload `key.gpg`, `key.sha256sum` and `meta.json.encrypted`.
 4. Start the multipart upload of `stream.encrypted` and upload its parts. Upload, complete and confirm
    (by `HEAD` size) each continuation object. Do not complete `stream.encrypted` yet.
 5. After `zfs send`, encryption and all uploads succeed, upload `backup.log.encrypted`.
 6. Complete `stream.encrypted` and confirm it with `HEAD` (metadata and size). **This is the commit
    point**: a prefix without `stream.encrypted` is never a valid backup or base.
+   If size matches but metadata is missing or wrong, preserve the backup and log, release the lock,
+   and exit nonzero with `backup committed, stream metadata missing or wrong`. Stderr lists the expected
+   headers (using the configured metadata prefix), observed metadata and a repair hint. This is not an
+   unknown completion outcome, including when the completion response was lost.
 7. Delete the lock.
 
 The lock never expires and is never taken over. An operator may delete a stale lock or partial backup only
@@ -89,11 +106,19 @@ after making sure that its writer and uploads have stopped.
 release `.lock` and permits concurrent writers to race. The prefix is still listed and must be empty
 before upload, but that check is not atomic.
 
-Unless locking is skipped, the selected mode is checked before every backup using a temporary probe
-object. COS mode requires `x-cos-forbid-overwrite` to reject an overwrite with the `FileAlreadyExists`
-error. Tencent COS documents that this header does not prevent overwrites when bucket versioning is
-enabled; the capability probe rejects such a configuration if the header is ignored. Skip mode omits
-the conditional-create probe but still checks metadata preservation.
+The selected lock mode is verified during acquisition itself; there is no additional lock probe.
+COS mode requires `x-cos-forbid-overwrite` to reject an overwrite with the `FileAlreadyExists` error.
+Tencent COS documents that this header does not prevent overwrites when bucket versioning is enabled;
+lock acquisition rejects such a configuration if the header is ignored. Metadata probing happens only
+after the lock and empty-prefix check. Skip mode still checks metadata preservation, without protection
+against concurrent writers.
+
+Probe names are fixed, not placed in another namespace or given random suffixes: the held lock provides
+single-writer protection. Probe failures stop before any key, log or stream is uploaded and release the
+lock. Cleanup errors are reported explicitly; unfinished multipart probes with a known upload ID are
+aborted. If initiation failed without returning an ID, inspect outstanding multipart uploads manually.
+A leftover probe object after failed cleanup or a crash makes the prefix nonempty and blocks a later
+backup until it is manually removed or cleared by `--force-overwrite`.
 
 Failure handling depends on what is known about the `stream.encrypted` upload:
 
@@ -103,6 +128,7 @@ Failure handling depends on what is known about the `stream.encrypted` upload:
 | Open (not completed) | Abort it; release the lock if the abort succeeded |
 | Initiation outcome unknown | Keep the lock |
 | Completion sent, outcome unknown | Check with `HEAD`: a matching object means committed; otherwise keep the lock and report the state as unknown |
+| Published with matching size, metadata missing or wrong | Keep backup objects and log; release lock; report repairable metadata failure and exit nonzero |
 
 An unfinished continuation upload is aborted. Residual objects are listed on stderr. A later backup
 of the same snapshot refuses the prefix until the partial content is removed. If the lock cannot be deleted

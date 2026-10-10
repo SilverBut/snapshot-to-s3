@@ -34,6 +34,7 @@ The backup is written under `s3://bucket/backups/pool/dataset/snap/`. The snapsh
 | --- | --- |
 | `--gpg-key-id` (or `GPG_KEY_ID`) | Selector resolving to exactly one encryption-capable public key |
 | `--force-full-snapshot` | Send a full stream instead of choosing an incremental base |
+| `--probe-metadata-multipart` | Also check metadata with a tiny multipart upload before backup (off by default; extra S3 requests). The simple PUT metadata check always runs |
 | `--rate-limit BYTES_PER_SEC` | Limit ciphertext throughput |
 | `--force-overwrite` | Delete any existing backup objects under the destination prefix and write anew. Destructive; the exclusive writer lock is still required and never bypassed |
 | `--progress [tty\|SECONDS\|off]` | Progress on stderr (size, elapsed time, speed). `tty` is a live line, a number prints one line per that many seconds; default and bare flag use `tty` on a terminal, else every 10 s. Also accepted by `restore`; never writes to stdout |
@@ -71,6 +72,10 @@ authenticated data before a failure; the exit status is then nonzero.
 `0` success, `1` any failure (details on stderr), `2` invalid command line. SIGINT and SIGTERM cancel
 cleanly through the same failure handling.
 
+A stream published with matching size but missing or wrong metadata exits `1` while retaining the
+uploaded backup and log and releasing its lock. The log contains expected metadata; stderr prints
+the expected headers for manual repair. See [storage.md](docs/storage.md#lock-and-commit-protocol).
+
 ## Configuration
 
 ### S3 endpoint
@@ -102,17 +107,19 @@ The selector is resolved to a full fingerprint, which is stored with the backup.
 ### Bucket permissions
 
 `s3:PutObject` (objects and, unless locking is disabled, the conditional lock), `s3:GetObject`,
-`s3:ListBucket`, `s3:AbortMultipartUpload`, and `s3:DeleteObject` for lock objects (`*/.lock`).
+`s3:ListBucket`, `s3:AbortMultipartUpload`, and `s3:DeleteObject` for lock and probe objects
+(`*/.lock`, `*/.metadata-probe`, `*/.metadata-probe-multipart`).
 Removing partial backups is a manual operator task.
 
 When locking is enabled, the service must support conditional create on PUT and preserve user metadata.
 By default, locks use `If-None-Match: *`; for Tencent COS,
 `--lock-detection-mode x-cos-forbid-overwrite` selects COS's `x-cos-forbid-overwrite: true` header
-(not effective on versioning-enabled buckets). Each backup checks the selected lock mode and metadata
-with a probe object under `<prefix>/.snapshot-to-s3-probes/` and deletes it afterwards. A lifecycle
-rule that aborts incomplete multipart uploads is recommended.
+(not effective on versioning-enabled buckets). Lock acquisition checks the selected condition.
+Metadata probing happens afterwards, inside the backup prefix next to `.lock`; see
+[storage.md](docs/storage.md#lock-and-commit-protocol). A lifecycle rule that aborts incomplete multipart
+uploads is recommended.
 
-`--lock-detection-mode dangerously-skip` disables the lock and its capability probe; it is unsafe if
+`--lock-detection-mode dangerously-skip` disables the lock and its condition verification; it is unsafe if
 another writer can back up the same prefix concurrently. Metadata probing and the empty-prefix check
 still run.
 

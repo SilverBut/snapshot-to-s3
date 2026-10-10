@@ -27,8 +27,8 @@ backup or a matching local snapshot.
 | `model.rs` | Names, object layout, `StreamIndex` / `BackupMetadata` |
 | `backup/` | Backup job and failure recovery (`mod.rs`), base selection (`selection.rs`), upload pipeline (`pipeline.rs`) |
 | `restore/` | Planning (`prepare.rs`), authentication (`verify.rs`), replay (`mod.rs`) |
-| `store/` | `ObjectStore` trait, writer lock, bounded multipart upload, chained object reads |
-| `s3/` | `ObjectStore` over HTTP: SigV4, credentials, retries, throughput guard, capability probe |
+| `store/` | `ObjectStore` trait, writer lock, metadata probe, bounded multipart upload, chained object reads |
+| `s3/` | `ObjectStore` over HTTP: SigV4, credentials, retries, throughput guard |
 | `crypto/` | Streaming AEAD, GPG key wrapping, key checksum |
 | `zfs/` | `Zfs` trait and its `zfs`/`zpool` command implementation |
 | `process.rs`, `rate.rs` | Bounded child-process I/O; ciphertext rate limiting |
@@ -64,7 +64,8 @@ Mutating commands are checked by exit status. Test harnesses can point `SNAPSHOT
 ## Errors
 
 * Backup succeeds only if `zfs send`, encryption and every upload succeed and the commit is confirmed.
-  A failure to delete the lock after commit is reported separately.
+  A failure to delete the lock after commit is reported separately. Metadata damage on an otherwise
+  confirmed commit is a repairable failure: retain objects and log, release the lock, exit nonzero.
 * Restore succeeds only if every replayed stream is fully authenticated and `zfs receive` succeeds.
   An authentication failure is never treated as end of stream.
 * Unknown outcomes (an upload whose initiation or completion may have been applied) are reported as
@@ -82,6 +83,7 @@ Mutating commands are checked by exit status. Test harnesses can point `SNAPSHOT
 | Corruption or truncation after a valid prefix | `tests/crypto_stream.rs`; `tests/workflow.rs::corrupt_stream_tail_stops_export` |
 | Send, encryption, part, log or continuation failure | `tests/workflow.rs` failure scenarios; `store::multipart` tests |
 | Concurrent writers, existing content | `store::lock` tests; `tests/live_http.rs` (opt-in, real S3) |
+| Provider drops metadata or adds extra fields | `store::probe` tests; `tests/http_store/operations.rs`; `tests/workflow.rs` metadata-loss scenarios |
 | Unknown completion, lost completion response | `tests/workflow.rs`; `store::multipart::completion_response_loss_requires_matching_object` |
 | Receive failure mid-chain | `tests/workflow.rs::incremental_chain_stops_at_receive_failure_and_tampering` |
 | Bounded memory, retries, service limits | `store::multipart::generated_large_stream_has_fixed_buffer_budget`; `tests/http_store/`; `tests/rate_limit.rs` |
