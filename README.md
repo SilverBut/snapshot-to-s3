@@ -4,8 +4,8 @@ Stream encrypted ZFS filesystem snapshots to S3-compatible object storage, and r
 
 * Raw `zfs send -w` full or incremental streams; the incremental base is chosen automatically.
 * Streaming AEAD (Tink-compatible `AES128_GCM_HKDF_1MB`) with a fresh key per backup, wrapped by GPG.
-* Plaintext and keys stay in memory and pipes: no temporary files, and memory does not grow with the
-  stream size. One backup may be up to about 4 PiB (see [Limits](#limits-and-resource-use)).
+* Plaintext and keys stay in memory and pipes and never touch disk; memory does not grow with the
+  stream size. Ciphertext parts can optionally be spooled to a temp file (`--part-temp-file`). One backup may be up to about 4 PiB (see [Limits](#limits-and-resource-use)).
 * An atomic per-backup lock; existing or partial backups are never overwritten.
 * Restore authenticates every required backup before replaying the chain into `zfs receive -u`, or
   exports one stream to stdout.
@@ -37,8 +37,9 @@ The backup is written under `s3://bucket/backups/pool/dataset/snap/`. The snapsh
 | `--rate-limit BYTES_PER_SEC` | Limit ciphertext throughput |
 | `--force-overwrite` | Delete any existing backup objects under the destination prefix and write anew. Destructive; the exclusive writer lock is still required and never bypassed |
 | `--progress [tty\|SECONDS\|off]` | Progress on stderr (size, elapsed time, speed). `tty` is a live line, a number prints one line per that many seconds; default and bare flag use `tty` on a terminal, else every 10 s. Also accepted by `restore`; never writes to stdout |
-| `--part-buffer-size` | Largest part held in memory (default 128 MiB) |
-| `--min-part-size` (default 100 MiB), `--max-part-size`, `--max-parts`, `--max-object-size` | Multipart limits (maximums default to AWS S3); lower `--min-part-size` for services that allow smaller parts |
+| `--max-part-size` | Largest part (default 512 MiB). Also the memory, or temp-file, held for the part being uploaded; must not exceed the provider limit (5 GiB on AWS) |
+| `--part-temp-file PATH` | Hold each ciphertext part in this file instead of memory, so large parts fit small-memory hosts. The path must not exist; it is created with mode 0600 and removed afterwards |
+| `--min-part-size` (default 100 MiB), `--max-parts`, `--max-object-size` | Multipart limits (maximums default to AWS S3); lower `--min-part-size` for services that allow smaller parts |
 
 Diagnostics: set `RUST_LOG` (for example `RUST_LOG=debug`) for logs of external commands, S3 requests and
 upload steps. Logs go to stderr only (default level `warn`), so `restore ... stdout:` output stays clean.
@@ -117,12 +118,12 @@ still run.
 
 ## Limits and resource use
 
-* **Memory** is bounded and independent of the stream size. Backup holds one part buffer
-  (`--part-buffer-size`) plus 2 MiB and 64 KiB pipes; restore holds a 2 MiB pipe and 1 MiB segments.
+* **Memory** is bounded and independent of the stream size. Backup holds one part of at most
+  `--max-part-size` (in memory, or on disk with `--part-temp-file`) plus 2 MiB and 64 KiB pipes; restore holds a 2 MiB pipe and 1 MiB segments.
   Command output and small objects are read with fixed caps.
 * **Size**: a stream larger than one object continues in further objects of at most `--max-parts` ×
-  part size bytes (1.25 TiB with the defaults; raise `--part-buffer-size` for fewer, larger objects, up to
-  5 TiB each on AWS). Up to 1,000,000 objects per backup are allowed; the encryption format allows about
+  part size bytes (512 MiB × 10,000 = 5000 GiB with the defaults). Parts are sized from the send estimate
+  plus 25% headroom; if that exceeds one object, a warning suggests a larger `--max-part-size`. Up to 1,000,000 objects per backup are allowed; the encryption format allows about
   4 PiB per backup.
 * GET downloads resume from the current offset after transient failures; uploads retry identical part
   bytes. Retries are per object.

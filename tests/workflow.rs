@@ -8,7 +8,7 @@ use snapshot_to_s3::backup::{backup, backup_without_lock, BackupOptions};
 use snapshot_to_s3::crypto;
 use snapshot_to_s3::model::{S3Location, SnapshotName};
 use snapshot_to_s3::restore::{restore, RestoreOptions};
-use snapshot_to_s3::store::{ObjectStore, UploadLimits};
+use snapshot_to_s3::store::{ObjectStore, PartStorage, UploadLimits};
 use snapshot_to_s3::testing::{FakeZfs, MemoryStore};
 use std::process::Command;
 use std::sync::Arc;
@@ -155,6 +155,7 @@ async fn backup_and_restore_workflows() {
     incremental_chain_stops_at_receive_failure_and_tampering(&fingerprint).await;
     corrupt_stream_tail_stops_export(&fingerprint).await;
     multi_object_stream_round_trip(&fingerprint).await;
+    temp_file_parts_round_trip(&fingerprint).await;
     continuation_failure_aborts_without_commit(&fingerprint).await;
     std::env::remove_var("GNUPGHOME");
 }
@@ -452,7 +453,7 @@ fn one_mib_objects(fingerprint: &str) -> BackupOptions {
         max_part_size: 1024 * 1024,
         max_parts: 2,
         max_object_size: 1024 * 1024,
-        buffer_limit: 512 * 1024,
+        part_storage: Default::default(),
     };
     options
 }
@@ -461,6 +462,31 @@ fn three_mib_source() -> FakeZfs {
     let mut zfs = FakeZfs::new();
     zfs.send_bytes = (0..3 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect();
     zfs
+}
+
+async fn temp_file_parts_round_trip(fingerprint: &str) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("part.tmp");
+    let store = Arc::new(MemoryStore::default());
+    let source = three_mib_source();
+    let expected = source.send_bytes.clone();
+    let mut options = one_mib_objects(fingerprint);
+    options.limits.part_storage = PartStorage::TempFile(path.clone());
+    let result = backup(store.clone(), Arc::new(source), options)
+        .await
+        .unwrap();
+    assert_eq!(result.stream_objects, 4);
+    assert!(!path.exists(), "part temp file must be removed");
+    let mut stdout = Vec::new();
+    restore(
+        store,
+        Arc::new(FakeZfs::new()),
+        restore_options(fingerprint, "s1", None),
+        &mut stdout,
+    )
+    .await
+    .unwrap();
+    assert!(stdout == expected, "temp-file part restore differs");
 }
 
 async fn multi_object_stream_round_trip(fingerprint: &str) {

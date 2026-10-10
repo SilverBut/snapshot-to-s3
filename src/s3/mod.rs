@@ -18,6 +18,7 @@ pub use policy::HttpPolicy;
 pub use probe::PROBE_NAMESPACE;
 
 use crate::model::MetadataMap;
+use crate::store::FilePart;
 use anyhow::{bail, Context, Result};
 use bytes::Bytes;
 use chrono::Utc;
@@ -25,6 +26,7 @@ use credentials::Credentials;
 use error::HttpStatusFailure;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use reqwest::{Method, Response, Url};
+use sha2::{Digest, Sha256};
 use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -178,20 +180,38 @@ impl HttpStore {
         method: Method,
         key: &str,
         query: &[(String, String)],
-        mut headers: HeaderMap,
+        headers: HeaderMap,
         body: Bytes,
     ) -> Result<Response> {
+        self.send_signed_body(method, key, query, headers, RequestBody::Bytes(body))
+            .await
+    }
+
+    /// [`Self::send_signed`] for a body in memory or in the part temporary file.
+    async fn send_signed_body(
+        &self,
+        method: Method,
+        key: &str,
+        query: &[(String, String)],
+        mut headers: HeaderMap,
+        body: RequestBody,
+    ) -> Result<Response> {
         let url = self.object_url(key, query)?;
-        tracing::debug!(%method, %key, body_bytes = body.len(), "S3 request");
+        let body_len = body.len();
+        tracing::debug!(%method, %key, body_bytes = body_len, "S3 request");
         let scope = sigv4::Scope {
             region: &self.config.region,
             service: &self.config.signing_service,
+        };
+        let payload_sha256 = match &body {
+            RequestBody::Bytes(bytes) => Sha256::digest(bytes).into(),
+            RequestBody::File(part) => part.sha256(),
         };
         sigv4::sign(
             &mut headers,
             &method,
             &url,
-            &body,
+            payload_sha256,
             &self.credentials,
             &scope,
             Utc::now(),
@@ -206,9 +226,14 @@ impl HttpStore {
         }
         let progress = Arc::new(AtomicU64::new(0));
         if transfer_body {
-            request = request.header(reqwest::header::CONTENT_LENGTH, body.len());
-            if !body.is_empty() {
-                request = request.body(counted_body(body, progress.clone()));
+            request = request.header(reqwest::header::CONTENT_LENGTH, body_len);
+            if body_len > 0 {
+                request = request.body(match body {
+                    RequestBody::Bytes(bytes) => counted_body(bytes, progress.clone()),
+                    RequestBody::File(part) => {
+                        counted_file_body(part.reader().await?, progress.clone())
+                    }
+                });
             }
         }
         let started = std::time::Instant::now();
@@ -342,6 +367,38 @@ fn normalize_metadata_prefix(prefix: &str) -> Result<String> {
         bail!("metadata_prefix must be a valid HTTP header-name prefix");
     }
     Ok(prefix)
+}
+
+/// A request body in memory or in the part temporary file.
+pub(super) enum RequestBody {
+    Bytes(Bytes),
+    File(FilePart),
+}
+
+impl RequestBody {
+    fn len(&self) -> u64 {
+        match self {
+            Self::Bytes(bytes) => bytes.len() as u64,
+            Self::File(part) => part.len(),
+        }
+    }
+}
+
+/// Streams a part from the part temporary file, counting bytes handed to
+/// the connection.
+fn counted_file_body(
+    reader: impl tokio::io::AsyncRead + Send + Sync + Unpin + 'static,
+    progress: Arc<AtomicU64>,
+) -> reqwest::Body {
+    use futures_util::StreamExt;
+    let stream =
+        tokio_util::io::ReaderStream::with_capacity(reader, UPLOAD_CHUNK_BYTES).map(move |chunk| {
+            if let Ok(chunk) = &chunk {
+                progress.fetch_add(chunk.len() as u64, Ordering::Relaxed);
+            }
+            chunk
+        });
+    reqwest::Body::wrap_stream(stream)
 }
 
 /// A streamed request body that counts bytes handed to the connection.

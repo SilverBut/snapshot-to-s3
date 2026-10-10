@@ -352,13 +352,13 @@ fn backup_log(
 ) -> String {
     let mut log = format!(
         "source={}\nsnapshot-guid={}\nmode={}\nciphertext-bytes={}\nstream-objects={}\n\
-         peak-part-buffer={}\nproducers-and-parts=succeeded\ncommit=pending\n",
+         peak-part-bytes={}\nproducers-and-parts=succeeded\ncommit=pending\n",
         options.source,
         current.guid,
         if incremental { "incremental" } else { "full" },
         stream.bytes,
         stream.objects,
-        stream.peak_buffer_bytes
+        stream.peak_part_bytes
     );
     for diagnostic in diagnostics {
         if log.len() + diagnostic.len() + 1 > LOG_LIMIT - 64 {
@@ -397,12 +397,12 @@ mod tests {
                 head: UploadedParts {
                     parts: Vec::new(),
                     bytes: 123_456,
-                    peak_buffer_bytes: 65_536,
+                    peak_part_bytes: 65_536,
                     ended: true,
                 },
                 objects: 3,
                 bytes: 123_456,
-                peak_buffer_bytes: 65_536,
+                peak_part_bytes: 65_536,
             },
         )
     }
@@ -411,7 +411,7 @@ mod tests {
     fn backup_log_text_and_diagnostic_limit_are_exact() {
         let (options, current, stream) = log_inputs();
         let base = "source=pool/data@s1\nsnapshot-guid=guid-current\nmode=incremental\n\
-                     ciphertext-bytes=123456\nstream-objects=3\npeak-part-buffer=65536\n\
+                     ciphertext-bytes=123456\nstream-objects=3\npeak-part-bytes=65536\n\
                      producers-and-parts=succeeded\ncommit=pending\n";
         let plain = backup_log(&options, &current, true, &stream, &[]);
         assert_eq!(plain, base);

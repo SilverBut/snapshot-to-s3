@@ -5,7 +5,7 @@ use crate::model::{validate_dataset, S3Location, SnapshotName};
 use crate::progress::{Mode, Reporter};
 use crate::restore::{restore, RestoreOptions};
 use crate::s3::{HttpConfig, HttpStore, LockDetectionMode};
-use crate::store::UploadLimits;
+use crate::store::{PartStorage, UploadLimits};
 use crate::zfs::SystemZfs;
 use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
@@ -97,11 +97,13 @@ struct ProgressArgs {
 
 #[derive(Args)]
 struct PartArgs {
-    /// Provider minimum size of every part but the last
+    /// Smallest part (every part but the last); parts are sized
+    /// automatically between this and --max-part-size
     #[arg(long, default_value_t = 100 * 1024 * 1024)]
     min_part_size: u64,
-    /// Provider maximum part size
-    #[arg(long, default_value_t = 5 * 1024 * 1024 * 1024)]
+    /// Largest part, which is also the most memory (or temporary file space)
+    /// one part uses; must not exceed the provider limit (5 GiB on AWS)
+    #[arg(long, default_value_t = 512 * 1024 * 1024)]
     max_part_size: u64,
     /// Provider maximum parts per object
     #[arg(long, default_value_t = 10_000)]
@@ -109,9 +111,11 @@ struct PartArgs {
     /// Largest object; longer streams continue in further objects
     #[arg(long, default_value_t = 5 * 1024 * 1024 * 1024 * 1024)]
     max_object_size: u64,
-    /// Largest part held in memory
-    #[arg(long, default_value_t = 128 * 1024 * 1024)]
-    part_buffer_size: u64,
+    /// Hold each part in this file instead of memory; the path must not exist.
+    /// It is created with mode 0600, holds only ciphertext and is deleted
+    /// afterwards
+    #[arg(long, value_name = "PATH")]
+    part_temp_file: Option<std::path::PathBuf>,
 }
 
 #[derive(Args)]
@@ -162,7 +166,10 @@ impl PartArgs {
             max_part_size: self.max_part_size,
             max_parts: self.max_parts,
             max_object_size: self.max_object_size,
-            buffer_limit: self.part_buffer_size,
+            part_storage: match &self.part_temp_file {
+                Some(path) => PartStorage::TempFile(path.clone()),
+                None => PartStorage::Memory,
+            },
         }
     }
 }

@@ -4,10 +4,12 @@
 mod chain;
 mod lock;
 mod multipart;
+mod part;
 
 pub use chain::{read_chain, ObjectRange};
 pub use lock::HeldLock;
 pub use multipart::{confirm_commit, upload_object, upload_parts, UploadLimits, UploadedParts};
+pub use part::{FilePart, PartBody, PartStorage};
 
 use crate::model::{MetadataMap, Reader};
 use anyhow::{bail, Result};
@@ -49,6 +51,18 @@ pub trait ObjectStore: Send + Sync {
         number: u32,
         data: Bytes,
     ) -> Result<String>;
+    /// Uploads one part from memory or the part temporary file. The default
+    /// reads a file part into memory; stores should stream it instead.
+    async fn upload_part_body(
+        &self,
+        key: &str,
+        upload: &str,
+        number: u32,
+        body: PartBody,
+    ) -> Result<String> {
+        let data = body.into_bytes().await?;
+        self.upload_part(key, upload, number, data).await
+    }
     async fn complete_upload(&self, key: &str, upload: &str, parts: &[Part]) -> Result<()>;
     async fn abort_upload(&self, key: &str, upload: &str) -> Result<()>;
 

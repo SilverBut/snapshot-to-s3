@@ -1,9 +1,9 @@
 //! [`ObjectStore`] operations over the S3 REST API.
 
 use super::error::{is_file_already_exists, xml_root_name, HttpStatusFailure};
-use super::{is_definite_rejection, is_retryable, HttpStore, LockDetectionMode};
+use super::{is_definite_rejection, is_retryable, HttpStore, LockDetectionMode, RequestBody};
 use crate::model::{MetadataMap, Reader};
-use crate::store::{ObjectHead, ObjectStore, Part};
+use crate::store::{ObjectHead, ObjectStore, Part, PartBody};
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -35,6 +35,38 @@ struct ListContentXml {
 struct CreateMultipartXml {
     #[serde(rename = "UploadId")]
     upload_id: String,
+}
+
+impl HttpStore {
+    async fn put_part(
+        &self,
+        key: &str,
+        upload: &str,
+        number: u32,
+        body: RequestBody,
+    ) -> Result<String> {
+        if !(1..=MAX_PART_NUMBER).contains(&number) {
+            bail!("multipart part number must be between 1 and 10000");
+        }
+        let query = [
+            ("partNumber".to_owned(), number.to_string()),
+            ("uploadId".to_owned(), upload.to_owned()),
+        ];
+        let response = self
+            .send_signed_body(Method::PUT, key, &query, HeaderMap::new(), body)
+            .await
+            .with_context(|| format!("upload multipart part {number}"))?;
+        let response = self
+            .require_success("upload multipart part", response)
+            .await?;
+        response
+            .headers()
+            .get(ETAG)
+            .context("UploadPart response omitted ETag")?
+            .to_str()
+            .context("invalid UploadPart ETag")
+            .map(str::to_owned)
+    }
 }
 
 #[async_trait]
@@ -192,27 +224,22 @@ impl ObjectStore for HttpStore {
         number: u32,
         data: Bytes,
     ) -> Result<String> {
-        if !(1..=MAX_PART_NUMBER).contains(&number) {
-            bail!("multipart part number must be between 1 and 10000");
-        }
-        let query = [
-            ("partNumber".to_owned(), number.to_string()),
-            ("uploadId".to_owned(), upload.to_owned()),
-        ];
-        let response = self
-            .send_signed(Method::PUT, key, &query, HeaderMap::new(), data)
+        self.put_part(key, upload, number, RequestBody::Bytes(data))
             .await
-            .with_context(|| format!("upload multipart part {number}"))?;
-        let response = self
-            .require_success("upload multipart part", response)
-            .await?;
-        response
-            .headers()
-            .get(ETAG)
-            .context("UploadPart response omitted ETag")?
-            .to_str()
-            .context("invalid UploadPart ETag")
-            .map(str::to_owned)
+    }
+
+    async fn upload_part_body(
+        &self,
+        key: &str,
+        upload: &str,
+        number: u32,
+        body: PartBody,
+    ) -> Result<String> {
+        let body = match body {
+            PartBody::Memory(bytes) => RequestBody::Bytes(bytes),
+            PartBody::File(part) => RequestBody::File(part),
+        };
+        self.put_part(key, upload, number, body).await
     }
 
     async fn complete_upload(&self, key: &str, upload: &str, parts: &[Part]) -> Result<()> {
