@@ -46,7 +46,7 @@ jobs:
         run: python3 -m scripts.release.publish select --mode "$MODE"
 
   build:
-    name: Build and verify frozen musl archive
+    name: Build and verify frozen musl binary
     needs: select
     if: needs.select.outputs.action == 'build'
     runs-on: ubuntu-26.04
@@ -63,7 +63,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --yes --no-install-recommends musl-tools binutils
-      - name: Build, check CLI version/static linkage and package
+      - name: Build, check CLI version/static linkage and stage binary
         env:
           EXPECTED_VERSION: ${{ needs.select.outputs.version }}
         run: |
@@ -76,8 +76,8 @@ jobs:
             exit 1
           fi
           mkdir dist
-          tar -czf dist/snapshot-to-s3-linux-x86_64.tar.gz -C "$(dirname "$binary")" snapshot-to-s3
-          (cd dist && sha256sum snapshot-to-s3-linux-x86_64.tar.gz > SHA256SUMS)
+          install -m 0755 "$binary" dist/snapshot-to-s3-linux-x86_64
+          (cd dist && sha256sum snapshot-to-s3-linux-x86_64 > SHA256SUMS)
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: frozen-release-${{ needs.select.outputs.sha }}
