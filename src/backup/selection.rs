@@ -57,7 +57,18 @@ pub async fn select_base(
         let Some(head) = store.head(&location.stream_key(&snapshot.name)).await? else {
             continue;
         };
-        let index = StreamIndex::from_metadata(&head.metadata)?;
+        let index = match StreamIndex::from_metadata(&head.metadata) {
+            Ok(index) => index,
+            Err(error) => {
+                let diagnostic = format!(
+                    "exclude {}: invalid remote metadata: {error:#}",
+                    snapshot.name
+                );
+                tracing::warn!("{diagnostic}");
+                diagnostics.push(diagnostic);
+                continue;
+            }
+        };
         if index.current_snapshot_id != snapshot.guid || index.vol_id != current.volume_guid {
             diagnostics.push(format!("exclude {}: remote GUID mismatch", snapshot.name));
             continue;

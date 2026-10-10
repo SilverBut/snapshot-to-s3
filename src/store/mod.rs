@@ -5,11 +5,15 @@ mod chain;
 mod lock;
 mod multipart;
 mod part;
+mod probe;
 
 pub use chain::{read_chain, ObjectRange};
 pub use lock::HeldLock;
-pub use multipart::{confirm_commit, upload_object, upload_parts, UploadLimits, UploadedParts};
+pub use multipart::{
+    confirm_commit, upload_object, upload_parts, CommitConfirmation, UploadLimits, UploadedParts,
+};
 pub use part::{FilePart, PartBody, PartStorage};
+pub use probe::probe_metadata;
 
 use crate::model::{MetadataMap, Reader};
 use anyhow::{bail, Result};

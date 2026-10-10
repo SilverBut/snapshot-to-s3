@@ -1,0 +1,106 @@
+//! Metadata preservation checks, run under the backup lock before any backup objects are written.
+
+use super::{confirm_commit, CommitConfirmation, ObjectStore, Part};
+use crate::model::{object, MetadataMap, StreamIndex};
+use anyhow::{bail, Context, Result};
+use bytes::Bytes;
+
+pub async fn probe_metadata(
+    store: &dyn ObjectStore,
+    prefix: &str,
+    stream_key: &str,
+    multipart: bool,
+) -> Result<()> {
+    let metadata = StreamIndex {
+        gpg_key_id: "0123456789ABCDEF0123456789ABCDEF01234567".into(),
+        fs_type: "zfs".into(),
+        vol_id: "18446744073709551615".into(),
+        current_snapshot_id: "18446744073709551614".into(),
+        base_snapshot_id: Some("18446744073709551613".into()),
+        base_object_key: Some(stream_key.into()),
+    }
+    .to_metadata()?;
+    let key = format!("{prefix}{}", object::METADATA_PROBE);
+    let data = Bytes::from_static(b"snapshot-to-s3 capability probe");
+    let result = async {
+        store.put(&key, data.clone(), &metadata).await?;
+        confirm_metadata(store, &key, &metadata, data.len() as u64).await
+    }
+    .await;
+    with_cleanup(result, store.delete(&key).await)?;
+    if multipart {
+        probe_multipart(store, prefix, data, &metadata).await?;
+    }
+    Ok(())
+}
+
+async fn probe_multipart(
+    store: &dyn ObjectStore,
+    prefix: &str,
+    data: Bytes,
+    metadata: &MetadataMap,
+) -> Result<()> {
+    let key = format!("{prefix}{}", object::METADATA_PROBE_MULTIPART);
+    let mut upload = None;
+    let result = async {
+        let id = store.create_upload(&key, metadata).await?;
+        upload = Some(id.clone());
+        let etag = store.upload_part(&key, &id, 1, data.clone()).await?;
+        let completed = store
+            .complete_upload(&key, &id, &[Part { number: 1, etag }])
+            .await;
+        // Preserve the completion error, even if confirmation also fails.
+        let confirmation = confirm_metadata(store, &key, metadata, data.len() as u64).await;
+        match (completed, confirmation) {
+            (Ok(()), result) => result,
+            (Err(error), Ok(())) => {
+                tracing::warn!("metadata probe completion response lost: {error:#}");
+                Ok(())
+            }
+            (Err(error), Err(confirmation)) => Err(error.context(format!(
+                "metadata probe confirmation also failed: {confirmation:#}"
+            ))),
+        }
+    }
+    .await;
+    let result = if result.is_err() {
+        match upload {
+            Some(id) => with_cleanup(result, store.abort_upload(&key, &id).await),
+            None => result.context(
+                "metadata probe initiation failed; upload outcome may be unknown, inspect multipart uploads",
+            ),
+        }
+    } else {
+        result
+    };
+    with_cleanup(result, store.delete(&key).await)
+}
+
+async fn confirm_metadata(
+    store: &dyn ObjectStore,
+    key: &str,
+    metadata: &MetadataMap,
+    size: u64,
+) -> Result<()> {
+    match confirm_commit(store, key, metadata, size).await? {
+        CommitConfirmation::Committed => Ok(()),
+        CommitConfirmation::Absent => bail!("metadata capability probe object absent: {key}"),
+        CommitConfirmation::CommittedMetadataMismatch { found, mismatch } => bail!(
+            "S3 endpoint did not preserve configured metadata on {key}: \
+             missing={:?}, wrong={:?}, expected={metadata:?}, found={found:?}",
+            mismatch.missing,
+            mismatch.wrong
+        ),
+    }
+}
+
+fn with_cleanup(result: Result<()>, cleanup: Result<()>) -> Result<()> {
+    match (result, cleanup) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(()), Err(error)) => Err(error.context("metadata capability probe cleanup failed")),
+        (Err(error), Err(cleanup)) => {
+            Err(error.context(format!("metadata capability probe cleanup also failed: {cleanup:#}")))
+        }
+    }
+}

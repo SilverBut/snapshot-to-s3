@@ -9,13 +9,11 @@ mod error;
 mod get;
 mod object_store;
 mod policy;
-mod probe;
 mod sigv4;
 mod throughput;
 
 pub use error::{is_definite_rejection, is_retryable};
 pub use policy::HttpPolicy;
-pub use probe::PROBE_NAMESPACE;
 
 use crate::model::MetadataMap;
 use crate::store::FilePart;

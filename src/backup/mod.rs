@@ -12,9 +12,13 @@ mod selection;
 
 use crate::crypto;
 use crate::model::{
-    object, BackupMetadata, MetadataMap, S3Location, SnapshotName, StreamIndex, LOG_LIMIT,
+    object, BackupMetadata, MetadataMap, MetadataMismatch, S3Location, SnapshotName, StreamIndex,
+    LOG_LIMIT,
 };
-use crate::store::{confirm_commit, HeldLock, ObjectStore, UploadLimits, UploadedParts};
+use crate::store::{
+    confirm_commit, probe_metadata, CommitConfirmation, HeldLock, ObjectStore, UploadLimits,
+    UploadedParts,
+};
 use crate::zfs::{SnapshotInfo, Zfs};
 use anyhow::{bail, ensure, Context, Error, Result};
 use bytes::Bytes;
@@ -34,6 +38,8 @@ pub struct BackupOptions {
     /// Delete any existing objects under the backup prefix (except the held
     /// lock) instead of refusing. Never bypasses the writer lock.
     pub force_overwrite: bool,
+    /// Also check metadata preservation through a small multipart upload.
+    pub probe_metadata_multipart: bool,
     /// Ciphertext bytes per second.
     pub rate_limit: Option<u64>,
     pub limits: UploadLimits,
@@ -48,6 +54,28 @@ pub struct BackupResult {
     /// `stream.encrypted` plus its continuation objects.
     pub stream_objects: u32,
 }
+
+#[derive(Debug)]
+pub struct StreamMetadataMismatch {
+    pub stream_key: String,
+    pub expected: MetadataMap,
+    pub found: MetadataMap,
+    pub mismatch: MetadataMismatch,
+}
+
+impl std::fmt::Display for StreamMetadataMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "backup committed, stream metadata missing or wrong: {}; missing={:?}, wrong={:?}; \
+             expected metadata is recorded in backup.log.encrypted; repair the object metadata \
+             before using this backup",
+            self.stream_key, self.mismatch.missing, self.mismatch.wrong
+        )
+    }
+}
+
+impl std::error::Error for StreamMetadataMismatch {}
 
 pub async fn backup(
     store: Arc<dyn ObjectStore>,
@@ -114,13 +142,15 @@ enum Upload {
     Open(String),
     /// Completion was sent; the stream may be published.
     CompletionUnknown(String),
+    /// Publication and size confirmed, even if the metadata needs repair.
+    Committed,
 }
 
 impl Upload {
     fn id(&self) -> Option<&str> {
         match self {
             Self::Open(id) | Self::CompletionUnknown(id) => Some(id),
-            Self::NotStarted | Self::InitiationUnknown => None,
+            Self::NotStarted | Self::InitiationUnknown | Self::Committed => None,
         }
     }
 }
@@ -150,6 +180,13 @@ impl Job<'_> {
                 None => HeldLock::ensure_prefix_empty(self.store, &self.prefix).await?,
             }
         }
+        probe_metadata(
+            self.store,
+            &self.prefix,
+            &self.stream_key,
+            options.probe_metadata_multipart,
+        )
+        .await?;
         let selected = select_base(
             self.store,
             zfs,
@@ -202,8 +239,10 @@ impl Job<'_> {
             current,
             base.is_some(),
             &stream,
+            &index,
             &selected.diagnostics,
         );
+        ensure!(log.len() <= LOG_LIMIT, "backup metadata exceeds log size limit");
         self.put(
             object::LOG,
             crypto::encrypt_small(&key, log.as_bytes()).await?,
@@ -259,7 +298,8 @@ impl Job<'_> {
             .err()
             .is_some_and(|error| self.store.is_definite_rejection(error));
         match confirm_commit(self.store, &self.stream_key, index, parts.bytes).await {
-            Ok(true) => {
+            Ok(CommitConfirmation::Committed) => {
+                self.upload = Upload::Committed;
                 if let Err(error) = completed {
                     tracing::warn!(
                         "completion response failed, but committed object metadata and \
@@ -268,14 +308,27 @@ impl Job<'_> {
                 }
                 Ok(())
             }
-            Ok(false) if rejected => {
+            Ok(CommitConfirmation::CommittedMetadataMismatch { found, mismatch }) => {
+                self.upload = Upload::Committed;
+                if let Err(error) = completed {
+                    tracing::warn!("stream published despite completion response failure: {error:#}");
+                }
+                Err(StreamMetadataMismatch {
+                    stream_key: self.stream_key.clone(),
+                    expected: index.clone(),
+                    found,
+                    mismatch,
+                }
+                .into())
+            }
+            Ok(CommitConfirmation::Absent) if rejected => {
                 self.upload = Upload::Open(upload_id);
                 let error = completed
                     .err()
                     .context("inconsistent completion rejection classification")?;
                 Err(error).context("multipart completion was definitively rejected")
             }
-            Ok(false) => bail!(
+            Ok(CommitConfirmation::Absent) => bail!(
                 "commit outcome unknown: stream absent after completion; {}; \
                  completion={completed:?}",
                 completion_lock_status(lock)
@@ -291,6 +344,17 @@ impl Job<'_> {
     /// Aborts an open upload and releases the lock when no upload can still
     /// publish the stream; otherwise keeps the lock for manual recovery.
     async fn recover(&self, lock: Option<&HeldLock>, error: Error) -> Error {
+        if matches!(self.upload, Upload::Committed) {
+            return match lock {
+                Some(lock) => match lock.release(self.store).await {
+                    Ok(()) => error,
+                    Err(cleanup) => error.context(format!(
+                        "backup committed, lock cleanup failed: {cleanup:#}"
+                    )),
+                },
+                None => error,
+            };
+        }
         let upload_id = self.upload.id();
         let lock_status = lock_status(lock);
         let stopped = match &self.upload {
@@ -308,6 +372,7 @@ impl Job<'_> {
             },
             Upload::InitiationUnknown => false,
             Upload::NotStarted => true,
+            Upload::Committed => unreachable!("committed uploads handled above"),
         };
         match self.store.list(&self.prefix).await {
             Ok(objects) => tracing::warn!("residual objects: {objects:?}"),
@@ -348,6 +413,7 @@ fn backup_log(
     current: &SnapshotInfo,
     incremental: bool,
     stream: &UploadedStream,
+    metadata: &MetadataMap,
     diagnostics: &[String],
 ) -> String {
     let mut log = format!(
@@ -360,6 +426,9 @@ fn backup_log(
         stream.objects,
         stream.peak_part_bytes
     );
+    for (name, value) in metadata {
+        log.push_str(&format!("stream-metadata.{name}={value}\n"));
+    }
     for diagnostic in diagnostics {
         if log.len() + diagnostic.len() + 1 > LOG_LIMIT - 64 {
             log.push_str("diagnostics-truncated=true\n");

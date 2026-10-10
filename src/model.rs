@@ -9,10 +9,46 @@ use std::fmt;
 pub type MetadataMap = BTreeMap<String, String>;
 pub type Reader = Box<dyn tokio::io::AsyncRead + Unpin + Send>;
 
+/// Stream-index keys, without the provider's metadata header prefix.
+pub mod metadata_field {
+    pub const GPG_KEY_ID: &str = "gpg-key-id";
+    pub const FS_TYPE: &str = "fs-type";
+    pub const VOL_ID: &str = "vol-id";
+    pub const CURRENT_SNAPSHOT_ID: &str = "current-snapshot-id";
+    pub const BASE_SNAPSHOT_ID: &str = "base-snapshot-id";
+    pub const BASE_OBJECT_KEY: &str = "base-object-key";
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MetadataMismatch {
+    pub missing: Vec<String>,
+    pub wrong: Vec<String>,
+}
+
+impl MetadataMismatch {
+    pub fn between(expected: &MetadataMap, actual: &MetadataMap) -> Self {
+        let mut mismatch = Self::default();
+        for (name, value) in expected {
+            match actual.get(name) {
+                None => mismatch.missing.push(name.clone()),
+                Some(found) if found != value => mismatch.wrong.push(name.clone()),
+                Some(_) => (),
+            }
+        }
+        mismatch
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.missing.is_empty() && self.wrong.is_empty()
+    }
+}
+
 /// Object names inside one backup prefix, `<prefix>/<dataset>/<snapshot>/`.
 pub mod object {
     /// Writer lock; present only while a backup is running or unresolved.
     pub const LOCK: &str = ".lock";
+    pub const METADATA_PROBE: &str = ".metadata-probe";
+    pub const METADATA_PROBE_MULTIPART: &str = ".metadata-probe-multipart";
     /// Per-backup data key, encrypted to the GPG recipient.
     pub const WRAPPED_KEY: &str = "key.gpg";
     /// Hex SHA-256 of the data key.
@@ -203,18 +239,19 @@ impl StreamIndex {
 
     /// Reads and validates the index from stream object metadata.
     pub fn from_metadata(map: &MetadataMap) -> Result<Self> {
+        use metadata_field::*;
         let required = |name: &str| {
             map.get(name)
                 .cloned()
                 .with_context(|| format!("missing metadata: {name}"))
         };
         let index = Self {
-            gpg_key_id: required("gpg-key-id")?,
-            fs_type: required("fs-type")?,
-            vol_id: required("vol-id")?,
-            current_snapshot_id: required("current-snapshot-id")?,
-            base_snapshot_id: map.get("base-snapshot-id").cloned(),
-            base_object_key: map.get("base-object-key").cloned(),
+            gpg_key_id: required(GPG_KEY_ID)?,
+            fs_type: required(FS_TYPE)?,
+            vol_id: required(VOL_ID)?,
+            current_snapshot_id: required(CURRENT_SNAPSHOT_ID)?,
+            base_snapshot_id: map.get(BASE_SNAPSHOT_ID).cloned(),
+            base_object_key: map.get(BASE_OBJECT_KEY).cloned(),
         };
         index.validate()?;
         Ok(index)
@@ -222,19 +259,20 @@ impl StreamIndex {
 
     /// Stream object metadata; absent base fields are omitted.
     pub fn to_metadata(&self) -> Result<MetadataMap> {
+        use metadata_field::*;
         self.validate()?;
         let mut map = MetadataMap::from([
-            ("gpg-key-id".into(), self.gpg_key_id.clone()),
-            ("fs-type".into(), self.fs_type.clone()),
-            ("vol-id".into(), self.vol_id.clone()),
+            (GPG_KEY_ID.into(), self.gpg_key_id.clone()),
+            (FS_TYPE.into(), self.fs_type.clone()),
+            (VOL_ID.into(), self.vol_id.clone()),
             (
-                "current-snapshot-id".into(),
+                CURRENT_SNAPSHOT_ID.into(),
                 self.current_snapshot_id.clone(),
             ),
         ]);
         if let (Some(guid), Some(key)) = (&self.base_snapshot_id, &self.base_object_key) {
-            map.insert("base-snapshot-id".into(), guid.clone());
-            map.insert("base-object-key".into(), key.clone());
+            map.insert(BASE_SNAPSHOT_ID.into(), guid.clone());
+            map.insert(BASE_OBJECT_KEY.into(), key.clone());
         }
         Ok(map)
     }

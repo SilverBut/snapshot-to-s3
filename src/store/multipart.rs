@@ -191,7 +191,10 @@ pub async fn upload_object<R: AsyncBufRead + Unpin + ?Sized>(
     let result = async {
         let uploaded = upload_parts(store, key, &upload, reader, estimate, limits, cancel).await?;
         let completed = store.complete_upload(key, &upload, &uploaded.parts).await;
-        if confirm_commit(store, key, &metadata, uploaded.bytes).await? {
+        if matches!(
+            confirm_commit(store, key, &metadata, uploaded.bytes).await?,
+            CommitConfirmation::Committed
+        ) {
             if let Err(error) = completed {
                 tracing::warn!("completion response failed, but {key} matches: {error:#}");
             }
@@ -265,16 +268,36 @@ async fn upload_part(
 
 /// Whether the published object matches the upload: `Ok(false)` if absent,
 /// an error if present with different metadata or length.
+#[derive(Debug, PartialEq, Eq)]
+pub enum CommitConfirmation {
+    Committed,
+    Absent,
+    CommittedMetadataMismatch {
+        found: MetadataMap,
+        mismatch: crate::model::MetadataMismatch,
+    },
+}
+
 pub async fn confirm_commit(
     store: &dyn ObjectStore,
     key: &str,
     metadata: &MetadataMap,
     expected_bytes: u64,
-) -> Result<bool> {
+) -> Result<CommitConfirmation> {
     match store.head(key).await? {
-        Some(head) if head.size == expected_bytes && &head.metadata == metadata => Ok(true),
-        Some(_) => bail!("published stream has unexpected metadata or length: {key}"),
-        None => Ok(false),
+        Some(head) if head.size == expected_bytes => {
+            let mismatch = crate::model::MetadataMismatch::between(metadata, &head.metadata);
+            if mismatch.is_empty() {
+                Ok(CommitConfirmation::Committed)
+            } else {
+                Ok(CommitConfirmation::CommittedMetadataMismatch {
+                    found: head.metadata,
+                    mismatch,
+                })
+            }
+        }
+        Some(_) => bail!("published stream has unexpected length: {key}"),
+        None => Ok(CommitConfirmation::Absent),
     }
 }
 
