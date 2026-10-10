@@ -77,7 +77,7 @@ impl Job<'_> {
         let uploaded = match uploaded {
             Ok(uploaded) => uploaded,
             Err(error) => {
-                eprintln!(
+                tracing::warn!(
                     "producer shutdown after upload failure: encryption={encryption:?}, \
                      limiter={limiter:?}, send={send:?}"
                 );

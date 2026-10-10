@@ -31,12 +31,16 @@ pub struct BackupOptions {
     pub gpg_key_id: String,
     /// Skip base selection and send a full stream.
     pub force_full: bool,
+    /// Delete any existing objects under the backup prefix (except the held
+    /// lock) instead of refusing. Never bypasses the writer lock.
+    pub force_overwrite: bool,
     /// Ciphertext bytes per second.
     pub rate_limit: Option<u64>,
     pub limits: UploadLimits,
     pub cancel: CancellationToken,
 }
 
+#[derive(Debug)]
 pub struct BackupResult {
     pub stream_key: String,
     pub snapshot_guid: String,
@@ -137,9 +141,14 @@ impl Job<'_> {
         current: &SnapshotInfo,
     ) -> Result<BackupResult> {
         let options = self.options;
-        match lock {
-            Some(lock) => lock.ensure_empty(self.store, &self.prefix).await?,
-            None => HeldLock::ensure_prefix_empty(self.store, &self.prefix).await?,
+        let held_key = lock.map(|lock| lock.key.as_str());
+        if options.force_overwrite {
+            HeldLock::clear_prefix(self.store, &self.prefix, held_key).await?;
+        } else {
+            match lock {
+                Some(lock) => lock.ensure_empty(self.store, &self.prefix).await?,
+                None => HeldLock::ensure_prefix_empty(self.store, &self.prefix).await?,
+            }
         }
         let selected = select_base(
             self.store,
@@ -183,6 +192,7 @@ impl Job<'_> {
             .send(&options.source, base.map(|base| &base.name))
             .await?;
         let estimate = crypto::ciphertext_size(selected.estimate);
+        crate::progress::set_total(estimate);
         let stream = self
             .upload_stream(&upload_id, send, &key, aad, estimate)
             .await?;
@@ -251,7 +261,7 @@ impl Job<'_> {
         match confirm_commit(self.store, &self.stream_key, index, parts.bytes).await {
             Ok(true) => {
                 if let Err(error) = completed {
-                    eprintln!(
+                    tracing::warn!(
                         "completion response failed, but committed object metadata and \
                          length match: {error:#}"
                     );
@@ -292,7 +302,7 @@ impl Job<'_> {
             Upload::Open(id) => match self.store.abort_upload(&self.stream_key, id).await {
                 Ok(()) => true,
                 Err(cleanup) => {
-                    eprintln!("multipart abort failed; {lock_status}: {cleanup:#}");
+                    tracing::warn!("multipart abort failed; {lock_status}: {cleanup:#}");
                     false
                 }
             },
@@ -300,8 +310,8 @@ impl Job<'_> {
             Upload::NotStarted => true,
         };
         match self.store.list(&self.prefix).await {
-            Ok(objects) => eprintln!("residual objects: {objects:?}"),
-            Err(cleanup) => eprintln!("cannot list residual objects: {cleanup:#}"),
+            Ok(objects) => tracing::warn!("residual objects: {objects:?}"),
+            Err(cleanup) => tracing::warn!("cannot list residual objects: {cleanup:#}"),
         }
         if !stopped {
             return anyhow::anyhow!(
@@ -372,6 +382,7 @@ mod tests {
                 location: S3Location::parse("s3://bucket/backups").unwrap(),
                 gpg_key_id: "recipient".into(),
                 force_full: false,
+                force_overwrite: false,
                 rate_limit: None,
                 limits: UploadLimits::default(),
                 cancel: CancellationToken::new(),

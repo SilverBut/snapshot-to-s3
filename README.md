@@ -35,8 +35,13 @@ The backup is written under `s3://bucket/backups/pool/dataset/snap/`. The snapsh
 | `--gpg-key-id` (or `GPG_KEY_ID`) | Selector resolving to exactly one encryption-capable public key |
 | `--force-full-snapshot` | Send a full stream instead of choosing an incremental base |
 | `--rate-limit BYTES_PER_SEC` | Limit ciphertext throughput |
-| `--part-buffer-size` | Largest part held in memory (default 64 MiB) |
-| `--min-part-size`, `--max-part-size`, `--max-parts`, `--max-object-size` | Service multipart limits (defaults: AWS S3) |
+| `--force-overwrite` | Delete any existing backup objects under the destination prefix and write anew. Destructive; the exclusive writer lock is still required and never bypassed |
+| `--progress [tty\|SECONDS\|off]` | Progress on stderr (size, elapsed time, speed). `tty` is a live line, a number prints one line per that many seconds; default and bare flag use `tty` on a terminal, else every 10 s. Also accepted by `restore`; never writes to stdout |
+| `--part-buffer-size` | Largest part held in memory (default 128 MiB) |
+| `--min-part-size` (default 100 MiB), `--max-part-size`, `--max-parts`, `--max-object-size` | Multipart limits (maximums default to AWS S3); lower `--min-part-size` for services that allow smaller parts |
+
+Diagnostics: set `RUST_LOG` (for example `RUST_LOG=debug`) for logs of external commands, S3 requests and
+upload steps. Logs go to stderr only (default level `warn`), so `restore ... stdout:` output stays clean.
 
 An incremental base must be an older local snapshot whose committed backup exists at the same prefix.
 Choosing a base does not check that the base's own chain is complete; keep the backups a chain needs
@@ -116,7 +121,7 @@ still run.
   (`--part-buffer-size`) plus 2 MiB and 64 KiB pipes; restore holds a 2 MiB pipe and 1 MiB segments.
   Command output and small objects are read with fixed caps.
 * **Size**: a stream larger than one object continues in further objects of at most `--max-parts` ×
-  part size bytes (625 GiB with the defaults; raise `--part-buffer-size` for fewer, larger objects, up to
+  part size bytes (1.25 TiB with the defaults; raise `--part-buffer-size` for fewer, larger objects, up to
   5 TiB each on AWS). Up to 1,000,000 objects per backup are allowed; the encryption format allows about
   4 PiB per backup.
 * GET downloads resume from the current offset after transient failures; uploads retry identical part

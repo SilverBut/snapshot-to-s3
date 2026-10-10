@@ -77,6 +77,7 @@ impl SystemZfs {
     where
         S: AsRef<OsStr> + Debug,
     {
+        tracing::debug!("running {program:?} {args:?}");
         let mut child = Self::command(program)
             .args(args)
             .stdout(Stdio::piped())
@@ -92,6 +93,7 @@ impl SystemZfs {
         let stderr = stderr_task
             .await
             .context("stderr collector join failed")??;
+        tracing::debug!("{program:?} exited with {}", status);
         if stdout.truncated {
             bail!("command stdout exceeded {stdout_limit} bytes: {program:?} {args:?}");
         }

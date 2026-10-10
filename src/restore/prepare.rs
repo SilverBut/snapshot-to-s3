@@ -95,8 +95,8 @@ pub async fn prepare(
                 let parent_source =
                     location.snapshot_of_stream_key(&selected.dataset, &parent_key)?;
                 let Some(head) = store.head(&parent_key).await? else {
-                    eprintln!(
-                        "warning: remote chain cannot recover an empty target; \
+                    tracing::warn!(
+                        "remote chain cannot recover an empty target; \
                          missing parent {parent_key}"
                     );
                     if common_older {

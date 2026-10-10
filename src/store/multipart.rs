@@ -33,11 +33,11 @@ pub struct UploadLimits {
 impl Default for UploadLimits {
     fn default() -> Self {
         Self {
-            min_part_size: 5 * MIB,
+            min_part_size: 100 * MIB,
             max_part_size: 5 * 1024 * MIB,
             max_parts: 10_000,
             max_object_size: 5 * 1024 * 1024 * MIB,
-            buffer_limit: 64 * MIB,
+            buffer_limit: 128 * MIB,
         }
     }
 }
@@ -127,7 +127,10 @@ pub async fn upload_parts<R: AsyncBufRead + Unpin + ?Sized>(
         uploaded.bytes += buffer.len() as u64;
         let last = buffer.len() < wanted;
         let number = u32::try_from(uploaded.parts.len() + 1)?;
+        let part_bytes = buffer.len() as u64;
         let etag = upload_part(store, key, upload, number, Bytes::from(buffer), cancel).await?;
+        crate::progress::add(part_bytes);
+        tracing::debug!(%key, number, part_bytes, total = uploaded.bytes, "part uploaded");
         uploaded.parts.push(Part { number, etag });
         if last {
             uploaded.ended = true;
@@ -160,7 +163,7 @@ pub async fn upload_object<R: AsyncBufRead + Unpin + ?Sized>(
         let completed = store.complete_upload(key, &upload, &uploaded.parts).await;
         if confirm_commit(store, key, &metadata, uploaded.bytes).await? {
             if let Err(error) = completed {
-                eprintln!("completion response failed, but {key} matches: {error:#}");
+                tracing::warn!("completion response failed, but {key} matches: {error:#}");
             }
             return Ok(uploaded);
         }
@@ -172,7 +175,7 @@ pub async fn upload_object<R: AsyncBufRead + Unpin + ?Sized>(
     .await;
     if result.is_err() {
         if let Err(error) = store.abort_upload(key, &upload).await {
-            eprintln!("multipart abort failed for {key}: {error:#}");
+            tracing::warn!("multipart abort failed for {key}: {error:#}");
         }
     }
     result
@@ -232,6 +235,9 @@ async fn upload_part(
         match store.upload_part(key, upload, number, bytes.clone()).await {
             Ok(etag) => break etag,
             Err(error) if attempt < PART_ATTEMPTS && store.is_retryable(&error) => {
+                tracing::warn!(
+                    "retrying part {number} of {key} after attempt {attempt}: {error:#}"
+                );
                 tokio::select! {
                     _ = cancel.cancelled() => bail!("backup cancelled during part retry"),
                     _ = tokio::time::sleep(PART_RETRY_BACKOFF * attempt as u32) => (),

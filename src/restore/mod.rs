@@ -125,7 +125,7 @@ async fn replay<W: AsyncWrite + Unpin>(
         aad,
         objects,
     } = backup;
-    let mut ciphertext = read_chain(store.clone(), objects);
+    let mut ciphertext = crate::progress::Counting(read_chain(store.clone(), objects));
     let (reader, mut writer) = tokio::io::duplex(DECRYPTED_PIPE_BYTES);
     let cancel = options.cancel.clone();
     let decryption = tokio::spawn(async move {

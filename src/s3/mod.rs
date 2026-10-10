@@ -182,6 +182,7 @@ impl HttpStore {
         body: Bytes,
     ) -> Result<Response> {
         let url = self.object_url(key, query)?;
+        tracing::debug!(%method, %key, body_bytes = body.len(), "S3 request");
         let scope = sigv4::Scope {
             region: &self.config.region,
             service: &self.config.signing_service,
@@ -210,14 +211,25 @@ impl HttpStore {
                 request = request.body(counted_body(body, progress.clone()));
             }
         }
-        if control {
+        let started = std::time::Instant::now();
+        let result = if control {
             request.send().await.context("send signed S3 request")
         } else {
             ThroughputGuard::new(&self.policy)
                 .wait(request.send(), Some(&progress))
                 .await?
                 .context("send signed S3 request")
+        };
+        match &result {
+            Ok(response) => tracing::debug!(
+                status = %response.status(),
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                %key,
+                "S3 response"
+            ),
+            Err(error) => tracing::debug!(%key, "S3 request failed: {error:#}"),
         }
+        result
     }
 
     async fn response_error(&self, operation: &str, response: Response) -> anyhow::Error {

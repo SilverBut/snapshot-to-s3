@@ -45,8 +45,8 @@ whatever the stream size. Small objects, logs and command output are read with e
 keys and metadata never touch application-managed files. Swap and core dumps are not controlled.
 
 A stream that is larger than one object continues in further objects (see
-[storage.md](storage.md#stream-objects)). With AWS limits and the default 64 MiB part buffer, each object
-holds 625 GiB, so 1 PB needs about 1,500 objects. A 512 MiB buffer gives objects of about 5 TiB.
+[storage.md](storage.md#stream-objects)). With AWS limits and the default 128 MiB part buffer, each object
+holds 1.25 TiB, so 1 PB needs about 800 objects. A 512 MiB buffer gives objects of about 5 TiB.
 
 ### ZFS command contract
 

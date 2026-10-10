@@ -114,7 +114,7 @@ writers and inspect the upload and objects manually before retrying.
 ## Multipart uploads
 
 Parts hold ciphertext directly. The part size is sized from the `zfs send -nP` estimate to fill one object in
-`--max-parts` parts, at least 8 MiB (and `--min-part-size`), and at most `--part-buffer-size` and
+`--max-parts` parts, at least 8 MiB and `--min-part-size` (default 100 MiB), and at most `--part-buffer-size` and
 `--max-part-size`. Parts grow after half of an object's parts are used, so an underestimated stream needs
 fewer objects. A part that fails with a transient error is retried up to twice with the same bytes. Only the final ETag of each part is
 kept. ETags are not used as content checksums.
