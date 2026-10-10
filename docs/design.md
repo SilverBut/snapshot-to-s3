@@ -7,7 +7,7 @@ In scope:
 * Back up an existing ZFS filesystem snapshot as a raw full or incremental stream, with an automatically
   selected base or `--force-full-snapshot`.
 * Encrypt each backup with its own random key, wrapped by a GPG public key.
-* Stream to S3-compatible storage with bounded memory and no temporary files, for streams up to about 4 PiB.
+* Stream to S3-compatible storage with bounded memory and no plaintext on disk (ciphertext parts may optionally be spooled to a temp file), for streams up to about 4 PiB.
 * Prevent cooperating writers from overwriting each other through a per-backup lock.
 * Restore the required chain into a new or matching existing filesystem, or export one stream to stdout.
 
@@ -38,15 +38,15 @@ backup or a matching local snapshot.
 
 ### Data path and resource bounds
 
-Backup: `zfs send -w` → encryption task → 2 MiB pipe → rate limiter → 64 KiB pipe → part buffer →
+Backup: `zfs send -w` → encryption task → 2 MiB pipe → rate limiter → 64 KiB pipe → part (memory or `--part-temp-file`) →
 `UploadPart`. Restore: chained `GET`s (one open object at a time) → decryption task → 2 MiB pipe →
-`zfs receive -u` or stdout. Memory is thus at most one part buffer plus fixed pipes and crypto segments,
+`zfs receive -u` or stdout. Memory is thus at most one part plus fixed pipes and crypto segments,
 whatever the stream size. Small objects, logs and command output are read with explicit caps. Plaintext,
 keys and metadata never touch application-managed files. Swap and core dumps are not controlled.
 
 A stream that is larger than one object continues in further objects (see
-[storage.md](storage.md#stream-objects)). With AWS limits and the default 128 MiB part buffer, each object
-holds 1.25 TiB, so 1 PB needs about 800 objects. A 512 MiB buffer gives objects of about 5 TiB.
+[storage.md](storage.md#stream-objects)). With AWS limits and the default 512 MiB maximum part size, each object
+holds 5000 GiB, so 1 PB needs about 190 objects.
 
 ### ZFS command contract
 

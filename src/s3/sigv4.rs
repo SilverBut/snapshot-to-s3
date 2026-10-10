@@ -17,19 +17,20 @@ pub(super) struct Scope<'a> {
 }
 
 /// Adds the date, payload hash, session token and `authorization` headers.
-/// The host is signed but left for the HTTP client to send.
+/// The host is signed but left for the HTTP client to send. The payload hash
+/// is passed in so a part streamed from its temporary file is not reread.
 pub(super) fn sign(
     headers: &mut HeaderMap,
     method: &Method,
     url: &Url,
-    body: &[u8],
+    payload_sha256: [u8; 32],
     credentials: &Credentials,
     scope: &Scope<'_>,
     now: DateTime<Utc>,
 ) -> Result<()> {
     let amz_date = now.format("%Y%m%dT%H%M%SZ").to_string();
     let date = now.format("%Y%m%d").to_string();
-    let payload_hash = hex::encode(Sha256::digest(body));
+    let payload_hash = hex::encode(payload_sha256);
     put_header(headers, "x-amz-date", &amz_date)?;
     put_header(headers, "x-amz-content-sha256", &payload_hash)?;
     if let Some(token) = &credentials.session_token {

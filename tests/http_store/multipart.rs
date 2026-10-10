@@ -2,7 +2,7 @@ use super::support::{config, fixture, fixture_sequence, split_captured_requests,
 use anyhow::Result;
 use snapshot_to_s3::{
     s3::{is_definite_rejection, is_retryable, HttpStore},
-    store::{upload_parts, ObjectStore, Part, UploadLimits},
+    store::{upload_parts, ObjectStore, Part, PartStorage, UploadLimits},
 };
 
 #[tokio::test]
@@ -66,6 +66,19 @@ async fn unparsed_successful_completion_is_not_a_definite_rejection() -> Result<
 
 #[tokio::test]
 async fn upload_parts_retries_identical_bytes_and_returns_only_final_etag() -> Result<()> {
+    retries_identical_bytes(PartStorage::Memory).await
+}
+
+#[tokio::test]
+async fn temp_file_parts_stream_the_same_signed_bytes_on_every_retry() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("part");
+    retries_identical_bytes(PartStorage::TempFile(path.clone())).await?;
+    assert!(!path.exists(), "the part temporary file is deleted");
+    Ok(())
+}
+
+async fn retries_identical_bytes(part_storage: PartStorage) -> Result<()> {
     let _env = EnvGuard::new();
     let responses = [
         "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
@@ -90,7 +103,7 @@ async fn upload_parts_retries_identical_bytes_and_returns_only_final_etag() -> R
             max_part_size: ciphertext.len() as u64,
             max_parts: 1,
             max_object_size: ciphertext.len() as u64,
-            buffer_limit: ciphertext.len() as u64,
+            part_storage,
         },
         &tokio_util::sync::CancellationToken::new(),
     )
@@ -103,10 +116,17 @@ async fn upload_parts_retries_identical_bytes_and_returns_only_final_etag() -> R
 
     let requests = split_captured_requests(&server.await?);
     assert_eq!(requests.len(), 3);
+    let payload_hash = format!(
+        "x-amz-content-sha256: {}",
+        hex::encode(<sha2::Sha256 as sha2::Digest>::digest(&ciphertext))
+    );
     for (head, body) in &requests {
         assert!(head.starts_with(
             "PUT /fixture-bucket/stream?partNumber=1&uploadId=upload%20%2B%2F%E9%9B%AA HTTP/1.1"
         ));
+        let head = head.to_ascii_lowercase();
+        assert!(head.contains(&payload_hash), "{head}");
+        assert!(head.contains(&format!("content-length: {}", ciphertext.len())));
         assert_eq!(body, &ciphertext);
     }
     assert_eq!(requests[0].1, requests[1].1);

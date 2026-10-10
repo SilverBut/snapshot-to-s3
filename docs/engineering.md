@@ -106,7 +106,7 @@ add it in its own P commit before the tests.
 * Split a module only when its parts change for different reasons. Size alone is not a reason, and a
   split that only moves code makes history harder to follow.
 * Tighten `pub` to `pub(crate)` where the compiler allows it, without changing signatures.
-* Check documented numbers before you "correct" them: 128 MiB × 10,000 parts is 1.25 TiB.
+* Check documented numbers before you "correct" them: 512 MiB × 10,000 parts is 5000 GiB.
 
 ## Validation and resources
 

@@ -113,10 +113,17 @@ writers and inspect the upload and objects manually before retrying.
 
 ## Multipart uploads
 
-Parts hold ciphertext directly. The part size is sized from the `zfs send -nP` estimate to fill one object in
-`--max-parts` parts, at least 8 MiB and `--min-part-size` (default 100 MiB), and at most `--part-buffer-size` and
-`--max-part-size`. Parts grow after half of an object's parts are used, so an underestimated stream needs
-fewer objects. A part that fails with a transient error is retried up to twice with the same bytes. Only the final ETag of each part is
+Parts hold ciphertext directly. At the start of each object the part size is computed once as
+`ceil(min(estimate × 1.25, --max-object-size) / --max-parts)`, rounded up to a MiB and clamped to
+`--min-part-size` (default 100 MiB) and `--max-part-size` (default 512 MiB). The 25% headroom absorbs small
+underestimates of the `zfs send -nP` estimate. If the estimate with headroom exceeds one object, a warning
+reports the expected object count and the stream continues in further objects. Parts grow to
+`--max-part-size` after half of an object's parts are used, so an underestimated stream needs fewer objects.
+
+`--max-part-size` is the only local cap: the part being uploaded is held in memory, or with
+`--part-temp-file PATH` in that file. The file must not exist; it is created exclusively with mode 0600,
+reused for every part of an object, and removed on success, failure and cancellation. It holds ciphertext
+only. Its SHA-256 is computed while it is written and the part is streamed with an exact `Content-Length`. A part that fails with a transient error is retried up to twice with the same bytes. Only the final ETag of each part is
 kept. ETags are not used as content checksums.
 
 ## HTTP transfers

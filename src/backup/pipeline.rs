@@ -26,7 +26,7 @@ pub(super) struct UploadedStream {
     pub(super) objects: u32,
     /// Ciphertext bytes over all objects.
     pub(super) bytes: u64,
-    pub(super) peak_buffer_bytes: usize,
+    pub(super) peak_part_bytes: usize,
 }
 
 impl Job<'_> {
@@ -99,6 +99,15 @@ impl Job<'_> {
         estimate: u64,
     ) -> Result<UploadedStream> {
         let options = self.options;
+        let objects = options.limits.expected_objects(estimate);
+        if objects > 1 {
+            tracing::warn!(
+                "estimated stream of {estimate} bytes (plus 25% headroom) exceeds one object of \
+                 {} bytes; expect about {objects} objects. Raise --max-part-size (with \
+                 --part-temp-file if memory is short) for fewer objects",
+                options.limits.object_capacity()
+            );
+        }
         let head = upload_parts(
             self.store,
             &self.stream_key,
@@ -112,7 +121,7 @@ impl Job<'_> {
         let mut stream = UploadedStream {
             objects: 1,
             bytes: head.bytes,
-            peak_buffer_bytes: head.peak_buffer_bytes,
+            peak_part_bytes: head.peak_part_bytes,
             head,
         };
         let mut ended = stream.head.ended;
@@ -142,7 +151,7 @@ impl Job<'_> {
                 .bytes
                 .checked_add(uploaded.bytes)
                 .context("ciphertext length overflow")?;
-            stream.peak_buffer_bytes = stream.peak_buffer_bytes.max(uploaded.peak_buffer_bytes);
+            stream.peak_part_bytes = stream.peak_part_bytes.max(uploaded.peak_part_bytes);
             ended = uploaded.ended;
         }
         Ok(stream)

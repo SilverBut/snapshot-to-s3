@@ -3,23 +3,31 @@
 //! One multipart object holds at most `max_parts` parts and
 //! `max_object_size` bytes; [`upload_parts`] fills one object and reports
 //! whether the stream continues, so callers can spread a stream of any size
-//! over several objects while holding only one part in memory.
+//! over several objects while holding only one part, in memory or in a
+//! temporary file.
 
+use super::part::{PartBody, PartStorage, Spool};
 use super::{ObjectStore, Part};
 use crate::model::MetadataMap;
 use anyhow::{bail, Context, Result};
-use bytes::Bytes;
 use std::time::Duration;
-use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt};
 use tokio_util::sync::CancellationToken;
 
 const MIB: u64 = 1024 * 1024;
+/// Parts are sized for the estimate plus this fraction, so a slightly
+/// larger stream still fits in one object.
+const ESTIMATE_HEADROOM_DIVISOR: u64 = 4;
 /// Attempts per part, including the first, for retryable failures.
 const PART_ATTEMPTS: u64 = 3;
 /// Delay before retry `n` is `n` times this.
 const PART_RETRY_BACKOFF: Duration = Duration::from_millis(100);
 
-/// Provider multipart limits and the local part-buffer budget.
+/// Multipart limits and where parts are held.
+///
+/// Parts are sized automatically between `min_part_size` and
+/// `max_part_size`; `max_part_size` is also the most memory (or temporary
+/// file space) one part uses, whatever the storage.
 #[derive(Clone, Debug)]
 pub struct UploadLimits {
     pub min_part_size: u64,
@@ -27,17 +35,17 @@ pub struct UploadLimits {
     pub max_parts: u32,
     /// Largest single object; longer streams continue in further objects.
     pub max_object_size: u64,
-    pub buffer_limit: u64,
+    pub part_storage: PartStorage,
 }
 
 impl Default for UploadLimits {
     fn default() -> Self {
         Self {
             min_part_size: 100 * MIB,
-            max_part_size: 5 * 1024 * MIB,
+            max_part_size: 512 * MIB,
             max_parts: 10_000,
             max_object_size: 5 * 1024 * 1024 * MIB,
-            buffer_limit: 128 * MIB,
+            part_storage: PartStorage::Memory,
         }
     }
 }
@@ -46,26 +54,49 @@ impl UploadLimits {
     pub fn validate(&self) -> Result<()> {
         if self.min_part_size == 0
             || self.min_part_size > self.max_part_size
-            || self.buffer_limit < self.min_part_size
             || self.max_parts == 0
             || self.max_object_size < self.min_part_size
-            || self.buffer_limit > usize::MAX as u64
+            || self.max_part_size > usize::MAX as u64
         {
-            bail!("invalid multipart limits or memory budget");
+            bail!(
+                "invalid multipart limits: need 0 < --min-part-size <= --max-part-size, \
+                 --max-parts > 0 and --max-object-size >= --min-part-size"
+            );
         }
         Ok(())
     }
 
-    /// Part size that fits `estimate` bytes, or one full object, into
-    /// `max_parts`, never below 8 MiB or `min_part_size` and never above the
-    /// buffer budget. A smaller part only means more, smaller objects.
+    /// The estimate plus headroom, so a slightly larger stream still fits.
+    fn with_headroom(estimate: u64) -> u64 {
+        estimate.saturating_add(estimate / ESTIMATE_HEADROOM_DIVISOR)
+    }
+
+    /// Most bytes one object holds with these limits.
+    pub fn object_capacity(&self) -> u64 {
+        self.max_part_size
+            .saturating_mul(u64::from(self.max_parts))
+            .min(self.max_object_size)
+    }
+
+    /// Objects expected for a stream of `estimate` bytes, headroom included.
+    pub fn expected_objects(&self, estimate: u64) -> u64 {
+        Self::with_headroom(estimate)
+            .div_ceil(self.object_capacity().max(1))
+            .max(1)
+    }
+
+    /// Part size that fits `estimate` bytes plus headroom, or one full
+    /// object, into `max_parts`; rounded up to a MiB and kept within
+    /// `min_part_size..=max_part_size`.
     fn part_size(&self, estimate: u64) -> Result<usize> {
         self.validate()?;
-        let required = estimate
+        let required = Self::with_headroom(estimate)
             .min(self.max_object_size)
             .div_ceil(u64::from(self.max_parts));
-        let size = required.max(self.min_part_size).max(8 * MIB);
-        let size = size.min(self.buffer_limit).min(self.max_part_size);
+        let size = required
+            .div_ceil(MIB)
+            .saturating_mul(MIB)
+            .clamp(self.min_part_size, self.max_part_size);
         Ok(usize::try_from(size)?)
     }
 }
@@ -74,16 +105,16 @@ pub struct UploadedParts {
     pub parts: Vec<Part>,
     /// Bytes uploaded into this object.
     pub bytes: u64,
-    /// Largest part buffer allocated.
-    pub peak_buffer_bytes: usize,
+    /// Largest part held, in memory or in the temporary file.
+    pub peak_part_bytes: usize,
     /// Whether the reader is exhausted; otherwise the object is full and
     /// the stream continues.
     pub ended: bool,
 }
 
 /// Uploads `reader` into an open multipart upload until the stream ends or
-/// the object is full, holding at most one part in memory. The estimate
-/// only sizes parts; the real length may differ.
+/// the object is full, holding at most one part. The estimate only sizes
+/// parts; the real length may differ.
 pub async fn upload_parts<R: AsyncBufRead + Unpin + ?Sized>(
     store: &dyn ObjectStore,
     key: &str,
@@ -94,10 +125,12 @@ pub async fn upload_parts<R: AsyncBufRead + Unpin + ?Sized>(
     cancel: &CancellationToken,
 ) -> Result<UploadedParts> {
     let mut size = limits.part_size(estimate)?;
+    tracing::debug!(%key, part_size = size, estimate, "sized parts");
+    let mut spool = Spool::open(&limits.part_storage)?;
     let mut uploaded = UploadedParts {
         parts: Vec::new(),
         bytes: 0,
-        peak_buffer_bytes: 0,
+        peak_part_bytes: 0,
         ended: false,
     };
     loop {
@@ -112,23 +145,20 @@ pub async fn upload_parts<R: AsyncBufRead + Unpin + ?Sized>(
         if uploaded.parts.len() > limits.max_parts as usize / 2 {
             // Grow late parts so a stream larger than its estimate needs
             // fewer objects.
-            size = size
-                .saturating_mul(2)
-                .min(limits.buffer_limit as usize)
-                .min(limits.max_part_size as usize);
+            size = size.saturating_mul(2).min(limits.max_part_size as usize);
         }
         let wanted = size.min(usize::try_from(room).unwrap_or(usize::MAX));
-        uploaded.peak_buffer_bytes = uploaded.peak_buffer_bytes.max(wanted);
-        let buffer = read_part(reader, wanted, cancel).await?;
-        if buffer.is_empty() {
+        uploaded.peak_part_bytes = uploaded.peak_part_bytes.max(wanted);
+        let body = spool.fill(reader, wanted, cancel).await?;
+        if body.is_empty() {
             uploaded.ended = true;
             break;
         }
-        uploaded.bytes += buffer.len() as u64;
-        let last = buffer.len() < wanted;
+        let part_bytes = body.len();
+        uploaded.bytes += part_bytes;
+        let last = part_bytes < wanted as u64;
         let number = u32::try_from(uploaded.parts.len() + 1)?;
-        let part_bytes = buffer.len() as u64;
-        let etag = upload_part(store, key, upload, number, Bytes::from(buffer), cancel).await?;
+        let etag = upload_part(store, key, upload, number, body, cancel).await?;
         crate::progress::add(part_bytes);
         tracing::debug!(%key, number, part_bytes, total = uploaded.bytes, "part uploaded");
         uploaded.parts.push(Part { number, etag });
@@ -181,31 +211,6 @@ pub async fn upload_object<R: AsyncBufRead + Unpin + ?Sized>(
     result
 }
 
-/// Fills up to `size` bytes; a shorter result means end of stream.
-async fn read_part<R: AsyncBufRead + Unpin + ?Sized>(
-    reader: &mut R,
-    size: usize,
-    cancel: &CancellationToken,
-) -> Result<Vec<u8>> {
-    let mut buffer = vec![0u8; size];
-    let mut filled = 0;
-    while filled < size {
-        let n = tokio::select! {
-            biased;
-            _ = cancel.cancelled() => bail!("backup cancelled"),
-            result = reader.read(&mut buffer[filled..]) => {
-                result.context("read encrypted stream")?
-            }
-        };
-        if n == 0 {
-            break;
-        }
-        filled += n;
-    }
-    buffer.truncate(filled);
-    Ok(buffer)
-}
-
 /// Whether `reader` is exhausted, without consuming any data.
 async fn at_end<R: AsyncBufRead + Unpin + ?Sized>(
     reader: &mut R,
@@ -223,7 +228,7 @@ async fn upload_part(
     key: &str,
     upload: &str,
     number: u32,
-    bytes: Bytes,
+    body: PartBody,
     cancel: &CancellationToken,
 ) -> Result<String> {
     let mut attempt = 0;
@@ -232,7 +237,10 @@ async fn upload_part(
             bail!("backup cancelled before part upload");
         }
         attempt += 1;
-        match store.upload_part(key, upload, number, bytes.clone()).await {
+        match store
+            .upload_part_body(key, upload, number, body.clone())
+            .await
+        {
             Ok(etag) => break etag,
             Err(error) if attempt < PART_ATTEMPTS && store.is_retryable(&error) => {
                 tracing::warn!(
@@ -276,6 +284,8 @@ mod tests {
     use crate::model::Reader;
     use crate::store::read_small;
     use crate::testing::MemoryStore;
+    use bytes::Bytes;
+    use tokio::io::AsyncReadExt;
 
     #[tokio::test]
     async fn multipart_limits_and_exact_ciphertext() {
@@ -287,7 +297,7 @@ mod tests {
             max_part_size: 8,
             max_parts: 3,
             max_object_size: 20,
-            buffer_limit: 8,
+            part_storage: PartStorage::Memory,
         };
         let original = b"0123456789abcdefXYZ";
         let parts = upload_parts(
@@ -304,7 +314,7 @@ mod tests {
         assert_eq!(parts.parts.len(), 3);
         assert_eq!(parts.bytes, original.len() as u64);
         assert!(parts.ended);
-        assert!(parts.peak_buffer_bytes <= 8);
+        assert!(parts.peak_part_bytes <= 8);
         store
             .complete_upload("stream", &id, &parts.parts)
             .await
@@ -325,7 +335,7 @@ mod tests {
             max_part_size: 8,
             max_parts: 3,
             max_object_size: 20,
-            buffer_limit: 8,
+            part_storage: PartStorage::Memory,
         };
         let cancel = CancellationToken::new();
         let input: Vec<u8> = (0..45).collect();
@@ -382,7 +392,7 @@ mod tests {
             max_part_size: 8,
             max_parts: 3,
             max_object_size: 20,
-            buffer_limit: 8,
+            part_storage: PartStorage::Memory,
         };
         let input = [7u8; 19];
         assert!(upload_object(
@@ -446,7 +456,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn generated_large_stream_has_fixed_buffer_budget() {
+    async fn generated_large_stream_never_exceeds_max_part_size() {
         let store = MemoryStore::discarding_parts();
         let id = store
             .create_upload("large", &MetadataMap::new())
@@ -456,10 +466,10 @@ mod tests {
         let mut input = tokio::io::BufReader::new(tokio::io::repeat(0xA5).take(size));
         let limits = UploadLimits {
             min_part_size: MIB,
-            max_part_size: 4 * MIB,
-            max_parts: 1000,
+            max_part_size: 2 * MIB,
+            max_parts: 50,
             max_object_size: 1024 * MIB,
-            buffer_limit: 2 * MIB,
+            part_storage: PartStorage::Memory,
         };
         let result = upload_parts(
             &store,
@@ -472,10 +482,12 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(result.bytes, size);
-        assert!(result.ended);
-        assert_eq!(result.parts.len(), 65);
-        assert_eq!(result.peak_buffer_bytes, 2 * 1024 * 1024);
+        // 129 MiB in 50 parts would need 4 MiB parts; the cap holds parts at
+        // 2 MiB, so the object fills and the stream continues.
+        assert_eq!(result.bytes, 100 * MIB);
+        assert!(!result.ended);
+        assert_eq!(result.parts.len(), 50);
+        assert_eq!(result.peak_part_bytes, 2 * 1024 * 1024);
         store.abort_upload("large", &id).await.unwrap();
     }
 
@@ -486,21 +498,15 @@ mod tests {
             max_part_size: 4,
             max_parts: 1,
             max_object_size: 4,
-            buffer_limit: 4,
+            part_storage: PartStorage::Memory,
         };
         tight.validate().unwrap();
-        UploadLimits {
-            buffer_limit: u64::MAX,
-            ..tight.clone()
-        }
-        .validate()
-        .unwrap();
         UploadLimits::default().validate().unwrap();
 
         let invalid: [fn(&mut UploadLimits); 5] = [
             |l| l.min_part_size = 0,
             |l| l.min_part_size = 5,
-            |l| l.buffer_limit = 3,
+            |l| l.max_part_size = 3,
             |l| l.max_parts = 0,
             |l| l.max_object_size = 3,
         ];
@@ -520,11 +526,11 @@ mod tests {
             .unwrap();
         let mut input = tokio::io::BufReader::new(tokio::io::repeat(1).take(48 * MIB));
         let limits = UploadLimits {
-            min_part_size: MIB,
+            min_part_size: 8 * MIB,
             max_part_size: 32 * MIB,
             max_parts: 4,
             max_object_size: 1024 * MIB,
-            buffer_limit: 32 * MIB,
+            part_storage: PartStorage::Memory,
         };
         let uploaded = upload_parts(
             &store,
@@ -541,9 +547,91 @@ mod tests {
         // `max_parts` doubles, and the fourth part fills the object.
         assert_eq!(uploaded.parts.len(), 4);
         assert_eq!(uploaded.bytes, 40 * MIB);
-        assert_eq!(uploaded.peak_buffer_bytes, 16 * MIB as usize);
+        assert_eq!(uploaded.peak_part_bytes, 16 * MIB as usize);
         assert!(!uploaded.ended);
         store.abort_upload("grow", &id).await.unwrap();
+    }
+
+    #[test]
+    fn parts_leave_headroom_and_stay_within_limits() {
+        let limits = UploadLimits {
+            min_part_size: MIB,
+            ..UploadLimits::default()
+        };
+        // An exact fit would be 2 MiB parts; 25% headroom and MiB rounding
+        // give 3 MiB, so a slightly larger stream still fits one object.
+        assert_eq!(
+            limits.part_size(10_000 * 2 * MIB).unwrap(),
+            3 * MIB as usize
+        );
+        assert_eq!(limits.part_size(1).unwrap(), MIB as usize);
+        assert_eq!(limits.part_size(u64::MAX).unwrap(), 512 * MIB as usize);
+
+        let defaults = UploadLimits::default();
+        assert_eq!(defaults.part_size(1).unwrap(), 100 * MIB as usize);
+        // 512 MiB x 10,000 parts: 5000 GiB per object.
+        assert_eq!(defaults.object_capacity(), 5000 * 1024 * MIB);
+        assert_eq!(defaults.expected_objects(0), 1);
+        assert_eq!(defaults.expected_objects(4000 * 1024 * MIB), 1);
+        assert_eq!(defaults.expected_objects(4001 * 1024 * MIB), 2);
+        assert_eq!(defaults.expected_objects(10 * 1024 * 1024 * MIB), 3);
+    }
+
+    #[tokio::test]
+    async fn temp_file_parts_round_trip_and_are_deleted() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("part");
+        let store = MemoryStore::default();
+        let id = store
+            .create_upload("file", &MetadataMap::new())
+            .await
+            .unwrap();
+        let limits = UploadLimits {
+            min_part_size: 4,
+            max_part_size: 8,
+            max_parts: 3,
+            max_object_size: 20,
+            part_storage: PartStorage::TempFile(path.clone()),
+        };
+        let original = b"0123456789abcdefXYZ";
+        let parts = upload_parts(
+            &store,
+            "file",
+            &id,
+            &mut &original[..],
+            original.len() as u64,
+            &limits,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert!(parts.ended);
+        assert_eq!(parts.parts.len(), 3);
+        assert!(!path.exists());
+        store
+            .complete_upload("file", &id, &parts.parts)
+            .await
+            .unwrap();
+        assert_eq!(
+            read_small(store.get("file", None, None).await.unwrap(), 100)
+                .await
+                .unwrap(),
+            original
+        );
+
+        // A failed part also deletes the file.
+        *store.failure.lock().unwrap() = Some("PART broken 1".into());
+        assert!(upload_object(
+            &store,
+            "broken",
+            &mut &original[..],
+            19,
+            &limits,
+            &CancellationToken::new()
+        )
+        .await
+        .is_err());
+        assert!(!path.exists());
     }
 
     async fn part_attempts(retryable: bool) -> usize {
