@@ -229,6 +229,8 @@ class ReleaseTests(unittest.TestCase):
         ).read_text()
         triggers = workflow.split("\non:\n", 1)[1].split("\npermissions:", 1)[0]
         self.assertIn("workflow_dispatch", triggers)
+        self.assertNotIn("build_ref:", triggers)
+        self.assertNotIn("actions/cache@", workflow)
         for automatic in ("workflow_run", "push", "pull_request", "schedule"):
             self.assertNotIn(automatic, triggers)
         env = {"GITHUB_REPOSITORY": "fixture/repo", "GITHUB_REF": "refs/heads/feature"}
@@ -238,8 +240,42 @@ class ReleaseTests(unittest.TestCase):
             patch.object(publish_release, "output") as output,
         ):
             with self.assertRaises(ValueError):
-                publish_release.select(Path.cwd(), "publish", "")
+                publish_release.select(Path.cwd(), "publish")
             output.assert_not_called()
+
+    def test_build_only_requires_main_and_uses_dispatch_commit(self):
+        env = {
+            "GITHUB_REPOSITORY": "fixture/repo",
+            "GITHUB_REF": "refs/heads/feature",
+            "GITHUB_SHA": "a" * 40,
+        }
+        with (
+            patch.dict(os.environ, env),
+            patch.object(publish_release, "api", return_value={"default_branch": "main"}),
+            patch.object(publish_release, "run") as run,
+            patch.object(publish_release, "output") as output,
+        ):
+            with self.assertRaises(ValueError):
+                publish_release.select(Path.cwd(), "build-only")
+            run.assert_not_called()
+            output.assert_not_called()
+
+        env["GITHUB_REF"] = "refs/heads/main"
+        with (
+            patch.dict(os.environ, env),
+            patch.object(publish_release, "api", return_value={"default_branch": "main"}),
+            patch.object(
+                publish_release,
+                "run",
+                side_effect=["a" * 40, '[package]\nversion = "0.1.0"\n'],
+            ) as run,
+            patch.object(publish_release, "output") as output,
+        ):
+            publish_release.select(Path.cwd(), "build-only")
+            self.assertEqual(
+                run.call_args_list[0].args[0][3], "a" * 40 + "^{commit}"
+            )
+            self.assertEqual(output.call_args.args[0]["sha"], "a" * 40)
 
     def test_draft_upload_verification_precedes_publication(self):
         for existing, damage in (
