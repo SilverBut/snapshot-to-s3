@@ -90,13 +90,13 @@ def verify_tag(repo: str, root: Path, tag: str, sha: str) -> bool:
     return True
 
 
-def select(root: Path, mode: str, build_ref: str) -> None:
+def select(root: Path, mode: str) -> None:
     repo = os.environ["GITHUB_REPOSITORY"]
     main = api(f"repos/{repo}", root)["default_branch"]
+    if os.environ.get("GITHUB_REF") != f"refs/heads/{main}":
+        raise ValueError("release workflows are restricted to the trusted default branch")
     if mode == "build-only":
-        ref = build_ref or os.environ["GITHUB_SHA"]
-        if ref.startswith("-") or ".." in ref or not re.fullmatch(r"[A-Za-z0-9._/+~-]+", ref):
-            raise ValueError("invalid build reference")
+        ref = os.environ["GITHUB_SHA"]
         sha = run(["git", "rev-parse", "--verify", f"{ref}^{{commit}}"], root, capture=True).strip()
         cargo = tomllib.loads(run(["git", "show", f"{sha}:Cargo.toml"], root, capture=True))[
             "package"
@@ -112,8 +112,6 @@ def select(root: Path, mode: str, build_ref: str) -> None:
             }
         )
         return
-    if os.environ.get("GITHUB_REF") != f"refs/heads/{main}":
-        raise ValueError("publication and draft updates are restricted to trusted main")
     plan = check_plan(root)
     if plan is None:
         raise ValueError("no release plan exists on main")
@@ -260,14 +258,13 @@ def main() -> int:
     commands = parser.add_subparsers(dest="command", required=True)
     choose = commands.add_parser("select")
     choose.add_argument("--mode", choices=["build-only", "publish"], required=True)
-    choose.add_argument("--build-ref", default="")
     send = commands.add_parser("publish")
     send.add_argument("--sha", required=True)
     send.add_argument("--assets", type=Path, required=True)
     args = parser.parse_args()
     try:
         if args.command == "select":
-            select(Path.cwd(), args.mode, args.build_ref)
+            select(Path.cwd(), args.mode)
         else:
             publish(Path.cwd(), args.sha, args.assets.resolve())
     except (ValueError, KeyError, OSError, subprocess.CalledProcessError) as error:
