@@ -51,8 +51,10 @@ Versions are SemVer tags: `vX.Y.Z`, or `vX.Y.Z-alpha.N` / `-beta.N` / `-rc.N` / 
    CI fails while the notes are unreviewed or the versions disagree.
 3. When CI passes, merge it with a **merge commit** and wait for CI on that merge commit in `main`.
 4. Run **Actions → Release** on `main` with mode **publish** (the default **build-only** does not
-   publish). It builds a static x86_64 musl binary, verifies it, and publishes it with `SHA256SUMS`
-   (check with `sha256sum -c SHA256SUMS`).
+   publish). It builds a static x86_64 musl binary, verifies it, and publishes
+   `snapshot-to-s3-linux-x86_64` directly with `SHA256SUMS`, without a tar archive. After downloading both,
+   check with `sha256sum -c SHA256SUMS` and make the binary executable with
+   `chmod +x snapshot-to-s3-linux-x86_64`.
 
 Both workflows run only when started manually; no push, PR or CI completion starts a release.
 Both Prepare Release jobs also require the default branch, including dry runs. Copilot note generation

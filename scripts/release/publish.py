@@ -23,7 +23,7 @@ from scripts.release.notes import NOTES_PATH
 from scripts.release.prepare import BRANCH_PREFIX, PLAN_PATH, check_plan, validate_proposal
 from scripts.release.version import parse_version
 
-ARCHIVE_NAME = "snapshot-to-s3-linux-x86_64.tar.gz"
+BINARY_NAME = "snapshot-to-s3-linux-x86_64"
 CHECKSUMS_NAME = "SHA256SUMS"
 CI_GATE_CHECK = "CI Gate"
 # GitHub Actions' app id; check runs from any other app cannot satisfy the gate.
@@ -153,16 +153,16 @@ def select(root: Path, mode: str) -> None:
 
 
 def verify_assets(directory: Path) -> tuple[Path, Path]:
-    archive = directory / ARCHIVE_NAME
+    binary = directory / BINARY_NAME
     checksums = directory / CHECKSUMS_NAME
     files = {p.name for p in directory.iterdir() if p.is_file()}
-    if files != {archive.name, checksums.name}:
-        raise ValueError("release artifact must contain exactly the archive and SHA256SUMS")
+    if files != {binary.name, checksums.name}:
+        raise ValueError("release artifact must contain exactly the binary and SHA256SUMS")
     line = checksums.read_text().strip()
-    match = re.fullmatch(rf"([0-9a-f]{{64}})  {re.escape(ARCHIVE_NAME)}", line)
-    if not match or hashlib.sha256(archive.read_bytes()).hexdigest() != match[1]:
-        raise ValueError("release archive checksum mismatch")
-    return archive, checksums
+    match = re.fullmatch(rf"([0-9a-f]{{64}})  {re.escape(BINARY_NAME)}", line)
+    if not match or hashlib.sha256(binary.read_bytes()).hexdigest() != match[1]:
+        raise ValueError("release binary checksum mismatch")
+    return binary, checksums
 
 
 def publish(root: Path, sha: str, directory: Path) -> None:
@@ -174,7 +174,7 @@ def publish(root: Path, sha: str, directory: Path) -> None:
     version, notes = snapshot(root, sha)
     require_green(repo, root, sha)
     tag = f"v{version}"
-    archive, checksums = verify_assets(directory)
+    binary, checksums = verify_assets(directory)
     if not verify_tag(repo, root, tag, sha):
         run(
             [
@@ -215,7 +215,7 @@ def publish(root: Path, sha: str, directory: Path) -> None:
             run(command, root)
         else:
             run(["gh", "release", "edit", tag, "--notes-file", notes_file.name], root)
-    run(["gh", "release", "upload", tag, str(archive), str(checksums), "--clobber"], root)
+    run(["gh", "release", "upload", tag, str(binary), str(checksums), "--clobber"], root)
     records = [r for r in release_records(repo, root) if r["tag_name"] == tag]
     if len(records) != 1:
         raise ValueError("cannot identify exactly one draft release after asset upload")
@@ -224,7 +224,7 @@ def publish(root: Path, sha: str, directory: Path) -> None:
     if not release["draft"]:
         raise ValueError("release is no longer a draft; publication stopped")
     assets = release["assets"]
-    expected = {p.name: p for p in (archive, checksums)}
+    expected = {p.name: p for p in (binary, checksums)}
     if {a["name"] for a in assets} != set(expected):
         raise ValueError("draft contains missing or unexpected release assets")
     for asset in assets:
