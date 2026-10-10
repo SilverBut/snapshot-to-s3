@@ -4,7 +4,7 @@
 
 chunked="$prefix/chunked"
 if ! cli backup "zfs:$namespace/source@s1" "$chunked" --gpg-key-id "$fingerprint" --force-full-snapshot \
-    --max-object-size 8388608 --part-buffer-size 8388608 2>"$runtime/chunked.log" ||
+    --max-object-size 8388608 --part-buffer-size 8388608 --min-part-size 5242880 2>"$runtime/chunked.log" ||
     ! grep -q ' in 2 objects)' "$runtime/chunked.log"; then
     cat "$runtime/chunked.log" >&2
     exit 1

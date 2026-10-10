@@ -2,6 +2,7 @@
 
 use crate::backup::{backup, backup_without_lock, BackupOptions};
 use crate::model::{validate_dataset, S3Location, SnapshotName};
+use crate::progress::{Mode, Reporter};
 use crate::restore::{restore, RestoreOptions};
 use crate::s3::{HttpConfig, HttpStore, LockDetectionMode};
 use crate::store::UploadLimits;
@@ -49,6 +50,12 @@ struct BackupArgs {
     /// Ciphertext bytes per second through the backup pipeline
     #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
     rate_limit: Option<u64>,
+    /// Replace any existing backup under the destination prefix instead of
+    /// refusing; the writer lock is still required
+    #[arg(long)]
+    force_overwrite: bool,
+    #[command(flatten)]
+    progress: ProgressArgs,
     #[command(flatten)]
     parts: PartArgs,
     #[command(flatten)]
@@ -74,13 +81,24 @@ struct RestoreArgs {
     #[arg(long)]
     target_dataset: Option<String>,
     #[command(flatten)]
+    progress: ProgressArgs,
+    #[command(flatten)]
     storage: StorageArgs,
+}
+
+#[derive(Args)]
+struct ProgressArgs {
+    /// Transfer progress on stderr: `tty` for a live line, a number of seconds
+    /// for one line per interval, or `off`; default and bare flag pick by
+    /// whether stderr is a terminal
+    #[arg(long, value_name = "tty|SECONDS|off", num_args = 0..=1, default_missing_value = "auto")]
+    progress: Option<String>,
 }
 
 #[derive(Args)]
 struct PartArgs {
     /// Provider minimum size of every part but the last
-    #[arg(long, default_value_t = 5 * 1024 * 1024)]
+    #[arg(long, default_value_t = 100 * 1024 * 1024)]
     min_part_size: u64,
     /// Provider maximum part size
     #[arg(long, default_value_t = 5 * 1024 * 1024 * 1024)]
@@ -92,7 +110,7 @@ struct PartArgs {
     #[arg(long, default_value_t = 5 * 1024 * 1024 * 1024 * 1024)]
     max_object_size: u64,
     /// Largest part held in memory
-    #[arg(long, default_value_t = 64 * 1024 * 1024)]
+    #[arg(long, default_value_t = 128 * 1024 * 1024)]
     part_buffer_size: u64,
 }
 
@@ -190,6 +208,7 @@ async fn run_backup(
     zfs: Arc<SystemZfs>,
     cancel: CancellationToken,
 ) -> Result<()> {
+    let progress = Mode::from_cli(args.progress.progress.as_deref())?;
     let limits = args.parts.limits();
     limits.validate()?;
     let location = args.destination;
@@ -208,15 +227,19 @@ async fn run_backup(
         location,
         gpg_key_id: args.gpg_key_id,
         force_full: args.force_full_snapshot,
+        force_overwrite: args.force_overwrite,
         rate_limit: args.rate_limit,
         limits,
         cancel,
     };
+    let reporter = Reporter::start(progress, "uploaded");
     let result = if args.lock_detection_mode == LockDetectionMode::DangerouslySkip {
-        backup_without_lock(store, zfs, options).await?
+        backup_without_lock(store, zfs, options).await
     } else {
-        backup(store, zfs, options).await?
+        backup(store, zfs, options).await
     };
+    reporter.finish().await;
+    let result = result?;
     eprintln!(
         "backup committed: {} (snapshot GUID {}, {} ciphertext bytes in {} object{})",
         result.stream_key,
@@ -233,6 +256,7 @@ async fn run_restore(
     zfs: Arc<SystemZfs>,
     cancel: CancellationToken,
 ) -> Result<()> {
+    let progress = Mode::from_cli(args.progress.progress.as_deref())?;
     let (source, target) = match args.destination {
         Destination::Stdout(source) => {
             if args.target_pool.is_some() || args.target_dataset.is_some() {
@@ -258,7 +282,10 @@ async fn run_restore(
         gpg_key_id: args.gpg_key_id,
         cancel,
     };
-    let result = restore(store, zfs, options, &mut tokio::io::stdout()).await?;
+    let reporter = Reporter::start(progress, "restored");
+    let result = restore(store, zfs, options, &mut tokio::io::stdout()).await;
+    reporter.finish().await;
+    let result = result?;
     if result.stdout_export {
         eprintln!("stdout export completed and authenticated");
     } else if result.received.is_empty() {
@@ -303,9 +330,9 @@ fn target_dataset(
 async fn cancel_on_signal(cancel: CancellationToken) {
     match wait_for_signal().await {
         Ok(()) => {
-            eprintln!("cancellation requested; stopping producers and resolving upload state")
+            tracing::warn!("cancellation requested; stopping producers and resolving upload state")
         }
-        Err(error) => eprintln!("signal monitoring failed: {error:#}"),
+        Err(error) => tracing::warn!("signal monitoring failed: {error:#}"),
     }
     cancel.cancel();
 }

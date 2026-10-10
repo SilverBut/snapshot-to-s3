@@ -6,7 +6,8 @@ Object names, the lock and commit protocol are defined in [storage.md](storage.m
 
 1. **Check.** Validate limits and the source (an existing filesystem snapshot). Probe that the service
    honors conditional `PUT` and user metadata.
-2. **Lock.** Acquire `.lock` and require an otherwise empty prefix.
+2. **Lock.** Acquire `.lock` and require an otherwise empty prefix. With `--force-overwrite`, delete every other
+   object under the prefix instead; the lock itself is still acquired exclusively.
 3. **Select a base** (skipped with `--force-full-snapshot`), as described below.
 4. **Write the key and metadata.** Resolve the GPG selector to one fingerprint. Generate a key, and
    upload `key.gpg`, `key.sha256sum` and `meta.json.encrypted`.

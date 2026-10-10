@@ -67,6 +67,25 @@ impl HeldLock {
             .with_context(|| format!("release lock {}", self.key))
     }
 
+    /// Deletes every object under `prefix` except `keep` (the held lock).
+    pub async fn clear_prefix(
+        store: &dyn ObjectStore,
+        prefix: &str,
+        keep: Option<&str>,
+    ) -> Result<()> {
+        for key in store.list(prefix).await? {
+            if Some(key.as_str()) == keep {
+                continue;
+            }
+            tracing::warn!("--force-overwrite: deleting existing object {key}");
+            store
+                .delete(&key)
+                .await
+                .with_context(|| format!("delete existing object {key}"))?;
+        }
+        Ok(())
+    }
+
     /// Fails if `prefix` contains anything besides this lock.
     pub async fn ensure_empty(&self, store: &dyn ObjectStore, prefix: &str) -> Result<()> {
         Self::ensure_prefix_empty_except(store, prefix, Some(&self.key)).await

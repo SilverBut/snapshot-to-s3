@@ -20,6 +20,7 @@ fn options(fingerprint: &str) -> BackupOptions {
         location: S3Location::parse("s3://bucket/backups").unwrap(),
         gpg_key_id: fingerprint.into(),
         force_full: true,
+        force_overwrite: false,
         rate_limit: None,
         limits: UploadLimits::default(),
         cancel: CancellationToken::new(),
@@ -144,6 +145,7 @@ async fn backup_and_restore_workflows() {
     failed_small_object_put_leaves_no_stream(&fingerprint).await;
     dangerously_skipped_lock_still_commits_without_lock_objects(&fingerprint).await;
     dangerously_skipped_lock_reports_unresolved_commit_without_protection(&fingerprint).await;
+    force_overwrite_replaces_existing_backup_but_not_the_lock(&fingerprint).await;
     upload_failures_abort_the_stream(&fingerprint).await;
     unknown_completion_retains_lock(&fingerprint).await;
     upload_shutdown_unresolved_retains_lock(&fingerprint).await;
@@ -155,6 +157,56 @@ async fn backup_and_restore_workflows() {
     multi_object_stream_round_trip(&fingerprint).await;
     continuation_failure_aborts_without_commit(&fingerprint).await;
     std::env::remove_var("GNUPGHOME");
+}
+
+async fn force_overwrite_replaces_existing_backup_but_not_the_lock(fingerprint: &str) {
+    let store = Arc::new(MemoryStore::default());
+    backup(
+        store.clone(),
+        Arc::new(FakeZfs::new()),
+        options(fingerprint),
+    )
+    .await
+    .unwrap();
+    let refused = backup(
+        store.clone(),
+        Arc::new(FakeZfs::new()),
+        options(fingerprint),
+    )
+    .await
+    .unwrap_err();
+    assert!(format!("{refused:#}").contains("already contains"));
+
+    store
+        .put(
+            &format!("{PREFIX}stream.encrypted.1"),
+            Bytes::from_static(b"stale"),
+            &Default::default(),
+        )
+        .await
+        .unwrap();
+    let mut forced = options(fingerprint);
+    forced.force_overwrite = true;
+    backup(store.clone(), Arc::new(FakeZfs::new()), forced)
+        .await
+        .unwrap();
+    assert!(has_object(&store, "stream.encrypted"));
+    assert!(!has_object(&store, "stream.encrypted.1"));
+    assert!(!has_object(&store, ".lock"));
+
+    // The exclusive lock is never bypassed.
+    let held = snapshot_to_s3::store::HeldLock::acquire(store.as_ref(), "backups/pool/data/s1/")
+        .await
+        .unwrap();
+    let mut forced = options(fingerprint);
+    forced.force_overwrite = true;
+    let error = backup(store.clone(), Arc::new(FakeZfs::new()), forced)
+        .await
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("lock already exists"));
+    assert!(has_object(&store, ".lock"));
+    assert!(has_object(&store, "stream.encrypted"));
+    held.release(store.as_ref()).await.unwrap();
 }
 
 async fn dangerously_skipped_lock_still_commits_without_lock_objects(fingerprint: &str) {

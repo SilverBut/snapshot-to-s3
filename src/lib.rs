@@ -7,6 +7,7 @@ pub mod cli;
 pub mod crypto;
 pub mod model;
 pub mod process;
+pub mod progress;
 pub mod rate;
 pub mod restore;
 pub mod s3;
