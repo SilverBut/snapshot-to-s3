@@ -17,6 +17,14 @@ pub mod metadata_field {
     pub const CURRENT_SNAPSHOT_ID: &str = "current-snapshot-id";
     pub const BASE_SNAPSHOT_ID: &str = "base-snapshot-id";
     pub const BASE_OBJECT_KEY: &str = "base-object-key";
+    pub const ALL: [&str; 6] = [
+        GPG_KEY_ID,
+        FS_TYPE,
+        VOL_ID,
+        CURRENT_SNAPSHOT_ID,
+        BASE_SNAPSHOT_ID,
+        BASE_OBJECT_KEY,
+    ];
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -33,6 +41,11 @@ impl MetadataMismatch {
                 None => mismatch.missing.push(name.clone()),
                 Some(found) if found != value => mismatch.wrong.push(name.clone()),
                 Some(_) => (),
+            }
+        }
+        for name in metadata_field::ALL {
+            if !expected.contains_key(name) && actual.contains_key(name) {
+                mismatch.wrong.push(name.into());
             }
         }
         mismatch
@@ -265,10 +278,7 @@ impl StreamIndex {
             (GPG_KEY_ID.into(), self.gpg_key_id.clone()),
             (FS_TYPE.into(), self.fs_type.clone()),
             (VOL_ID.into(), self.vol_id.clone()),
-            (
-                CURRENT_SNAPSHOT_ID.into(),
-                self.current_snapshot_id.clone(),
-            ),
+            (CURRENT_SNAPSHOT_ID.into(), self.current_snapshot_id.clone()),
         ]);
         if let (Some(guid), Some(key)) = (&self.base_snapshot_id, &self.base_object_key) {
             map.insert(BASE_SNAPSHOT_ID.into(), guid.clone());

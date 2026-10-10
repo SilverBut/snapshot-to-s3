@@ -42,6 +42,7 @@ async fn probe_multipart(
 ) -> Result<()> {
     let key = format!("{prefix}{}", object::METADATA_PROBE_MULTIPART);
     let mut upload = None;
+    let mut published = false;
     let result = async {
         let id = store.create_upload(&key, metadata).await?;
         upload = Some(id.clone());
@@ -50,7 +51,16 @@ async fn probe_multipart(
             .complete_upload(&key, &id, &[Part { number: 1, etag }])
             .await;
         // Preserve the completion error, even if confirmation also fails.
-        let confirmation = confirm_metadata(store, &key, metadata, data.len() as u64).await;
+        published = completed.is_ok();
+        let confirmation = match confirm_commit(store, &key, metadata, data.len() as u64).await {
+            Ok(outcome) => {
+                if !matches!(outcome, CommitConfirmation::Absent) {
+                    published = true;
+                }
+                check_metadata(outcome, &key, metadata)
+            }
+            Err(error) => Err(error),
+        };
         match (completed, confirmation) {
             (Ok(()), result) => result,
             (Err(error), Ok(())) => {
@@ -63,7 +73,7 @@ async fn probe_multipart(
         }
     }
     .await;
-    let result = if result.is_err() {
+    let result = if result.is_err() && !published {
         match upload {
             Some(id) => with_cleanup(result, store.abort_upload(&key, &id).await),
             None => result.context(
@@ -82,7 +92,15 @@ async fn confirm_metadata(
     metadata: &MetadataMap,
     size: u64,
 ) -> Result<()> {
-    match confirm_commit(store, key, metadata, size).await? {
+    check_metadata(
+        confirm_commit(store, key, metadata, size).await?,
+        key,
+        metadata,
+    )
+}
+
+fn check_metadata(outcome: CommitConfirmation, key: &str, metadata: &MetadataMap) -> Result<()> {
+    match outcome {
         CommitConfirmation::Committed => Ok(()),
         CommitConfirmation::Absent => bail!("metadata capability probe object absent: {key}"),
         CommitConfirmation::CommittedMetadataMismatch { found, mismatch } => bail!(
@@ -99,8 +117,9 @@ fn with_cleanup(result: Result<()>, cleanup: Result<()>) -> Result<()> {
         (Ok(()), Ok(())) => Ok(()),
         (Err(error), Ok(())) => Err(error),
         (Ok(()), Err(error)) => Err(error.context("metadata capability probe cleanup failed")),
-        (Err(error), Err(cleanup)) => {
-            Err(error.context(format!("metadata capability probe cleanup also failed: {cleanup:#}")))
-        }
+        (Err(error), Err(cleanup)) => Err(error.context(format!(
+            "metadata capability probe cleanup also failed: {cleanup:#}"
+        ))),
     }
 }
+

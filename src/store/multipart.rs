@@ -266,8 +266,7 @@ async fn upload_part(
     Ok(etag)
 }
 
-/// Whether the published object matches the upload: `Ok(false)` if absent,
-/// Reports metadata damage separately from absent or incorrectly sized objects.
+/// Publication status, with repairable metadata damage reported separately.
 #[derive(Debug, PartialEq, Eq)]
 pub enum CommitConfirmation {
     Committed,
@@ -278,6 +277,7 @@ pub enum CommitConfirmation {
     },
 }
 
+/// Checks publication by HEAD; size mismatches and operational failures remain errors.
 pub async fn confirm_commit(
     store: &dyn ObjectStore,
     key: &str,

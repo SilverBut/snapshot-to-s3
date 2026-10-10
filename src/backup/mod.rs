@@ -242,7 +242,10 @@ impl Job<'_> {
             &index,
             &selected.diagnostics,
         );
-        ensure!(log.len() <= LOG_LIMIT, "backup metadata exceeds log size limit");
+        ensure!(
+            log.len() <= LOG_LIMIT,
+            "backup metadata exceeds log size limit"
+        );
         self.put(
             object::LOG,
             crypto::encrypt_small(&key, log.as_bytes()).await?,
@@ -311,7 +314,9 @@ impl Job<'_> {
             Ok(CommitConfirmation::CommittedMetadataMismatch { found, mismatch }) => {
                 self.upload = Upload::Committed;
                 if let Err(error) = completed {
-                    tracing::warn!("stream published despite completion response failure: {error:#}");
+                    tracing::warn!(
+                        "stream published despite completion response failure: {error:#}"
+                    );
                 }
                 Err(StreamMetadataMismatch {
                     stream_key: self.stream_key.clone(),
