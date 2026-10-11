@@ -4,8 +4,6 @@
 
 ## [0.2.0]
 
-<!-- RELEASE_NOTES_NEED_REVIEW -->
-
 ### Fixed
 
 - Send an explicit Content-Length (including zero) on empty PUT and POST requests, so backups no longer fail with HTTP 411 MissingContentLength on S3 endpoints that require it (#11). (#11)
@@ -23,9 +21,6 @@
 - Publish the release binary `snapshot-to-s3-linux-x86_64` directly alongside `SHA256SUMS` instead of a tar archive (#17). (#17)
 - Rename the lock and metadata-probe objects from `.lock`, `.metadata-probe` and `.metadata-probe-multipart` to `_lock`, `_metadata-probe` and `_metadata-probe-multipart`, and add more detailed decision logging across lock, prefix, backup and metadata-probe flows (#18). (#18)
 
-
-### Needs Review
-- Upgrade notes Restrict manual release builds to the default branch and the dispatch commit, removing the selectable build ref and shared cache. (#15) — _This is a release workflow and CI change with no apparent user-visible effect, so a maintainer may want to omit it under the team's rule._
 
 ## [0.1.0]
 
