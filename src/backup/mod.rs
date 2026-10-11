@@ -262,6 +262,18 @@ impl Job<'_> {
             ciphertext_estimate = estimate,
             "zfs send started"
         );
+        // User-facing prompt, not a log record: visible even without RUST_LOG.
+        let estimated = crate::progress::human_bytes(estimate);
+        match base {
+            Some(base) => eprintln!(
+                "backing up {} incrementally from base {} (estimated {estimated})",
+                options.source, base.name
+            ),
+            None => eprintln!(
+                "backing up {} as a full snapshot (estimated {estimated})",
+                options.source
+            ),
+        }
         crate::progress::set_total(estimate);
         let stream = self
             .upload_stream(&upload_id, send, &key, aad, estimate)
