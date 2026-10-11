@@ -385,7 +385,7 @@ impl RequestBody {
 }
 
 /// Streams a part from the part temporary file, counting bytes handed to
-/// the connection.
+/// the connection for the throughput guard and transfer progress.
 fn counted_file_body(
     reader: impl tokio::io::AsyncRead + Send + Sync + Unpin + 'static,
     progress: Arc<AtomicU64>,
@@ -395,13 +395,15 @@ fn counted_file_body(
         tokio_util::io::ReaderStream::with_capacity(reader, UPLOAD_CHUNK_BYTES).map(move |chunk| {
             if let Ok(chunk) = &chunk {
                 progress.fetch_add(chunk.len() as u64, Ordering::Relaxed);
+                crate::progress::add(chunk.len() as u64);
             }
             chunk
         });
     reqwest::Body::wrap_stream(stream)
 }
 
-/// A streamed request body that counts bytes handed to the connection.
+/// A streamed request body that counts bytes handed to the connection for
+/// the throughput guard and transfer progress.
 fn counted_body(body: Bytes, progress: Arc<AtomicU64>) -> reqwest::Body {
     let stream = futures_util::stream::unfold(body, move |mut remaining| {
         let progress = progress.clone();
@@ -411,6 +413,7 @@ fn counted_body(body: Bytes, progress: Arc<AtomicU64>) -> reqwest::Body {
             }
             let chunk = remaining.split_to(remaining.len().min(UPLOAD_CHUNK_BYTES));
             progress.fetch_add(chunk.len() as u64, Ordering::Relaxed);
+            crate::progress::add(chunk.len() as u64);
             Some((Ok::<_, io::Error>(chunk), remaining))
         }
     });

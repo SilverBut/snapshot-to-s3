@@ -171,7 +171,6 @@ pub async fn upload_parts<R: AsyncBufRead + Unpin + ?Sized>(
         let last = part_bytes < wanted as u64;
         let number = u32::try_from(uploaded.parts.len() + 1)?;
         let etag = upload_part(store, key, upload, number, body, cancel).await?;
-        crate::progress::add(part_bytes);
         tracing::debug!(%key, number, part_bytes, total = uploaded.bytes, "part uploaded");
         uploaded.parts.push(Part { number, etag });
         if last {
