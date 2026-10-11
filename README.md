@@ -42,8 +42,8 @@ The backup is written under `s3://bucket/backups/pool/dataset/snap/`. The snapsh
 | `--part-temp-file PATH` | Hold each ciphertext part in this file instead of memory, so large parts fit small-memory hosts. The path must not exist; it is created with mode 0600 and removed afterwards |
 | `--min-part-size` (default 100 MiB), `--max-parts`, `--max-object-size` | Multipart limits (maximums default to AWS S3); lower `--min-part-size` for services that allow smaller parts |
 
-Diagnostics: logs go to stderr only (default level `warn`), so `restore ... stdout:` output stays clean.
-Set `RUST_LOG` to keep a record for later investigation:
+Diagnostics: logs go to stderr only (default level `info`), so `restore ... stdout:` output stays clean.
+Set `RUST_LOG` to change the detail kept for later investigation:
 
 * `info`: each decision and its outcome: store settings, lock acquisition and release, prefix checks,
   metadata probe results, base selection, uploaded objects, commit confirmation, failure recovery
@@ -51,6 +51,7 @@ Set `RUST_LOG` to keep a record for later investigation:
 * `debug`: also every `HEAD` read-back with the observed size, ETag and metadata compared with the
   expected values, base candidates and estimates, external commands and S3 requests.
 * `trace`: also skipped snapshots, accepted parts and raw `HEAD` responses.
+* `warn`: only warnings and errors, for quiet runs.
 
 An incremental base must be an older local snapshot whose committed backup exists at the same prefix.
 Choosing a base does not check that the base's own chain is complete; keep the backups a chain needs
