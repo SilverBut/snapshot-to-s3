@@ -2,6 +2,26 @@
 
 ## [Unreleased]
 
+## [0.2.0]
+
+### Fixed
+
+- Send an explicit Content-Length (including zero) on empty PUT and POST requests, so backups no longer fail with HTTP 411 MissingContentLength on S3 endpoints that require it (#11). (#11)
+- Report backup progress and current speed as request-body bytes are sent, rather than in spikes after each part finishes uploading (#19). (#19)
+
+### Added
+
+- Add a `--lock-detection-mode` option with `if-none-match` (default), Tencent COS `x-cos-forbid-overwrite` support, and an unsafe `dangerously-skip` mode that bypasses lock acquisition (#12). (#12)
+- Add `RUST_LOG` diagnostic logging to stderr, a `--force-overwrite` option that deletes existing objects under the prefix, and a `--progress` option for backup and restore (#13). (#13)
+- Unify part sizing under `--max-part-size` (default 512 MiB), remove `--part-buffer-size`, and add `--part-temp-file PATH` to spool encrypted parts to a temporary file instead of memory (#14). (#14)
+- Verify S3 metadata after lock acquisition, keep committed backups with missing or wrong metadata, exit nonzero with repair diagnostics, and add an opt-in `--probe-metadata-multipart` option (#16). (#16)
+
+### Upgrade notes
+
+- Publish the release binary `snapshot-to-s3-linux-x86_64` directly alongside `SHA256SUMS` instead of a tar archive (#17). (#17)
+- Rename the lock and metadata-probe objects from `.lock`, `.metadata-probe` and `.metadata-probe-multipart` to `_lock`, `_metadata-probe` and `_metadata-probe-multipart`, and add more detailed decision logging across lock, prefix, backup and metadata-probe flows (#18). (#18)
+
+
 ## [0.1.0]
 
 ### Added
